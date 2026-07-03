@@ -9,7 +9,7 @@ import Callout from '../../../../components/Callout.astro';
 
 Apache **Kafka** คือ distributed event streaming platform เป็น log ที่ทนทานและ replay ได้ ให้ producer หลายตัวเขียนเข้ามา และ consumer หลายตัวอ่านออกไป โดยต่างคนต่างอ่านตามจังหวะของตัวเอง คอร์สนี้เขียน **สำหรับ developer** คนที่ต้องเขียน producer กับ consumer เอง ต้องเข้าใจ delivery guarantee และต้องทำให้ Kafka ทำงานถูกต้องบน production
 
-คอร์สนี้อิงกับ **Kafka 4.x** ซึ่งรันด้วย **KRaft mode** อย่างเดียว โดย ZooKeeper ถูกถอดออกไปหมดแล้ว ตัวอย่าง CLI ทุกอันใช้ `--bootstrap-server` และตัวอย่าง client ใช้ Java `kafka-clients` API ตัวจริง ซึ่งเป็น reference มาตรฐานที่ client ภาษาอื่นล้วนอ้างอิงตาม
+คอร์สนี้อิงกับ **Kafka 4.x** ซึ่งรันด้วย **KRaft mode** อย่างเดียว โดย ZooKeeper ถูกถอดออกไปหมดแล้ว ตัวอย่าง CLI ทุกอันใช้ `--bootstrap-server` และตัวอย่าง client เป็น **TypeScript** ด้วย **KafkaJS** — Node.js client ที่คนใช้กันแพร่หลาย และ API ของมันยังถูก implement โดย client ทางการของ Confluent อย่าง `@confluentinc/kafka-javascript` ด้วย (ส่วน Kafka Streams ที่พูดถึงทีหลัง เป็น library บน JVM เท่านั้น จึงแสดงเป็น Java)
 
 ## คอร์สนี้ครอบคลุมอะไรบ้าง
 

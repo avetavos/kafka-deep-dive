@@ -1,6 +1,6 @@
 ---
 title: 'Exactly-Once Processing'
-description: 'The consume-transform-produce pattern with transactions — sendOffsetsToTransaction to commit input offsets and output records atomically.'
+description: 'The consume-transform-produce pattern with transactions — txn.sendOffsets to commit input offsets and output records atomically.'
 sidebar:
   order: 3
 ---
@@ -16,51 +16,61 @@ The classic exactly-once use case is **consume-transform-produce** — read from
 
 ## Why offsets must join the transaction
 
-Consider reading `orders`, enriching each, and writing to `orders-enriched`. If you commit the output in a transaction but commit the input offset separately, a crash between the two either reprocesses (duplicates the output) or skips (loses input). The fix: commit the consumer\'s offsets **as part of the producer\'s transaction** with `sendOffsetsToTransaction()`. Now output records and input progress commit or abort **together**.
+Consider reading `orders`, enriching each, and writing to `orders-enriched`. If you commit the output in a transaction but commit the input offset separately, a crash between the two either reprocesses (duplicates the output) or skips (loses input). The fix: commit the consumer's offsets **as part of the producer's transaction** with `txn.sendOffsets()`. Now output records and input progress commit or abort **together**.
 
-```java
-producer.initTransactions();
-consumer.subscribe(List.of("orders"));
+```typescript
+const producer = kafka.producer({ transactionalId: 'enricher-1', idempotent: true, maxInFlightRequests: 1 })
+const consumer = kafka.consumer({ groupId: 'enricher', readUncommitted: false })
+await producer.connect()
+await consumer.connect()
+await consumer.subscribe({ topic: 'orders' })
 
-while (running) {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
-    if (records.isEmpty()) continue;
-
-    producer.beginTransaction();
-    for (ConsumerRecord<String, String> record : records) {
-        producer.send(new ProducerRecord<>("orders-enriched", record.key(), enrich(record.value())));
+await consumer.run({
+  autoCommit: false,                               // offsets are committed inside the transaction
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction()       // begin
+    try {
+      for (const message of batch.messages) {
+        await txn.send({ topic: 'orders-enriched', messages: [{ key: message.key, value: enrich(message.value) }] })
+      }
+      // Commit the input offsets in the SAME transaction as the output
+      await txn.sendOffsets({
+        consumerGroupId: 'enricher',
+        topics: [{ topic: batch.topic, partitions: [{ partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }] }],
+      })
+      await txn.commit()                           // outputs + offsets are atomic
+    } catch (e) {
+      await txn.abort()
     }
-    // Commit the input offsets in the SAME transaction as the output
-    Map<TopicPartition, OffsetAndMetadata> offsets = offsetsFor(records);
-    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
-
-    producer.commitTransaction();   // outputs + offsets are atomic
-}
+  },
+})
 ```
 
 ## Handling failures correctly
 
-Two exception classes matter. `ProducerFencedException` and `OutOfOrderSequenceException` are **unrecoverable** — another instance has taken over your `transactional.id`; shut down. A general `KafkaException` inside the transaction should **abort and retry** from the last committed offsets:
+KafkaJS throws if a transactional operation fails, and every thrown error carries a **`retriable`** flag that decides your recovery. The common case is **retriable**: `txn.abort()` and let the batch run again from the last committed offsets. A **non-retriable** error (`e.retriable === false`) means a newer producer has taken over your `transactionalId` — you cannot continue, so `disconnect()` this instance and let a healthy one take over:
 
-```java
-} catch (ProducerFencedException | OutOfOrderSequenceException e) {
-    shutdown();                       // a zombie was fenced; give up this instance
-} catch (KafkaException e) {
-    producer.abortTransaction();      // roll back and retry the batch
+```typescript
+} catch (e) {
+  await txn.abort()                  // roll back and retry the batch
+  if (!e.retriable) {                // a zombie was fenced — this producer cannot recover
+    await producer.disconnect()      // give up this instance
+    throw e
+  }
 }
 ```
 
 <Mermaid title="Consume-transform-produce as one atomic unit" code={eosDiagram} />
 
 export const eosDiagram = `flowchart LR
-  in["poll from orders"] --> begin["beginTransaction()"]
-  begin --> transform["transform + send to orders-enriched"]
-  transform --> off["sendOffsetsToTransaction(input offsets)"]
-  off --> commit["commitTransaction(): outputs + offsets atomic"]
+  in["consume from orders"] --> begin["producer.transaction()"]
+  begin --> transform["transform + txn.send to orders-enriched"]
+  transform --> off["txn.sendOffsets(input offsets)"]
+  off --> commit["txn.commit(): outputs + offsets atomic"]
   commit --> in`;
 
 <Callout title="The one-line takeaway">
-Exactly-once **consume-transform-produce** works by putting the consumer\'s input offsets **inside the producer\'s transaction** via `sendOffsetsToTransaction()`, so output records and input progress commit atomically. Treat `ProducerFencedException` as fatal (a zombie was fenced) and a `KafkaException` as **abort-and-retry**. This gives exactly-once for pipelines that stay inside Kafka.
+Exactly-once **consume-transform-produce** works by putting the consumer's input offsets **inside the producer's transaction** via `txn.sendOffsets()`, so output records and input progress commit atomically. On failure, `txn.abort()` and retry; if the thrown error is **non-retriable** (`e.retriable === false`, a zombie was fenced) `disconnect()` and let another instance take over. This gives exactly-once for pipelines that stay inside Kafka.
 </Callout>
 
 export const quizEos = [
@@ -75,27 +85,27 @@ export const quizEos = [
     answer: 1,
   },
   {
-    q: 'Which method commits consumer offsets as part of the producer transaction?',
+    q: 'Which call commits consumer offsets as part of the producer transaction?',
     options: [
-      'consumer.commitSync()',
-      'producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata())',
+      'consumer.commitOffsets()',
+      'txn.sendOffsets({ consumerGroupId, topics }) on the transaction',
       'producer.flush()',
-      'consumer.seekToBeginning()',
+      'consumer.seek()',
     ],
     answer: 1,
   },
   {
-    q: 'How should you handle a ProducerFencedException?',
+    q: 'How should you handle a non-retriable transaction error (`e.retriable === false`)?',
     options: [
       'Retry the transaction immediately',
-      'Treat it as unrecoverable and shut down — another instance took over the transactional.id',
+      'Treat it as unrecoverable — abort, disconnect the producer, and let another instance take over (a zombie was fenced)',
       'Ignore it',
       'Switch to auto-commit',
     ],
     answer: 1,
   },
   {
-    q: 'What is the correct response to a general KafkaException inside a transaction?',
+    q: 'What is the correct response to a retriable error inside a transaction?',
     options: [
       'Commit anyway',
       'Abort the transaction and retry the batch from the last committed offsets',

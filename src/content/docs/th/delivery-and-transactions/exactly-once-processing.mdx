@@ -1,6 +1,6 @@
 ---
 title: 'Exactly-Once Processing'
-description: 'รูปแบบ consume-transform-produce ด้วย transactions ใช้ sendOffsetsToTransaction commit input offset กับ output record แบบ atomic'
+description: 'รูปแบบ consume-transform-produce ด้วย transactions ใช้ txn.sendOffsets commit input offset กับ output record แบบ atomic'
 sidebar:
   order: 3
 ---
@@ -16,51 +16,61 @@ use case คลาสสิกของ exactly-once คือ **consume-transfo
 
 ## ทำไม offset ต้องเข้าไปอยู่ใน transaction
 
-ลองนึกถึงการอ่าน `orders` เติมข้อมูลแต่ละตัว แล้วเขียนไป `orders-enriched` ถ้าคุณ commit output ใน transaction แต่ commit input offset แยกต่างหาก การล่มระหว่างสองจังหวะจะทำให้ประมวลผลซ้ำ (output ซ้ำ) หรือข้าม (input หาย) วิธีแก้คือ commit offset ของ consumer **ให้เป็นส่วนหนึ่งของ transaction ของ producer** ด้วย `sendOffsetsToTransaction()` ทีนี้ output record กับความคืบหน้าของ input จะ commit หรือ abort **พร้อมกัน**
+ลองนึกถึงการอ่าน `orders` เติมข้อมูลแต่ละตัว แล้วเขียนไป `orders-enriched` ถ้าคุณ commit output ใน transaction แต่ commit input offset แยกต่างหาก การล่มระหว่างสองจังหวะจะทำให้ประมวลผลซ้ำ (output ซ้ำ) หรือข้าม (input หาย) วิธีแก้คือ commit offset ของ consumer **ให้เป็นส่วนหนึ่งของ transaction ของ producer** ด้วย `txn.sendOffsets()` ทีนี้ output record กับความคืบหน้าของ input จะ commit หรือ abort **พร้อมกัน**
 
-```java
-producer.initTransactions();
-consumer.subscribe(List.of("orders"));
+```typescript
+const producer = kafka.producer({ transactionalId: 'enricher-1', idempotent: true, maxInFlightRequests: 1 })
+const consumer = kafka.consumer({ groupId: 'enricher', readUncommitted: false })
+await producer.connect()
+await consumer.connect()
+await consumer.subscribe({ topic: 'orders' })
 
-while (running) {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
-    if (records.isEmpty()) continue;
-
-    producer.beginTransaction();
-    for (ConsumerRecord<String, String> record : records) {
-        producer.send(new ProducerRecord<>("orders-enriched", record.key(), enrich(record.value())));
+await consumer.run({
+  autoCommit: false,                               // offsets are committed inside the transaction
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction()       // begin
+    try {
+      for (const message of batch.messages) {
+        await txn.send({ topic: 'orders-enriched', messages: [{ key: message.key, value: enrich(message.value) }] })
+      }
+      // Commit the input offsets in the SAME transaction as the output
+      await txn.sendOffsets({
+        consumerGroupId: 'enricher',
+        topics: [{ topic: batch.topic, partitions: [{ partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }] }],
+      })
+      await txn.commit()                           // outputs + offsets are atomic
+    } catch (e) {
+      await txn.abort()
     }
-    // Commit the input offsets in the SAME transaction as the output
-    Map<TopicPartition, OffsetAndMetadata> offsets = offsetsFor(records);
-    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
-
-    producer.commitTransaction();   // outputs + offsets are atomic
-}
+  },
+})
 ```
 
 ## จัดการ failure ให้ถูก
 
-exception สองกลุ่มสำคัญ `ProducerFencedException` และ `OutOfOrderSequenceException` เป็นแบบ **กู้คืนไม่ได้** อีก instance เข้ามายึด `transactional.id` ของคุณแล้ว ให้ shutdown ส่วน `KafkaException` ทั่วไปภายใน transaction ควร **abort แล้ว retry** จาก offset ที่ commit ล่าสุด
+KafkaJS จะ throw ถ้า transactional operation ล้มเหลว และ error ที่ throw ออกมาจะพก flag **`retriable`** ที่ตัดสินวิธีกู้คืน เคสปกติคือ **retriable**: `txn.abort()` แล้วปล่อยให้ batch รันใหม่จาก offset ที่ commit ล่าสุด ส่วน error แบบ **non-retriable** (`e.retriable === false`) แปลว่ามี producer ตัวใหม่เข้ามายึด `transactionalId` ของคุณไปแล้ว คุณไปต่อไม่ได้ ให้ `disconnect()` instance นี้แล้วปล่อยให้ตัวที่ยังดีทำงานแทน
 
-```java
-} catch (ProducerFencedException | OutOfOrderSequenceException e) {
-    shutdown();                       // a zombie was fenced; give up this instance
-} catch (KafkaException e) {
-    producer.abortTransaction();      // roll back and retry the batch
+```typescript
+} catch (e) {
+  await txn.abort()                  // roll back and retry the batch
+  if (!e.retriable) {                // a zombie was fenced — this producer cannot recover
+    await producer.disconnect()      // give up this instance
+    throw e
+  }
 }
 ```
 
 <Mermaid title="consume-transform-produce เป็นหน่วย atomic เดียว" code={eosDiagram} />
 
 export const eosDiagram = `flowchart LR
-  in["poll from orders"] --> begin["beginTransaction()"]
-  begin --> transform["transform + send to orders-enriched"]
-  transform --> off["sendOffsetsToTransaction(input offsets)"]
-  off --> commit["commitTransaction(): outputs + offsets atomic"]
+  in["consume from orders"] --> begin["producer.transaction()"]
+  begin --> transform["transform + txn.send to orders-enriched"]
+  transform --> off["txn.sendOffsets(input offsets)"]
+  off --> commit["txn.commit(): outputs + offsets atomic"]
   commit --> in`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-exactly-once **consume-transform-produce** ทำงานด้วยการเอา input offset ของ consumer **เข้าไปอยู่ใน transaction ของ producer** ผ่าน `sendOffsetsToTransaction()` เพื่อให้ output record กับความคืบหน้าของ input commit แบบ atomic มอง `ProducerFencedException` เป็น fatal (zombie ถูก fence) และ `KafkaException` เป็น **abort แล้ว retry** นี่ให้ exactly-once สำหรับ pipeline ที่อยู่ภายใน Kafka
+exactly-once **consume-transform-produce** ทำงานด้วยการเอา input offset ของ consumer **เข้าไปอยู่ใน transaction ของ producer** ผ่าน `txn.sendOffsets()` เพื่อให้ output record กับความคืบหน้าของ input commit แบบ atomic ตอน fail ให้ `txn.abort()` แล้ว retry ถ้า error ที่ throw เป็นแบบ **non-retriable** (`e.retriable === false` มี zombie ถูก fence) ให้ `disconnect()` แล้วปล่อยให้อีก instance ทำงานแทน นี่ให้ exactly-once สำหรับ pipeline ที่อยู่ภายใน Kafka
 </Callout>
 
 export const quizEos = [
@@ -75,27 +85,27 @@ export const quizEos = [
     answer: 1,
   },
   {
-    q: 'method ไหน commit consumer offset เป็นส่วนหนึ่งของ producer transaction',
+    q: 'การเรียกไหน commit consumer offset เป็นส่วนหนึ่งของ producer transaction',
     options: [
-      'consumer.commitSync()',
-      'producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata())',
+      'consumer.commitOffsets()',
+      'txn.sendOffsets({ consumerGroupId, topics }) บน transaction',
       'producer.flush()',
-      'consumer.seekToBeginning()',
+      'consumer.seek()',
     ],
     answer: 1,
   },
   {
-    q: 'ควรจัดการ ProducerFencedException ยังไง',
+    q: 'ควรจัดการ error แบบ non-retriable (`e.retriable === false`) ยังไง',
     options: [
       'retry transaction ทันที',
-      'มองว่ากู้คืนไม่ได้แล้ว shutdown อีก instance เข้ามายึด transactional.id ไปแล้ว',
+      'มองว่ากู้คืนไม่ได้ — abort, disconnect producer แล้วปล่อยให้อีก instance ทำงานแทน (มี zombie ถูก fence)',
       'เพิกเฉย',
       'สลับไปใช้ auto-commit',
     ],
     answer: 1,
   },
   {
-    q: 'การตอบสนองที่ถูกต้องต่อ KafkaException ทั่วไปภายใน transaction คืออะไร',
+    q: 'การตอบสนองที่ถูกต้องต่อ error แบบ retriable ภายใน transaction คืออะไร',
     options: [
       'commit ต่อไปเลย',
       'abort transaction แล้ว retry batch จาก offset ที่ commit ล่าสุด',

@@ -1,6 +1,6 @@
 ---
 title: 'Error Handling & Retries'
-description: 'pipeline ที่ทนทาน producer retries กับ delivery.timeout.ms แยก error แบบ retriable กับ fatal รูปแบบ dead-letter topic และ idempotent consumer เป็น safety net'
+description: 'pipeline ที่ทนทาน retry อัตโนมัติผ่าน retry policy ของ KafkaJS แยก error แบบ retriable กับ fatal รูปแบบ dead-letter topic และ idempotent consumer เป็น safety net'
 sidebar:
   order: 4
 ---
@@ -12,41 +12,49 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-code Kafka ที่ทนทานจะจัดทุก failure ลงหนึ่งในสามถัง **retriable** (ปล่อยให้ producer retry ภายใน `delivery.timeout.ms`), **abortable** (roll transaction กลับแล้วลองใหม่) หรือ **fatal** (close producer แล้วให้อีก instance เข้ามาแทน) และ dead-letter record ที่ไม่มีวันสำเร็จ
+code Kafka ที่ทนทานจะจัดทุก failure ลงหนึ่งในสามถัง **retriable** (ปล่อยให้ retry policy ของ KafkaJS retry ให้), **abortable** (roll transaction กลับแล้วลอง batch ใหม่) หรือ **fatal** (disconnect producer แล้วให้อีก instance เข้ามาแทน) และ dead-letter record ที่ไม่มีวันสำเร็จ
 
-## producer retry อัตโนมัติและมีกรอบเวลา
+## producer retry อัตโนมัติและมีกรอบ
 
-producer retry error แบบ retriable เอง เช่น leader election หรือ network สะดุดชั่วคราว ตัวคุมยุคใหม่ไม่ใช่ *จำนวน* retry แต่เป็น **งบเวลา** `delivery.timeout.ms` (default **120000**) คือขอบบนว่า `send()` ใช้เวลานานแค่ไหนในการรายงานสำเร็จหรือล้มเหลว ครอบคลุมทั้ง batching การ ack ของ broker และทุก retry ข้างใต้ มันต้องอย่างน้อยเท่ากับ `request.timeout.ms + linger.ms`
+KafkaJS retry error แบบ retriable เอง เช่น leader election หรือ network สะดุดชั่วคราว โดยคุมด้วย **`retry` policy** ของ client: จำนวน `retries` ที่จำกัด พร้อม **exponential backoff** (แต่ละรอบเริ่มที่ `initialRetryTime` แล้วโตขึ้นไปจนถึง `maxRetryTime`) คุณตั้งครั้งเดียวบน `Kafka` client และมันครอบคลุมทั้งการ produce, consume และ admin call
 
-```properties
-delivery.timeout.ms=120000     # total deadline for a send, including all retries
-request.timeout.ms=30000       # per-attempt broker wait
-retries=2147483647             # effectively unlimited; the deadline bounds it
-enable.idempotence=true        # retries stay duplicate-free within a partition
+```typescript
+const kafka = new Kafka({
+  clientId: 'orders-app',
+  brokers: ['localhost:9092'],
+  retry: {
+    retries: 8,             // bounded automatic retries for retriable errors
+    initialRetryTime: 300,  // first backoff in ms; grows exponentially
+    maxRetryTime: 30000,    // cap on any single backoff
+  },
+})
+
+const producer = kafka.producer({ idempotent: true })  // keeps those retries duplicate-free
 ```
 
-เมื่อเปิด `enable.idempotence=true` retry เหล่านี้ไม่สร้าง duplicate ใน partition เลย คุณจึง retry ได้ดุดันโดยไม่ทำ stream พัง
+เมื่อ producer เป็น `idempotent: true` retry เหล่านี้ไม่สร้าง duplicate ใน partition เลย คุณจึง retry ได้ดุดันโดยไม่ทำ stream พัง
 
-## retriable vs abortable vs fatal ใน transaction
+## abortable vs fatal ใน transaction
 
-ภายใน transactional loop exception ไม่เท่ากันหมด action ในการกู้คืนต่างกันตามกลุ่ม
+ภายใน transactional loop KafkaJS จะ throw เมื่อ operation ล้มเหลว และ flag **`retriable`** บน error ที่ throw ออกมาเป็นตัวตัดสินวิธีกู้คืน
 
-- **`TransactionAbortableException`** transaction commit ไม่ได้แต่ producer ยังปกติดี เรียก `abortTransaction()` แล้ว **retry batch** จาก offset ที่ commit ล่าสุด
-- **`ProducerFencedException`** และ **`OutOfOrderSequenceException`** เป็น **fatal** อีก instance เข้ามายึด `transactional.id` ของคุณ (zombie ถูก fence) หรือ idempotent sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ **close แล้ว shutdown** เพื่อให้ instance ที่ปกติทำงานต่อ
+- **retriable / abortable** (`e.retriable === true`) transaction commit ไม่ได้แต่ producer ยังปกติดี เรียก `txn.abort()` แล้ว **retry batch** จาก offset ที่ commit ล่าสุด
+- **fatal** (`e.retriable === false`) มี producer ตัวใหม่เข้ามายึด `transactionalId` ของคุณ (zombie ถูก fence) หรือ idempotent sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ **disconnect แล้ว shut down** เพื่อให้ instance ที่ปกติทำงานต่อ
 
-```java
+```typescript
+const txn = await producer.transaction()
 try {
-    producer.beginTransaction();
-    for (ConsumerRecord<String, String> record : records) {
-        producer.send(new ProducerRecord<>("orders-enriched", record.key(), transform(record)));
-    }
-    producer.sendOffsetsToTransaction(offsetsFor(records), consumer.groupMetadata());
-    producer.commitTransaction();
-} catch (ProducerFencedException | OutOfOrderSequenceException e) {
-    producer.close();       // FATAL: a zombie was fenced — give up this instance
-    shutdown();
-} catch (TransactionAbortableException e) {
-    producer.abortTransaction();   // roll back and retry the batch
+  for (const message of batch.messages) {
+    await txn.send({ topic: 'orders-enriched', messages: [{ key: message.key, value: transform(message) }] })
+  }
+  await txn.sendOffsets({ consumerGroupId: 'enricher', topics: offsetsFor(batch) })
+  await txn.commit()
+} catch (e) {
+  await txn.abort()                  // ABORTABLE: roll back and retry the batch
+  if (!e.retriable) {                // FATAL: a zombie was fenced — give up this instance
+    await producer.disconnect()
+    throw e
+  }
 }
 ```
 
@@ -54,12 +62,12 @@ try {
 
 **poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ payload พัง schema ที่ parse ไม่ได้ หรือ downstream ที่ล้มถาวร retry มันไปเรื่อย ๆ จะทำให้ทั้ง partition ค้างอยู่หลังมัน วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)** หลังลองล้มเหลว N ครั้ง ก็ produce record บวก context ของ error ไปยัง topic `orders-dlq` แยกต่างหาก commit ข้ามมันไป แล้วปล่อยให้ flow หลักเดินต่อ คนหรือ job แยกค่อยมาตรวจ DLT ทีหลัง
 
-```java
+```typescript
 try {
-    process(record);
-} catch (NonRetriableException e) {
-    // Route the bad record aside instead of blocking the partition
-    dlqProducer.send(new ProducerRecord<>("orders-dlq", record.key(), record.value()));
+  await process(message)
+} catch (e) {
+  // Route the bad record aside instead of blocking the partition
+  await dlqProducer.send({ topic: 'orders-dlq', messages: [{ key: message.key, value: message.value }] })
 }
 // commit past the record either way, so the partition keeps advancing
 ```
@@ -70,41 +78,41 @@ try {
 
 export const errorDiagram = `flowchart TB
   fail["failure during send or process"] --> retriable{"which kind?"}
-  retriable -->|"transient"| retry["producer retries within delivery.timeout.ms"]
-  retriable -->|"TransactionAbortableException"| abort["abortTransaction() then retry batch"]
-  retriable -->|"ProducerFenced / OutOfOrderSequence"| fatal["close producer and shut down"]
+  retriable -->|"transient"| retry["KafkaJS retries per its retry policy"]
+  retriable -->|"abortable (e.retriable)"| abort["txn.abort() then retry batch"]
+  retriable -->|"fatal (not retriable)"| fatal["disconnect producer and shut down"]
   retriable -->|"poison message"| dlq["send to dead-letter topic, commit past it"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-จัด failure ตามกลุ่ม error ชั่วคราวจัดการด้วย **retry อัตโนมัติที่มีกรอบ `delivery.timeout.ms`** (default 120000 และ **`enable.idempotence=true`** ทำให้ไม่ซ้ำ) **`TransactionAbortableException`** หมายถึง **abort แล้ว retry batch** ส่วน **`ProducerFencedException`** และ **`OutOfOrderSequenceException`** เป็น **fatal — close แล้ว shut down** route poison message ไป **dead-letter topic** และเก็บ **idempotent consumer** ไว้เป็น safety net เพื่อให้การส่งซ้ำใด ๆ ลงเอยที่ state เดียวกัน
+จัด failure ตามชนิด error ชั่วคราวจัดการด้วย **retry อัตโนมัติจาก `retry` policy ของ KafkaJS** (จำนวน `retries` ที่จำกัด พร้อม exponential backoff และ producer แบบ **`idempotent: true`** ทำให้ไม่ซ้ำ) error แบบ **abortable** (`e.retriable`) หมายถึง **`txn.abort()` แล้ว retry batch** ส่วนแบบ **non-retriable** เป็น **fatal — disconnect แล้ว shut down** route poison message ไป **dead-letter topic** และเก็บ **idempotent consumer** ไว้เป็น safety net เพื่อให้การส่งซ้ำใด ๆ ลงเอยที่ state เดียวกัน
 </Callout>
 
 export const quizErrors = [
   {
-    q: '`delivery.timeout.ms` กำหนดกรอบอะไร',
+    q: 'KafkaJS จำกัด retry อัตโนมัติยังไง',
     options: [
-      'consumer รอระหว่าง poll นานแค่ไหน',
-      'เวลารวมที่ send ใช้ในการรายงานสำเร็จหรือล้มเหลว รวม batching และทุก retry (default 120000)',
-      'retention period ของ topic',
-      'ช่วงเวลา heartbeat',
+      'retry ไปเรื่อย ๆ จนกว่า broker จะตอบ',
+      'ผ่าน `retry` policy ของ client — จำนวน `retries` ที่จำกัด พร้อม exponential backoff',
+      'ไม่ retry เลย ต้อง retry เองด้วยมือ',
+      'ตาม retention period ของ topic',
     ],
     answer: 1,
   },
   {
-    q: 'ควรจัดการ TransactionAbortableException ยังไง',
+    q: 'ควรจัดการ error แบบ abortable (retriable) ใน transaction ยังไง',
     options: [
-      'close producer แล้ว shut down ถาวร',
-      'เรียก abortTransaction() แล้ว retry batch จาก offset ที่ commit ล่าสุด',
+      'disconnect producer แล้ว shut down ถาวร',
+      'เรียก `txn.abort()` แล้ว retry batch จาก offset ที่ commit ล่าสุด',
       'commit transaction ต่อไปเลย',
       'เพิกเฉยแล้ว send ต่อ',
     ],
     answer: 1,
   },
   {
-    q: 'ทำไม ProducerFencedException และ OutOfOrderSequenceException ถึงเป็น fatal',
+    q: 'ทำไม error แบบ non-retriable (`e.retriable === false`) ถึงเป็น fatal',
     options: [
       'เป็น network error ชั่วคราวที่หายเอง',
-      'อีก instance เข้ามายึด transactional.id หรือ sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ close แล้ว shut down',
+      'มี producer ตัวใหม่เข้ามายึด transactionalId หรือ sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ disconnect แล้ว shut down',
       'หมายความว่า topic ถูกลบ',
       'เกิดเฉพาะตอนปิด idempotence',
     ],
@@ -113,7 +121,7 @@ export const quizErrors = [
   {
     q: 'idempotent consumer มีบทบาทอะไร',
     options: [
-      'เอาความจำเป็นของ delivery timeout ออก',
+      'เอาความจำเป็นของ retry policy ออก',
       'เป็น safety net ทำให้การประมวลผลทำซ้ำได้ปลอดภัย การส่งซ้ำหรือ batch ที่ retry จึงลงเอยที่ state ที่ถูกต้องเดียวกัน',
       'ปิด dead-letter topic',
       'รับประกันว่าไม่มี duplicate บน network',

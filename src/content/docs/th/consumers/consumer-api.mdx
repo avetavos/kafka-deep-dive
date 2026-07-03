@@ -1,6 +1,6 @@
 ---
 title: 'The Consumer API'
-description: 'อ่าน record ด้วย Kafka consumer ทั้ง subscribe, poll loop, deserializer และเหตุผลที่ poll เป็นตัวขับเคลื่อนทุกอย่างของ consumer.'
+description: 'อ่าน record ด้วย KafkaJS consumer ทั้ง subscribe, consumer.run กับ eachMessage, การ deserialize เอง และเหตุผลที่ run loop เป็นตัวขับเคลื่อนทุกอย่างของ consumer'
 sidebar:
   order: 1
 ---
@@ -12,56 +12,60 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## แนวคิดในหนึ่งประโยค
 
-Kafka consumer จะ subscribe topic แล้ว **วนลูปเรียก `poll()`** — แต่ละ poll คืน record มาเป็น batch จาก partition ที่ถูก assign ให้ และ poll ตัวเดียวกันนี้เองที่คอยทำให้ consumer ยังมีชีวิตอยู่ใน group.
+Kafka consumer จะ subscribe topic แล้ว **รัน consume loop** — KafkaJS เรียก handler `eachMessage` ของคุณด้วย record จาก partition ที่ถูก assign ให้ และ loop ที่รันอยู่นี้เองที่คอยทำให้ consumer ยังมีชีวิตอยู่ใน group
 
-## subscribe ก่อน แล้วค่อย poll
+## subscribe ก่อน แล้วค่อย run
 
-คุณตั้งค่า consumer ด้วย `bootstrap.servers`, `group.id` และ **deserializer** (ตัวสะท้อนกลับของ serializer ฝั่ง producer) จากนั้น `subscribe()` ไปยัง topic ที่ต้องการ แล้วขับ **poll loop**:
+คุณสร้าง consumer จาก `Kafka` client พร้อม `groupId`, `connect()`, `subscribe()` ไปยัง topic ที่ต้องการ แล้วเริ่ม `run()` KafkaJS จะส่งแต่ละ record ให้ callback `eachMessage` ของคุณ โดย `key` และ `value` มาเป็น `Buffer` ดิบ — คุณ **deserialize เอง** (เช่น `.toString()` หรือ `JSON.parse`) เป็นภาพสะท้อนของฝั่ง producer ที่ serialize
 
-```java
-Properties props = new Properties();
-props.put("bootstrap.servers", "localhost:9092");
-props.put("group.id", "order-processor");          // consumer group membership
-props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
-props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+```typescript
+import { Kafka } from 'kafkajs';
 
-try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-    consumer.subscribe(List.of("orders"));
-    while (true) {
-        // Wait up to 1s for records, then process whatever arrived
-        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
-        for (ConsumerRecord<String, String> record : records) {
-            System.out.printf("p=%d off=%d key=%s val=%s%n",
-                record.partition(), record.offset(), record.key(), record.value());
-        }
-    }
+const kafka = new Kafka({ clientId: 'order-processor', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'order-processor' }); // consumer group membership
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'orders', fromBeginning: false }); // false = only new records (latest)
+
+  // run() drives the poll loop for you and calls eachMessage per record
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      // key/value are Buffers — deserialize them yourself
+      console.log(
+        `p=${partition} off=${message.offset} key=${message.key?.toString()} val=${message.value?.toString()}`,
+      );
+    },
+  });
 }
+
+main();
 ```
 
-## ทำไม loop ถึงสำคัญ
+## ทำไม run loop ถึงสำคัญ
 
-`poll()` ทำมากกว่าแค่ดึงข้อมูล ในการเรียกแต่ละครั้ง consumer ยังส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ของตัวเองด้วย ถ้าคุณหยุด poll — เช่นเพราะประมวลผล batch นานเกินไป — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **poll ต่อเนื่อง และคุมเวลา process ต่อ batch ให้จำกัด**
+`run()` ทำมากกว่าแค่ดึงข้อมูล เบื้องหลังมันคอย poll Kafka, ส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ให้ ถ้า `eachMessage` ของคุณ block นานเกินไป — process record หนึ่งนานกว่า session timeout — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **คุมเวลา process ต่อ record ให้จำกัด**
 
-<Mermaid title="The consumer poll loop" code={pollDiagram} />
+<Mermaid title="The consumer run loop" code={pollDiagram} />
 
 export const pollDiagram = `flowchart LR
-  sub["subscribe(topics)"] --> poll["poll(timeout)"]
-  poll --> recs["ConsumerRecords batch"]
-  recs --> proc["process each record"]
-  proc --> poll
-  poll -->|also| hb["send heartbeats + coordinate group"]`;
+  sub["subscribe(topics)"] --> run["consumer.run(...)"]
+  run --> each["eachMessage per record"]
+  each --> proc["process the record"]
+  proc --> run
+  run -->|also| hb["send heartbeats + coordinate group"]`;
 
 ## แต่ละ record พก coordinate ของตัวเองมา
 
-`ConsumerRecord` ทุกตัวเปิดเผย `topic()`, `partition()`, `offset()`, `key()`, `value()`, `timestamp()` และ headers ออกมา coordinate เหล่านี้คือสิ่งที่คุณใช้ commit ความคืบหน้า และใช้คิดเรื่องลำดับ — consumer จะเห็น record **เรียงตาม offset ภายในแต่ละ partition** แม้ว่า record จาก partition ต่างกันอาจสลับกันข้าม poll batch ได้.
+message ทุกตัวเปิดเผย `topic`, `partition`, `offset`, `key`, `value`, `timestamp` และ headers ออกมา coordinate เหล่านี้คือสิ่งที่คุณใช้ commit ความคืบหน้า และใช้คิดเรื่องลำดับ — consumer จะเห็น record **เรียงตาม offset ภายในแต่ละ partition** แม้ว่า record จาก partition ต่างกันอาจสลับกันได้
 
 <Callout title="สรุปหนึ่งบรรทัด">
-consumer จะ **`subscribe()`** ไปยัง topic แล้วขับ **`poll()` loop** โดย `poll()` คืน batch กลับมา **พร้อมกับ** ทำงานเบื้องหลัง — heartbeat, group coordination, ดึง assignment — ดังนั้นถ้าหยุด poll หรือ block นานเกินไป group จะ **rebalance** ย้าย partition ของคุณออกไป record มาถึง **เรียงตาม offset ภายใน partition** โดยแต่ละตัวติดป้าย topic, partition และ offset.
+consumer จะ **`subscribe()`** ไปยัง topic แล้วเริ่ม **`consumer.run({ eachMessage })`** ซึ่งขับ poll loop ให้คุณ — heartbeat, group coordination, ดึง assignment — ดังนั้นถ้า handler ของคุณ block นานเกินไป group จะ **rebalance** ย้าย partition ของคุณออกไป record มาถึง **เรียงตาม offset ภายใน partition** โดยแต่ละตัวติดป้าย topic, partition และ offset และคุณ **deserialize** key กับ value เอง
 </Callout>
 
 export const quizConsumerApi = [
   {
-    q: '`poll()` ทำอะไรอีกนอกจากคืน record?',
+    q: 'consumer.run() (poll loop) ทำอะไรอีกนอกจากคืน record?',
     options: [
       'ไม่ทำอะไรอีก — แค่ดึงข้อมูลอย่างเดียว',
       'มันยังส่ง heartbeat, ประสาน group membership และดึง partition assignment ด้วย',
@@ -71,22 +75,22 @@ export const quizConsumerApi = [
     answer: 1,
   },
   {
-    q: 'ถ้า consumer หยุดเรียก `poll()` นานเกินไปจะเกิดอะไรขึ้น?',
+    q: 'ถ้า consumer หยุด consume (handler block) นานเกินไปจะเกิดอะไรขึ้น?',
     options: [
       'Kafka จะเร่งความเร็วในการส่ง',
       'group coordinator จะถือว่ามันตายแล้ว และ rebalance ย้าย partition ไปให้ consumer ตัวอื่น',
       'consumer จะ scale up อัตโนมัติ',
-      'ไม่มีอะไรเกิดขึ้น การ poll เป็นทางเลือก',
+      'ไม่มีอะไรเกิดขึ้น การ consume เป็นทางเลือก',
     ],
     answer: 1,
   },
   {
-    q: 'deserializer มีไว้ทำอะไร?',
+    q: 'จะได้ key หรือ value ที่มี type จาก message ของ KafkaJS ได้ยังไง?',
     options: [
       'บีบอัด record ก่อนส่ง',
-      'แปลง raw bytes ของ key/value ในแต่ละ record กลับเป็น object ที่มี type บนฝั่ง consumer',
-      'assign partition',
-      'commit offset',
+      'key และ value มาเป็น Buffer — คุณ deserialize เอง (เช่น toString หรือ JSON.parse)',
+      'assign partition เอง',
+      'commit offset ก่อน',
     ],
     answer: 1,
   },

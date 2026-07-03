@@ -16,12 +16,17 @@ The **key** on a record decides its partition — the default partitioner hashes
 
 ## Key in, partition out
 
-Every `ProducerRecord` has an optional key. The producer's partitioner turns that key into a partition number:
+Every message you send can carry an optional `key`. The producer's partitioner turns that key into a partition number:
 
-```java
+```typescript
 // Same key "user-42" → same partition, every time → ordered per user
-producer.send(new ProducerRecord<>("orders", "user-42", "placed order #918"));
-producer.send(new ProducerRecord<>("orders", "user-42", "cancelled order #918"));
+await producer.send({
+  topic: 'orders',
+  messages: [
+    { key: 'user-42', value: 'placed order #918' },
+    { key: 'user-42', value: 'cancelled order #918' },
+  ],
+})
 ```
 
 For a **non-null key**, the default partitioner computes roughly `hash(key) % numberOfPartitions`. Deterministic hashing means every record for `user-42` goes to the same partition, so all of that user's events stay in one totally-ordered log. Different keys spread across partitions, balancing load.

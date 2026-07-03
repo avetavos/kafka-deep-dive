@@ -1,6 +1,6 @@
 ---
 title: 'Transactions'
-description: 'เขียนข้าม partition แบบ atomic ด้วย transactional producer transactional.id initTransactions begin และ commit read_committed และการเสริมความแข็งแรงจาก KIP-890 ใน Kafka 4.x'
+description: 'เขียนข้าม partition แบบ atomic ด้วย transactional producer transactionalId วงจรชีวิตของ transaction read_committed และการเสริมความแข็งแรงจาก KIP-890 ใน Kafka 4.x'
 sidebar:
   order: 2
 ---
@@ -16,59 +16,65 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ตั้งค่า transactional producer
 
-transaction ต่อยอดจาก idempotent producer คุณเพิ่ม **`transactional.id`** ซึ่งเป็น id ที่เสถียรและให้ Kafka fence ตัว zombie ของ producer เชิงตรรกะเดียวกันออกไป แล้วเรียก `initTransactions()` หนึ่งครั้งตอน startup
+transaction ต่อยอดจาก idempotent producer คุณเพิ่ม **`transactionalId`** ซึ่งเป็น id ที่เสถียรและให้ Kafka fence ตัว zombie ของ producer เชิงตรรกะเดียวกันออกไป พร้อมกับ `idempotent: true` และ `maxInFlightRequests: 1` การ connect producer จะลงทะเบียน transactional id ให้เอง — ต่างจาก client ฝั่ง Java ตรงที่ KafkaJS ไม่มี `initTransactions()` แยกต่างหาก
 
-```java
-Properties props = new Properties();
-props.put("bootstrap.servers", "localhost:9092");
-props.put("enable.idempotence", "true");     // required foundation
-props.put("transactional.id", "payments-tx-1");  // stable id enables transactions
-// ... serializers ...
+```typescript
+import { Kafka } from 'kafkajs'
 
-KafkaProducer<String, String> producer = new KafkaProducer<>(props);
-producer.initTransactions();   // registers the txn id, fences older instances
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] })
+
+// A transactional producer: a stable transactionalId is the key ingredient
+const producer = kafka.producer({
+  transactionalId: 'payments-tx-1',   // stable id enables transactions + zombie fencing
+  idempotent: true,                    // required foundation
+  maxInFlightRequests: 1,
+})
+
+await producer.connect()               // connecting registers the transactional id
 ```
 
 ## วงจรชีวิตของ transaction
 
-ห่อหน่วยงานหนึ่งไว้ใน `beginTransaction()` … `commitTransaction()` send ทุกตัวระหว่างนั้นถูก buffer เข้า transaction `commitTransaction()` ทำให้ทุกตัวปรากฏพร้อมกันแบบ atomic และ `abortTransaction()` ทิ้งทั้งหมด
+เริ่มหน่วยงานหนึ่งด้วย `producer.transaction()` send ทุกตัวบน `txn` ที่ได้คืนมาถูก buffer เข้า transaction `txn.commit()` ทำให้ทุกตัวปรากฏพร้อมกันแบบ atomic และ `txn.abort()` ทิ้งทั้งหมด
 
-```java
-producer.beginTransaction();
+```typescript
+const txn = await producer.transaction()   // begin
 try {
-    producer.send(new ProducerRecord<>("accounts", debitKey, debit));
-    producer.send(new ProducerRecord<>("accounts", creditKey, credit));
-    producer.commitTransaction();     // both writes appear together, or neither
-} catch (KafkaException e) {
-    producer.abortTransaction();       // roll back the whole unit
+  await txn.send({ topic: 'accounts', messages: [{ key: debitKey, value: debit }] })
+  await txn.send({ topic: 'accounts', messages: [{ key: creditKey, value: credit }] })
+  await txn.commit()     // both writes appear together, or neither
+} catch (e) {
+  await txn.abort()      // roll back the whole unit
 }
 ```
 
 ## consumer ต้องอ่านแบบ committed
 
-transaction มีความหมายก็ต่อเมื่อฝั่งอ่านเมิน data ที่ abort และที่ยัง in-flight ตั้ง isolation level ของ consumer เป็น **`read_committed`** เพื่อให้มันไม่เห็น record จาก transaction ที่ abort หรือที่ยังเปิดอยู่
+transaction มีความหมายก็ต่อเมื่อฝั่งอ่านเมิน data ที่ abort และที่ยัง in-flight ตั้ง consumer เป็น **`readUncommitted: false`** — คือ **read_committed** และเป็นค่า default ของ KafkaJS — เพื่อให้มันไม่เห็น record จาก transaction ที่ abort หรือที่ยังเปิดอยู่
 
-```properties
-isolation.level=read_committed
-enable.auto.commit=false
+```typescript
+const consumer = kafka.consumer({
+  groupId: 'ledger',
+  readUncommitted: false,   // read_committed: skip aborted and in-flight records
+})
 ```
 
 <Mermaid title="transaction commit หลาย write แบบ atomic" code={txnDiagram} />
 
 export const txnDiagram = `flowchart LR
-  init["initTransactions() once"] --> begin["beginTransaction()"]
-  begin --> s1["send to accounts-0"]
-  begin --> s2["send to accounts-2"]
-  s1 --> commit["commitTransaction(): all visible together"]
+  init["connect() once (registers txn id)"] --> begin["producer.transaction()"]
+  begin --> s1["txn.send to accounts-0"]
+  begin --> s2["txn.send to accounts-2"]
+  s1 --> commit["txn.commit(): all visible together"]
   s2 --> commit
-  begin -.->|on error| abort["abortTransaction(): nothing visible"]`;
+  begin -.->|on error| abort["txn.abort(): nothing visible"]`;
 
 ## KIP-890 ใน Kafka 4.x
 
 Kafka 4.x finalize **KIP-890 Transactions Server-Side Defense** ที่เสริมความแข็งแรงให้ transactional protocol รับมือ edge case อย่าง transaction ที่ค้างและ zombie producer พอ finalize การอัปเกรด 4.0 protocol ใหม่ที่แข็งแรงกว่าก็ถูกเปิดใช้ ทำให้ transactional pipeline บน Kafka 4.x ทนทานกว่าเวอร์ชันเก่าโดยที่คุณไม่ต้องแก้ code ฝั่งตัวเอง
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**transaction** ทำให้การเขียนข้าม partition เป็น **atomic** ตั้ง `enable.idempotence=true` บวก **`transactional.id`** ที่เสถียร เรียก `initTransactions()` หนึ่งครั้ง แล้วใช้ `beginTransaction()` / `commitTransaction()` (หรือ `abortTransaction()`) ฝั่งอ่านต้องใช้ **`isolation.level=read_committed`** เพื่อข้าม data ที่ abort หรือเปิดค้าง Kafka 4.x เสริมความแข็งแรงทั้งหมดนี้ผ่าน **KIP-890** แบบโปร่งใส
+**transaction** ทำให้การเขียนข้าม partition เป็น **atomic** ตั้ง `idempotent: true` บวก **`transactionalId`** ที่เสถียร (และ `maxInFlightRequests: 1`) แล้วใช้ `producer.transaction()` → `txn.commit()` (หรือ `txn.abort()`) ฝั่งอ่านต้องใช้ **`readUncommitted: false`** (read_committed) เพื่อข้าม data ที่ abort หรือเปิดค้าง Kafka 4.x เสริมความแข็งแรงทั้งหมดนี้ผ่าน **KIP-890** แบบโปร่งใส
 </Callout>
 
 export const quizTransactions = [
@@ -83,7 +89,7 @@ export const quizTransactions = [
     answer: 1,
   },
   {
-    q: 'บทบาทของ `transactional.id` คืออะไร',
+    q: 'บทบาทของ `transactionalId` คืออะไร',
     options: [
       'มันตั้งชื่อ topic',
       'id ที่เสถียรของ producer เชิงตรรกะ ที่ให้ Kafka fence ตัว zombie ออกไป',
@@ -95,9 +101,9 @@ export const quizTransactions = [
   {
     q: 'consumer ต้องตั้งอะไรเพื่ออ่าน transactional data ให้ถูกต้อง',
     options: [
-      '`isolation.level=read_uncommitted`',
-      '`isolation.level=read_committed` เพื่อข้าม record ที่ abort และที่ยัง in-flight',
-      '`enable.auto.commit=true`',
+      '`readUncommitted: true`',
+      '`readUncommitted: false` (read_committed) เพื่อข้าม record ที่ abort และที่ยัง in-flight',
+      '`autoCommit: true`',
       'fetch size ที่ใหญ่ขึ้น',
     ],
     answer: 1,

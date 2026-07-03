@@ -16,12 +16,17 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## Key เข้า partition ออก
 
-`ProducerRecord` ทุกตัวมี key แบบ optional partitioner ของ producer จะแปลง key เป็นเลข partition:
+message ทุกตัวที่ส่งมี key แบบ optional ได้ partitioner ของ producer จะแปลง key เป็นเลข partition:
 
-```java
+```typescript
 // Same key "user-42" → same partition, every time → ordered per user
-producer.send(new ProducerRecord<>("orders", "user-42", "placed order #918"));
-producer.send(new ProducerRecord<>("orders", "user-42", "cancelled order #918"));
+await producer.send({
+  topic: 'orders',
+  messages: [
+    { key: 'user-42', value: 'placed order #918' },
+    { key: 'user-42', value: 'cancelled order #918' },
+  ],
+})
 ```
 
 สำหรับ key ที่ **ไม่ null** default partitioner คำนวณประมาณ `hash(key) % numberOfPartitions` การ hash แบบ deterministic ทำให้ทุก record ของ `user-42` ไป partition เดียวกัน event ของ user นั้นจึงอยู่ใน log เดียวที่ ordered ทั้งหมด ส่วน key ต่างกันก็กระจายไปคนละ partition ช่วยบาลานซ์โหลด.

@@ -51,9 +51,12 @@ export const retentionDiagram = `flowchart TB
 
 ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บมันไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น.
 
-```java
+```typescript
 // Tombstone: null value tells a compacted topic to forget this key
-producer.send(new ProducerRecord<>("user-config", "user-42", null));
+await producer.send({
+  topic: 'user-config',
+  messages: [{ key: 'user-42', value: null }],
+})
 ```
 
 รวม policy ได้ด้วย `cleanup.policy=compact,delete` เพื่อ compact ตาม key **และ** ยังทยอยลบข้อมูลที่เก่ามากออกไป.

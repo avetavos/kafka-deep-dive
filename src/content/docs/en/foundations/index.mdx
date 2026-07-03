@@ -9,7 +9,7 @@ import Callout from '../../../../components/Callout.astro';
 
 Apache **Kafka** is a distributed event streaming platform: a durable, replayable log that many producers write to and many consumers read from, independently and at their own pace. This course is written **for developers** — people who write producers and consumers, reason about delivery guarantees, and have to make Kafka behave correctly in production.
 
-It targets **Kafka 4.x**, which runs exclusively in **KRaft mode** — ZooKeeper has been fully removed. Every CLI example uses `--bootstrap-server`, and the client examples use the official Java `kafka-clients` API, the canonical reference every other client mirrors.
+It targets **Kafka 4.x**, which runs exclusively in **KRaft mode** — ZooKeeper has been fully removed. Every CLI example uses `--bootstrap-server`, and the client examples are **TypeScript** using **KafkaJS** — the widely-used Node.js client whose API is also implemented by Confluent's official `@confluentinc/kafka-javascript`. (Kafka Streams, covered later, is a JVM-only library and is shown in Java.)
 
 ## What this course covers
 

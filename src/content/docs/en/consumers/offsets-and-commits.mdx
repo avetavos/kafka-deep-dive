@@ -1,6 +1,6 @@
 ---
 title: 'Offsets & Commits'
-description: 'How a consumer records its progress — committed offsets, auto-commit vs manual commitSync and commitAsync, and the at-least-once default.'
+description: 'How a consumer records its progress — committed offsets, auto-commit vs manual commitOffsets in KafkaJS, and the at-least-once default.'
 sidebar:
   order: 3
 ---
@@ -18,55 +18,60 @@ A consumer records how far it has processed by **committing an offset** per part
 
 Two offsets travel with each partition:
 
-- **Position** — the next offset the consumer will fetch (advances as you poll).
+- **Position** — the next offset the consumer will fetch (advances as you consume).
 - **Committed offset** — the last offset the consumer durably recorded as "done."
 
 On restart or rebalance, a consumer resumes from the **committed** offset. So a commit is a promise: "everything before this is processed; don't send it again."
 
 ## Auto-commit is convenient and risky
 
-By default `enable.auto.commit=true` commits the latest polled offset every `auto.commit.interval.ms` (5s). It is easy, but it commits on a timer regardless of whether your processing succeeded — a crash after auto-commit but before processing **loses** those records. For anything that matters, turn it off and commit **after** processing:
+By default KafkaJS commits automatically (`autoCommit: true`): it periodically commits the offsets it has delivered, every `autoCommitInterval` ms (or after `autoCommitThreshold` messages). It is easy, but it commits on a schedule regardless of whether your processing succeeded — a crash after an auto-commit but before processing **loses** those records. For anything that matters, set `autoCommit: false` and commit **after** processing:
 
-```java
-props.put("enable.auto.commit", "false");   // take control of commits
+```typescript
+const consumer = kafka.consumer({ groupId: 'order-processor' });
+await consumer.connect();
+await consumer.subscribe({ topic: 'orders' });
 
-while (true) {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
-    for (ConsumerRecord<String, String> record : records) {
-        process(record);                     // do the work FIRST
-    }
-    consumer.commitSync();                    // then commit — at-least-once
-}
+await consumer.run({
+  autoCommit: false,                                    // take control of commits
+  eachMessage: async ({ topic, partition, message }) => {
+    await process(message);                             // do the work FIRST
+    // then commit the NEXT offset to read (offset + 1) — at-least-once
+    await consumer.commitOffsets([
+      { topic, partition, offset: (Number(message.offset) + 1).toString() },
+    ]);
+  },
+});
 ```
 
-## commitSync vs commitAsync
+## Manual commits in KafkaJS
 
-- **`commitSync()`** blocks until the broker acknowledges, retries on retriable errors — safe, slower.
-- **`commitAsync()`** fires and continues, with an optional callback — faster, no automatic retry (a common pattern is `commitAsync` in the loop and a final `commitSync` on shutdown).
+With `autoCommit: false` you commit yourself with **`consumer.commitOffsets([...])`**, which returns a Promise. **Await it** to be sure the commit was acknowledged before you move on — the safe, slightly slower choice, like a synchronous commit. Skip the `await` to fire it in the background for throughput, accepting that a failure won't be caught inline. Either way you commit the **next** offset to read (`offset + 1`), because that is where the consumer should resume.
 
 ## Where to start, and replaying with seek()
 
-A committed offset only helps if one exists. The first time a group reads a partition — or if its committed offset has aged out of retention — `auto.offset.reset` decides where to begin:
+A committed offset only helps if one exists. The first time a group reads a partition — or if its committed offset has aged out of retention — KafkaJS's `fromBeginning` flag on `subscribe()` decides where to begin:
 
-- **`earliest`** — start at the beginning of the partition and reprocess all retained history.
-- **`latest`** — start at the end, reading only records that arrive from now on (this is the default).
+- **`fromBeginning: true`** — start at the beginning of the partition and reprocess all retained history (the `earliest` policy).
+- **`fromBeginning: false`** — start at the end, reading only records that arrive from now on (the default, `latest`).
 
-You can also override the position yourself with `seek()` — move a partition to any offset to **replay** old records or skip ahead:
+You can also override the position yourself with `consumer.seek()` — move a partition to any offset to **replay** old records or skip ahead:
 
-```java
-props.put("auto.offset.reset", "earliest"); // where to begin when there is no committed offset
+```typescript
+// where to begin when there is no committed offset:
+// fromBeginning: true = earliest (replay all history), false = latest (default)
+await consumer.subscribe({ topic: 'orders', fromBeginning: true });
 
-// Replay partition 0 of "orders" starting from offset 100
-TopicPartition tp = new TopicPartition("orders", 0);
-consumer.seek(tp, 100);                      // the next poll() fetches from offset 100
-// consumer.seekToBeginning(List.of(tp));    // or replay the whole partition from the start
+// Replay partition 0 of "orders" from offset 100 (call after run() has started)
+consumer.seek({ topic: 'orders', partition: 0, offset: '100' }); // next fetch starts at offset 100
+// use offset '0' to replay the whole partition from the start
 ```
 
 <Mermaid title="Commit after processing gives at-least-once" code={commitDiagram} />
 
 export const commitDiagram = `flowchart LR
   poll["poll batch"] --> proc["process records"]
-  proc --> commit["commitSync() after success"]
+  proc --> commit["commitOffsets() after success"]
   commit --> poll
   proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates)"]`;
 
@@ -75,7 +80,7 @@ export const commitDiagram = `flowchart LR
 Commit **after** processing and a crash between the two means those records are re-read and reprocessed on restart — **at-least-once**, possible duplicates. Commit **before** processing and a crash means they are skipped — **at-most-once**, possible loss. At-least-once is the common default; making it effectively exactly-once takes idempotent processing or transactions, which the next module covers.
 
 <Callout title="The one-line takeaway">
-A consumer commits **offsets** to mark progress (stored in `__consumer_offsets`), and resumes from the **committed** offset after a restart. **Auto-commit** is easy but commits on a timer and can lose records; for correctness, disable it and **commit after processing** with `commitSync()`/`commitAsync()`. Committing after processing yields **at-least-once** (possible duplicates) — the default to design around. Use **`auto.offset.reset`** to decide where a brand-new group starts (`earliest`/`latest`) and **`seek()`** to replay.
+A consumer commits **offsets** to mark progress (stored in `__consumer_offsets`), and resumes from the **committed** offset after a restart. **Auto-commit** (`autoCommit: true`) is easy but commits on a schedule and can lose records; for correctness set **`autoCommit: false`** and **commit after processing** with `consumer.commitOffsets([...])`. Committing after processing yields **at-least-once** (possible duplicates) — the default to design around. Use **`fromBeginning`** to decide where a brand-new group starts (earliest/latest) and **`seek()`** to replay.
 </Callout>
 
 export const quizOffsets = [
@@ -93,9 +98,9 @@ export const quizOffsets = [
     q: 'Why is auto-commit risky for important processing?',
     options: [
       'It commits too rarely to be useful',
-      'It commits on a timer regardless of whether processing succeeded, so a crash can lose records',
+      'It commits on a schedule regardless of whether processing succeeded, so a crash can lose records',
       'It duplicates every record',
-      'It disables the poll loop',
+      'It disables the consume loop',
     ],
     answer: 1,
   },
@@ -110,12 +115,12 @@ export const quizOffsets = [
     answer: 1,
   },
   {
-    q: 'What is the difference between commitSync and commitAsync?',
+    q: 'With manual commits in KafkaJS, what does awaiting consumer.commitOffsets(...) give you?',
     options: [
-      'commitSync is faster and never retries',
-      'commitSync blocks and retries on retriable errors; commitAsync returns immediately without automatic retry',
-      'They are identical',
-      'commitAsync writes to disk; commitSync writes to memory',
+      'Nothing; commits are always instant and unacknowledged',
+      'It waits until the commit is acknowledged before continuing — the safe choice, vs firing it in the background for throughput',
+      'It deletes old offsets from the topic',
+      'It creates a new consumer group',
     ],
     answer: 1,
   },

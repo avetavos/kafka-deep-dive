@@ -1,6 +1,6 @@
 ---
 title: 'Transactions'
-description: 'Atomic multi-partition writes with the transactional producer — transactional.id, initTransactions, begin and commit, read_committed, and the KIP-890 hardening in Kafka 4.x.'
+description: 'Atomic multi-partition writes with the transactional producer — transactionalId, the transaction lifecycle, read_committed, and the KIP-890 hardening in Kafka 4.x.'
 sidebar:
   order: 2
 ---
@@ -16,59 +16,65 @@ A Kafka **transaction** lets a producer write to multiple partitions (and commit
 
 ## Configuring a transactional producer
 
-Transactions build on the idempotent producer. You add a **`transactional.id`** — a stable identifier that lets Kafka fence out zombie instances of the same logical producer — and call `initTransactions()` once at startup:
+Transactions build on the idempotent producer. You add a **`transactionalId`** — a stable identifier that lets Kafka fence out zombie instances of the same logical producer — along with `idempotent: true` and `maxInFlightRequests: 1`. Connecting the producer registers the transactional id; unlike the Java client, KafkaJS has no separate `initTransactions()` call.
 
-```java
-Properties props = new Properties();
-props.put("bootstrap.servers", "localhost:9092");
-props.put("enable.idempotence", "true");     // required foundation
-props.put("transactional.id", "payments-tx-1");  // stable id enables transactions
-// ... serializers ...
+```typescript
+import { Kafka } from 'kafkajs'
 
-KafkaProducer<String, String> producer = new KafkaProducer<>(props);
-producer.initTransactions();   // registers the txn id, fences older instances
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] })
+
+// A transactional producer: a stable transactionalId is the key ingredient
+const producer = kafka.producer({
+  transactionalId: 'payments-tx-1',   // stable id enables transactions + zombie fencing
+  idempotent: true,                    // required foundation
+  maxInFlightRequests: 1,
+})
+
+await producer.connect()               // connecting registers the transactional id
 ```
 
 ## The transaction lifecycle
 
-Wrap a unit of work in `beginTransaction()` … `commitTransaction()`. Any sends between them are buffered into the transaction; `commitTransaction()` makes them all visible atomically, and `abortTransaction()` discards them:
+Start a unit of work with `producer.transaction()`. Any sends on the returned `txn` are buffered into the transaction; `txn.commit()` makes them all visible atomically, and `txn.abort()` discards them:
 
-```java
-producer.beginTransaction();
+```typescript
+const txn = await producer.transaction()   // begin
 try {
-    producer.send(new ProducerRecord<>("accounts", debitKey, debit));
-    producer.send(new ProducerRecord<>("accounts", creditKey, credit));
-    producer.commitTransaction();     // both writes appear together, or neither
-} catch (KafkaException e) {
-    producer.abortTransaction();       // roll back the whole unit
+  await txn.send({ topic: 'accounts', messages: [{ key: debitKey, value: debit }] })
+  await txn.send({ topic: 'accounts', messages: [{ key: creditKey, value: credit }] })
+  await txn.commit()     // both writes appear together, or neither
+} catch (e) {
+  await txn.abort()      // roll back the whole unit
 }
 ```
 
 ## Consumers must read committed
 
-Transactions only matter if readers ignore aborted and in-flight data. Set the consumer\'s isolation level to **`read_committed`** so it never sees records from aborted or open transactions:
+Transactions only matter if readers ignore aborted and in-flight data. Set the consumer to **`readUncommitted: false`** — **read_committed**, and the KafkaJS default — so it never sees records from aborted or open transactions:
 
-```properties
-isolation.level=read_committed
-enable.auto.commit=false
+```typescript
+const consumer = kafka.consumer({
+  groupId: 'ledger',
+  readUncommitted: false,   // read_committed: skip aborted and in-flight records
+})
 ```
 
 <Mermaid title="A transaction commits multiple writes atomically" code={txnDiagram} />
 
 export const txnDiagram = `flowchart LR
-  init["initTransactions() once"] --> begin["beginTransaction()"]
-  begin --> s1["send to accounts-0"]
-  begin --> s2["send to accounts-2"]
-  s1 --> commit["commitTransaction(): all visible together"]
+  init["connect() once (registers txn id)"] --> begin["producer.transaction()"]
+  begin --> s1["txn.send to accounts-0"]
+  begin --> s2["txn.send to accounts-2"]
+  s1 --> commit["txn.commit(): all visible together"]
   s2 --> commit
-  begin -.->|on error| abort["abortTransaction(): nothing visible"]`;
+  begin -.->|on error| abort["txn.abort(): nothing visible"]`;
 
 ## KIP-890 in Kafka 4.x
 
 Kafka 4.x finalizes **KIP-890, Transactions Server-Side Defense**, which strengthens the transactional protocol against edge cases like hanging transactions and zombie producers. When the 4.0 upgrade is finalized the new, hardened protocol is enabled — so transactional pipelines on Kafka 4.x are more robust than on older versions with no code change on your side.
 
 <Callout title="The one-line takeaway">
-A **transaction** makes multi-partition writes **atomic**: configure `enable.idempotence=true` plus a stable **`transactional.id`**, call `initTransactions()` once, then `beginTransaction()` / `commitTransaction()` (or `abortTransaction()`). Readers must use **`isolation.level=read_committed`** to skip aborted/open data. Kafka 4.x hardens all of this via **KIP-890**, transparently.
+A **transaction** makes multi-partition writes **atomic**: configure `idempotent: true` plus a stable **`transactionalId`** (and `maxInFlightRequests: 1`), then `producer.transaction()` → `txn.commit()` (or `txn.abort()`). Readers must use **`readUncommitted: false`** (read_committed) to skip aborted/open data. Kafka 4.x hardens all of this via **KIP-890**, transparently.
 </Callout>
 
 export const quizTransactions = [
@@ -83,7 +89,7 @@ export const quizTransactions = [
     answer: 1,
   },
   {
-    q: 'What is the role of `transactional.id`?',
+    q: 'What is the role of `transactionalId`?',
     options: [
       'It names the topic',
       'A stable identifier for the logical producer that lets Kafka fence out zombie instances',
@@ -95,9 +101,9 @@ export const quizTransactions = [
   {
     q: 'What must a consumer set to correctly read transactional data?',
     options: [
-      '`isolation.level=read_uncommitted`',
-      '`isolation.level=read_committed`, so it skips aborted and in-flight records',
-      '`enable.auto.commit=true`',
+      '`readUncommitted: true`',
+      '`readUncommitted: false` (read_committed), so it skips aborted and in-flight records',
+      '`autoCommit: true`',
       'A larger fetch size',
     ],
     answer: 1,

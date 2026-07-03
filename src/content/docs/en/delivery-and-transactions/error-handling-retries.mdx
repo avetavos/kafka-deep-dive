@@ -1,6 +1,6 @@
 ---
 title: 'Error Handling & Retries'
-description: 'Resilient pipelines — producer retries and delivery.timeout.ms, retriable vs fatal transactional errors, the dead-letter topic pattern, and idempotent consumers as the safety net.'
+description: 'Resilient pipelines — automatic retries via the KafkaJS retry policy, retriable vs fatal transactional errors, the dead-letter topic pattern, and idempotent consumers as the safety net.'
 sidebar:
   order: 4
 ---
@@ -12,41 +12,49 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Robust Kafka code sorts every failure into one of three buckets — **retriable** (let the producer retry within `delivery.timeout.ms`), **abortable** (roll the transaction back and try again), or **fatal** (close the producer and let another instance take over) — and dead-letters the records that can never succeed.
+Robust Kafka code sorts every failure into one of three buckets — **retriable** (let the KafkaJS retry policy retry it), **abortable** (roll the transaction back and try the batch again), or **fatal** (disconnect the producer and let another instance take over) — and dead-letters the records that can never succeed.
 
-## Producer retries are automatic and time-bounded
+## Producer retries are automatic and bounded
 
-The producer retries retriable errors — leader elections, transient network blips — on its own. The modern control is not a retry *count* but a **time budget**: `delivery.timeout.ms` (default **120000**) is the upper bound on how long `send()` may take to report success or failure, covering batching, broker acknowledgement, and every retry underneath. It must be at least `request.timeout.ms + linger.ms`.
+KafkaJS retries retriable errors — leader elections, transient network blips — on its own, governed by the client's **`retry` policy**: a bounded number of `retries` with **exponential backoff** (each wait starts at `initialRetryTime` and grows up to `maxRetryTime`). You set it once on the `Kafka` client, and it covers producing, consuming, and admin calls.
 
-```properties
-delivery.timeout.ms=120000     # total deadline for a send, including all retries
-request.timeout.ms=30000       # per-attempt broker wait
-retries=2147483647             # effectively unlimited; the deadline bounds it
-enable.idempotence=true        # retries stay duplicate-free within a partition
+```typescript
+const kafka = new Kafka({
+  clientId: 'orders-app',
+  brokers: ['localhost:9092'],
+  retry: {
+    retries: 8,             // bounded automatic retries for retriable errors
+    initialRetryTime: 300,  // first backoff in ms; grows exponentially
+    maxRetryTime: 30000,    // cap on any single backoff
+  },
+})
+
+const producer = kafka.producer({ idempotent: true })  // keeps those retries duplicate-free
 ```
 
-With `enable.idempotence=true`, these retries never create duplicates in the partition, so you can retry aggressively without corrupting the stream.
+With an `idempotent: true` producer, these retries never create duplicates in the partition, so you can retry aggressively without corrupting the stream.
 
-## Retriable vs abortable vs fatal in a transaction
+## Abortable vs fatal in a transaction
 
-Inside a transactional loop, exceptions are not all equal — the recovery action differs by class:
+Inside a transactional loop, KafkaJS throws when an operation fails, and the thrown error's **`retriable`** flag decides the recovery:
 
-- **`TransactionAbortableException`** — the transaction cannot commit but the producer is still healthy. Call `abortTransaction()` and **retry the batch** from the last committed offsets.
-- **`ProducerFencedException`** and **`OutOfOrderSequenceException`** — **fatal**. Another instance has claimed your `transactional.id` (a zombie was fenced) or the idempotent sequence is broken. You cannot recover this producer; **close it and shut down** so a healthy instance continues.
+- **retriable / abortable** (`e.retriable === true`) — the transaction cannot commit but the producer is still healthy. Call `txn.abort()` and **retry the batch** from the last committed offsets.
+- **fatal** (`e.retriable === false`) — a newer producer has claimed your `transactionalId` (a zombie was fenced) or the idempotent sequence is broken. You cannot recover this producer; **disconnect it and shut down** so a healthy instance continues.
 
-```java
+```typescript
+const txn = await producer.transaction()
 try {
-    producer.beginTransaction();
-    for (ConsumerRecord<String, String> record : records) {
-        producer.send(new ProducerRecord<>("orders-enriched", record.key(), transform(record)));
-    }
-    producer.sendOffsetsToTransaction(offsetsFor(records), consumer.groupMetadata());
-    producer.commitTransaction();
-} catch (ProducerFencedException | OutOfOrderSequenceException e) {
-    producer.close();       // FATAL: a zombie was fenced — give up this instance
-    shutdown();
-} catch (TransactionAbortableException e) {
-    producer.abortTransaction();   // roll back and retry the batch
+  for (const message of batch.messages) {
+    await txn.send({ topic: 'orders-enriched', messages: [{ key: message.key, value: transform(message) }] })
+  }
+  await txn.sendOffsets({ consumerGroupId: 'enricher', topics: offsetsFor(batch) })
+  await txn.commit()
+} catch (e) {
+  await txn.abort()                  // ABORTABLE: roll back and retry the batch
+  if (!e.retriable) {                // FATAL: a zombie was fenced — give up this instance
+    await producer.disconnect()
+    throw e
+  }
 }
 ```
 
@@ -54,12 +62,12 @@ try {
 
 A **poison message** is a record the consumer can never process — malformed payload, an unparseable schema, a permanently failing downstream. Retrying it forever stalls the whole partition behind it. The standard fix is a **dead-letter topic (DLT)**: after N failed attempts, produce the record plus error context to a separate `orders-dlq` topic, commit past it, and keep the main flow moving. A human or a separate job inspects the DLT out of band.
 
-```java
+```typescript
 try {
-    process(record);
-} catch (NonRetriableException e) {
-    // Route the bad record aside instead of blocking the partition
-    dlqProducer.send(new ProducerRecord<>("orders-dlq", record.key(), record.value()));
+  await process(message)
+} catch (e) {
+  // Route the bad record aside instead of blocking the partition
+  await dlqProducer.send({ topic: 'orders-dlq', messages: [{ key: message.key, value: message.value }] })
 }
 // commit past the record either way, so the partition keeps advancing
 ```
@@ -70,50 +78,50 @@ Underneath all of this, **idempotent consumers are the safety net**. Because at-
 
 export const errorDiagram = `flowchart TB
   fail["failure during send or process"] --> retriable{"which kind?"}
-  retriable -->|"transient"| retry["producer retries within delivery.timeout.ms"]
-  retriable -->|"TransactionAbortableException"| abort["abortTransaction() then retry batch"]
-  retriable -->|"ProducerFenced / OutOfOrderSequence"| fatal["close producer and shut down"]
+  retriable -->|"transient"| retry["KafkaJS retries per its retry policy"]
+  retriable -->|"abortable (e.retriable)"| abort["txn.abort() then retry batch"]
+  retriable -->|"fatal (not retriable)"| fatal["disconnect producer and shut down"]
   retriable -->|"poison message"| dlq["send to dead-letter topic, commit past it"]`;
 
 <Callout title="The one-line takeaway">
-Sort failures by class: transient errors are handled by **automatic retries bounded by `delivery.timeout.ms`** (default 120000, kept duplicate-free by **`enable.idempotence=true`**); **`TransactionAbortableException`** means **abort and retry the batch**; **`ProducerFencedException`** and **`OutOfOrderSequenceException`** are **fatal — close and shut down**. Route poison messages to a **dead-letter topic**, and keep **idempotent consumers** as the safety net so any redelivery lands on the same state.
+Sort failures by kind: transient errors are handled by **automatic retries from the KafkaJS `retry` policy** (bounded `retries` with exponential backoff, kept duplicate-free by an **`idempotent: true`** producer); an **abortable** transaction error (`e.retriable`) means **`txn.abort()` and retry the batch**; a **non-retriable** one is **fatal — disconnect and shut down**. Route poison messages to a **dead-letter topic**, and keep **idempotent consumers** as the safety net so any redelivery lands on the same state.
 </Callout>
 
 export const quizErrors = [
   {
-    q: 'What does `delivery.timeout.ms` bound?',
+    q: 'How does KafkaJS bound automatic retries?',
     options: [
-      'How long a consumer waits between polls',
-      'The total time a send may take to report success or failure, including batching and all retries (default 120000)',
-      'The retention period of a topic',
-      'The heartbeat interval',
+      'It retries forever until the broker responds',
+      'Via the client `retry` policy — a bounded number of `retries` with exponential backoff',
+      'It never retries; you must retry manually',
+      'By the topic retention period',
     ],
     answer: 1,
   },
   {
-    q: 'How should you handle a TransactionAbortableException?',
+    q: 'How should you handle an abortable (retriable) transaction error?',
     options: [
-      'Close the producer and shut down permanently',
-      'Call abortTransaction() and retry the batch from the last committed offsets',
+      'Disconnect the producer and shut down permanently',
+      'Call `txn.abort()` and retry the batch from the last committed offsets',
       'Commit the transaction anyway',
       'Ignore it and keep sending',
     ],
     answer: 1,
   },
   {
-    q: 'Why are ProducerFencedException and OutOfOrderSequenceException fatal?',
+    q: 'Why is a non-retriable transaction error (`e.retriable === false`) fatal?',
     options: [
-      'They are transient network errors that clear on their own',
-      'Another instance has taken over the transactional.id or the sequence is broken — this producer cannot recover, so close it and shut down',
-      'They mean the topic was deleted',
-      'They only occur when idempotence is disabled',
+      'It is a transient network error that clears on its own',
+      'A newer producer has taken over the transactionalId or the sequence is broken — this producer cannot recover, so disconnect it and shut down',
+      'It means the topic was deleted',
+      'It only occurs when idempotence is disabled',
     ],
     answer: 1,
   },
   {
     q: 'What role do idempotent consumers play?',
     options: [
-      'They remove the need for a delivery timeout',
+      'They remove the need for a retry policy',
       'They are the safety net: making processing safe to repeat means any redelivery or retried batch lands on the same correct state',
       'They disable dead-letter topics',
       'They guarantee zero duplicates on the network',

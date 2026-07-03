@@ -51,9 +51,12 @@ export const retentionDiagram = `flowchart TB
 
 Under compaction, how do you delete a key entirely? Write a **tombstone** — a record with the key and a **null value**. Compaction treats it as "this key is gone," retains it long enough for all consumers to observe the deletion, then removes both the tombstone and the key's history.
 
-```java
+```typescript
 // Tombstone: null value tells a compacted topic to forget this key
-producer.send(new ProducerRecord<>("user-config", "user-42", null));
+await producer.send({
+  topic: 'user-config',
+  messages: [{ key: 'user-42', value: null }],
+})
 ```
 
 You can also combine policies with `cleanup.policy=compact,delete` to compact by key **and** still age out very old data.
