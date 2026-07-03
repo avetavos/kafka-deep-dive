@@ -10,7 +10,7 @@ export default defineConfig({
   base: '/kafka',
   output: 'static',
   integrations: [starlight({
-      title: 'Kafka Deep Dive',
+      title: 'Kafka — From Zero to Hero',
       head: [
         { tag: 'script', attrs: { type: 'module', src: '/kafka/enhance.js' } },
         { tag: 'link', attrs: { rel: 'manifest', href: '/kafka/manifest.webmanifest' } },
@@ -20,7 +20,7 @@ export default defineConfig({
         { tag: 'meta', attrs: { name: 'mobile-web-app-capable', content: 'yes' } },
         { tag: 'meta', attrs: { name: 'apple-mobile-web-app-capable', content: 'yes' } },
         { tag: 'meta', attrs: { name: 'apple-mobile-web-app-status-bar-style', content: 'black-translucent' } },
-        { tag: 'meta', attrs: { name: 'apple-mobile-web-app-title', content: "Kafka Deep Dive" } },
+        { tag: 'meta', attrs: { name: 'apple-mobile-web-app-title', content: "Kafka — From Zero to Hero" } },
         { tag: 'script', content: "if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/kafka/sw.js',{scope:'/kafka/'}).catch(function(){})})}" },
       ],
       defaultLocale: 'en',

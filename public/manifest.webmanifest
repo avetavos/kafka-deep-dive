@@ -1,7 +1,7 @@
 {
   "id": "/kafka/",
-  "name": "Kafka Deep Dive",
-  "short_name": "Kafka Deep Dive",
+  "name": "Kafka — From Zero to Hero",
+  "short_name": "Kafka",
   "start_url": "/kafka/en/",
   "scope": "/kafka/",
   "display": "standalone",
