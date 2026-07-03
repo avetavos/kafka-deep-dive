@@ -1,0 +1,125 @@
+---
+title: 'Security & Production'
+description: 'ทำ Kafka ให้ปลอดภัยสำหรับ production TLS encryption in transit, SASL authentication, ACL authorization ด้วย kafka-acls.sh และ checklist ความพร้อมสำหรับ cluster ที่ durable และปลอดภัย'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+การทำ Kafka ให้ปลอดภัยคือสามชั้นซ้อนกัน **encryption in transit** ด้วย TLS, **authentication** ด้วย SASL หรือ mTLS เพื่อพิสูจน์ว่า client เป็นใคร และ **authorization** ด้วย ACL เพื่อคุมว่า client นั้นทำอะไรได้ ทั้งหมดวางอยู่บน cluster ที่ตั้งค่าให้ durable
+
+## encryption และ authentication
+
+โดย default listener ของ Kafka พูด plaintext สำหรับ production คุณเปิด **TLS/SSL** เพื่อให้ traffic ระหว่าง client กับ broker และระหว่าง broker ด้วยกันเอง ถูก encrypt ระหว่างส่ง เหนือขึ้นไปคุณเพิ่ม **authentication** เพื่อให้ broker รู้ว่าใครกำลังเชื่อมต่อ Kafka รองรับ SASL mechanism หลายแบบบวกกับ mutual TLS
+
+- **SASL/SCRAM** salted challenge-response โดยเก็บ credential ไว้ใน cluster เป็นตัวเลือกที่นิยมและ self-contained
+- **SASL/PLAIN** username กับ password ปลอดภัยเฉพาะ **บน TLS**
+- **SASL/OAUTHBEARER** OAuth 2.0 bearer token สำหรับ integrate กับ identity provider
+- **mTLS** TLS certificate ของ client เองคือ identity จึงไม่ต้องมี password แยก
+
+```properties
+# Broker listener using TLS for encryption + SASL/SCRAM for authentication
+listeners=SASL_SSL://:9093
+security.inter.broker.protocol=SASL_SSL
+sasl.enabled.mechanisms=SCRAM-SHA-256
+ssl.keystore.location=/etc/kafka/broker.keystore.jks
+ssl.truststore.location=/etc/kafka/broker.truststore.jks
+```
+
+## authorization ด้วย ACL
+
+authentication พิสูจน์ identity ส่วน **authorization** ตัดสินว่า identity นั้นทำอะไรได้ authorizer ของ Kafka เช็ค **ACL** กฎอย่าง "user `analytics` Read topic `orders` ได้" คุณจัดการมันด้วย `kafka-acls.sh` โดยใช้ `--bootstrap-server` เสมอ
+
+```bash
+# Allow user "analytics" to consume from topic "orders"
+kafka-acls.sh --bootstrap-server localhost:9092 \
+  --add --allow-principal User:analytics \
+  --operation Read --topic orders --group analytics-group
+
+# Allow user "order-service" to produce to topic "orders"
+kafka-acls.sh --bootstrap-server localhost:9092 \
+  --add --allow-principal User:order-service \
+  --operation Write --topic orders
+```
+
+<Mermaid title="สามชั้นของ security ใน Kafka" code={secFlow} />
+
+export const secFlow = `flowchart LR
+  client["Client"] -->|"TLS: encrypt in transit"| enc["Encryption"]
+  enc -->|"SASL / mTLS: who are you"| authn["Authentication"]
+  authn -->|"ACLs: what may you do"| authz["Authorization"]
+  authz --> broker["Broker serves the request"]`;
+
+## checklist ความพร้อม production
+
+security เป็นเพียงคอลัมน์หนึ่งของความพร้อม production durability กับ observability คือคอลัมน์ที่เหลือ ก่อน cluster รับ traffic จริง ยืนยันว่า
+
+- **replication factor >= 3** บน topic สำคัญ เพื่อให้เสีย broker ได้สองตัวโดยไม่สูญข้อมูล
+- **`min.insync.replicas=2`** คู่กับ **`acks=all`** การเขียนต้องการ in-sync replica อย่างน้อยสองตัว คือคอมโบ production ที่ durable
+- **TLS ทุกที่**, **SASL หรือ mTLS authentication** และ **ACL** ล็อกแต่ละ principal ให้ least privilege
+- **monitoring และ alerting** บน consumer lag, under-replicated partition และ request latency
+- **quota** เพื่อกัน client ตัวเดียวที่ทำตัวไม่ดีไม่ให้แย่ง bandwidth หรือ request ของทั้ง cluster
+
+```properties
+# Durable topic-level defaults for production
+default.replication.factor=3
+min.insync.replicas=2
+# and producers set acks=all
+```
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kafka บน production ซ้อน **TLS** encryption, **SASL/mTLS** authentication และ **ACL** (ผ่าน **`kafka-acls.sh`**) สำหรับ authorization บนแกนที่ durable ทั้ง **replication factor >= 3**, **`min.insync.replicas=2`** และ **`acks=all`** พร้อม **monitoring**, alerting และ **quota** ครบ ยินดีด้วย คุณจบ **Kafka Deep Dive** แล้ว จาก log, broker และ KRaft ผ่าน producer, consumer, delivery semantics, Streams และ Connect ไปจนถึงการรันและทำ Kafka ให้ปลอดภัยบน production ไปสร้างอะไรที่ durable กันเถอะ
+</Callout>
+
+export const quizSecurity = [
+  {
+    q: 'สามชั้นของ security ใน Kafka คืออะไร',
+    options: [
+      'encryption in transit (TLS), authentication (SASL/mTLS) และ authorization (ACL)',
+      'backup, snapshot และ replication',
+      'batching, compression และ acks',
+      'ZooKeeper, KRaft และ JMX',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'tool ไหนจัดการกฎ authorization ของ Kafka',
+    options: [
+      '`kafka-storage.sh`',
+      '`kafka-acls.sh --bootstrap-server ...`',
+      '`kafka-console-producer.sh`',
+      '`kafka-topics.sh --acl`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'คอมโบ production ที่ durable สำหรับการเขียนคืออะไร',
+    options: [
+      'replication factor 1 และ acks=0',
+      'replication factor >= 3, min.insync.replicas=2 และ acks=all',
+      'broker ตัวเดียวไม่มี replica',
+      'acks=1 โดยไม่มี ISR ขั้นต่ำ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องตั้ง quota บน production cluster',
+    options: [
+      'เพื่อ encrypt traffic ระหว่าง broker',
+      'เพื่อกัน client ตัวเดียวที่ทำตัวไม่ดีไม่ให้แย่ง bandwidth หรือ request ของทั้ง cluster',
+      'เพื่อเพิ่ม replication factor อัตโนมัติ',
+      'เพื่อปิด ACL',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/security-and-production" questions={quizSecurity} />
+
+<ProgressTracker client:visible id="operations-and-production/security-and-production" />

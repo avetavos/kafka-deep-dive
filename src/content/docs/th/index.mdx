@@ -1,0 +1,60 @@
+---
+title: Kafka Deep Dive
+description: เชี่ยวชาญ Apache Kafka 4.x ตั้งแต่พื้นฐาน — log abstraction, topics/partitions/replication, producers และ consumers, consumer groups (KIP-848), delivery semantics และ transactions, streams และ connect และการรัน Kafka บน production เป็น KRaft-only ไม่มี ZooKeeper
+template: splash
+hero:
+  tagline: คอร์สแบบ standalone เน้น developer ว่าด้วย Apache Kafka 4.x ตั้งแต่ append-only log และ partitioning ไปจนถึง producers, consumer groups, exactly-once transactions และ production operations สอนผ่าน client code จริง CLI และไดอะแกรม Kafka 4.x เป็น KRaft-only และ ZooKeeper หายไปแล้ว
+  actions:
+    - text: เริ่มที่นี่
+      link: /kafka/th/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: ข้ามไปที่ Producers
+      link: /kafka/th/producers/producer-api/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## สิ่งที่คุณจะได้เรียน
+
+<CardGrid>
+  <Card title="Foundations & the Log" icon="rocket">
+    Kafka ในฐานะ distributed log, append-only abstraction, brokers/topics/partitions/offsets และ KRaft [เริ่ม →](/kafka/th/foundations/)
+  </Card>
+  <Card title="Topics, Partitions & Replication" icon="random">
+    partitioning และ ordering, key, replication และ ISR, retention และ log compaction [เรียน →](/kafka/th/topics-and-partitions/partitions-and-ordering/)
+  </Card>
+  <Card title="Producing Messages" icon="seti:html">
+    producer API, acks และ durability, idempotent producer, batching และ compression [produce →](/kafka/th/producers/producer-api/)
+  </Card>
+  <Card title="Consuming & Consumer Groups" icon="seti:plan">
+    poll loop, consumer groups และ rebalancing (KIP-848), offset commit และ delivery semantics [consume →](/kafka/th/consumers/consumer-api/)
+  </Card>
+  <Card title="Delivery Semantics & Transactions" icon="seti:config">
+    end-to-end guarantee, transactions (KIP-890), exactly-once processing และ error handling [guarantee →](/kafka/th/delivery-and-transactions/delivery-guarantees/)
+  </Card>
+  <Card title="Streams, Connect & Schema" icon="puzzle">
+    Schema Registry, Kafka Connect, Kafka Streams และการเลือก processing layer [process →](/kafka/th/streams-connect-schema/schema-registry/)
+  </Card>
+  <Card title="Operations & Production" icon="approve-check">
+    การรัน Kafka บนเครื่อง, monitoring และ consumer lag, tuning และ security [operate →](/kafka/th/operations-and-production/running-kafka-locally/)
+  </Card>
+</CardGrid>
+
+## คอร์สนี้ทำงานยังไง
+
+<CardGrid>
+  <Card title="เข้าใจ model ก่อน แล้วค่อยดู code" icon="rocket">
+    ทุกหัวข้อเริ่มจาก model — log, partition, consumer group, transaction — พอเข้าใจแล้วพฤติกรรมของ Kafka จะกลายเป็นกลไกที่คุณเข้าใจ ไม่ใช่ config ที่ต้องเดา
+  </Card>
+  <Card title="Kafka 4.x ที่ verify แล้ว" icon="random">
+    เขียนบน Kafka 4.x และตรวจสอบกับ official docs ผ่าน context7 — KRaft (ไม่มี ZooKeeper), idempotent producer, KIP-848 consumer rebalance protocol และ KIP-890 transactions ถูกสอนตามที่มีอยู่จริงวันนี้
+  </Card>
+  <Card title="เน้น guarantee ไม่ใช่แค่ API" icon="approve-check">
+    ไม่ใช่แค่ "นี่คือ `send()`" แต่เป็น "`acks=all` บวก `min.insync.replicas` การันตีอะไรจริง ๆ และตรงไหนที่ message ยังหายหรือซ้ำได้" คุณจะ reason เรื่อง delivery ได้อย่างมั่นใจ
+  </Card>
+  <Card title="ไดอะแกรมที่อธิบายได้" icon="puzzle">
+    log, partition assignment, replication และ ISR และ transactional loop เป็นไดอะแกรม Mermaid ที่รองรับธีม สองภาษา (English / ไทย) พร้อมบันทึกความคืบหน้า quiz
+  </Card>
+</CardGrid>

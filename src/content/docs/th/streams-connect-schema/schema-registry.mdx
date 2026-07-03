@@ -1,0 +1,119 @@
+---
+title: 'Schema Registry'
+description: 'ทำไม producer กับ consumer ต้องตกลงรูปร่างของ record ให้ตรงกัน Schema Registry เก็บ schema แบบมีเวอร์ชัน record พก schema id ไปด้วย และ compatibility mode ช่วยให้ schema วิวัฒน์ได้อย่างปลอดภัย'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Schema Registry** คือ contract แบบมีเวอร์ชันที่แชร์กันสำหรับรูปร่างของ record — producer ลงทะเบียน schema ไว้ แต่ละ record พกแค่ **schema id** เล็ก ๆ แทนที่จะพก definition เต็ม ๆ ส่วน consumer ก็ดึง schema ตาม id นั้นมาใช้ ทั้งสองฝั่งจึงตกลงกันได้เสมอว่าจะอ่าน bytes ยังไง
+
+## ทำไมต้องมี schema
+
+ตัว Kafka เองไม่สนใจว่าใน record มีอะไร — สำหรับ broker แล้ว value ก็คือ bytes ก้อนหนึ่ง ความอิสระนี้กลายเป็นปัญหาทันทีที่ทีมที่สองมา consume topic ของคุณ ถ้า producer เปลี่ยนชื่อ field หรือเปลี่ยน type ทุก consumer จะพังเงียบ ๆ บน production **schema** เปลี่ยนข้อสมมติที่ซ่อนอยู่ให้กลายเป็น contract ที่ชัดเจน
+
+Schema Registry เก็บ schema เหล่านี้แยกออกมา โดย key ด้วย **subject** (ปกติคือ `<topic>-value`) และรองรับ format การ serialize ที่นิยม 3 แบบ:
+
+- **Avro** — binary กระชับ มีกฎ schema evolution ที่ครบ เป็นตัวเลือกยอดนิยมสุด
+- **Protobuf** — ภาษา schema ของ Google มี tooling ข้ามภาษาที่ดี
+- **JSON Schema** — อ่านง่ายสำหรับคน เหมาะเมื่อทีมพูดภาษา JSON อยู่แล้ว
+
+```json
+// An Avro schema registered as the subject "orders-value"
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.shop.orders",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "amount",  "type": "double" },
+    { "name": "currency", "type": "string", "default": "USD" } // default => safe to add
+  ]
+}
+```
+
+## record พก id ไม่ได้พก schema
+
+ถ้าส่ง schema เต็ม ๆ ไปกับทุก record ก็จะเปลือง bandwidth แทนที่จะเป็นแบบนั้น serializer จะลงทะเบียน schema แค่ครั้งเดียว ได้ค่า **schema id** เป็นเลขจำนวนเต็มกลับมา แล้วเติม header เล็ก ๆ ไว้หน้า value ของแต่ละ record: magic byte หนึ่งตัว ตามด้วย id ขนาด 4 byte แล้วจึงเป็น payload ฝั่ง consumer อ่าน id ดึง schema ที่ตรงกันจาก registry (แล้ว cache ไว้) และ deserialize
+
+<Mermaid title="Producers and consumers share a contract through the registry" code={registryDiagram} />
+
+export const registryDiagram = `flowchart LR
+  prod["Producer"] -->|"register schema, get id"| reg["Schema Registry"]
+  prod -->|"record = id + payload"| topic["Topic: orders"]
+  topic -->|"read record"| cons["Consumer"]
+  cons -->|"fetch schema by id"| reg`;
+
+## compatibility mode: วิวัฒน์อย่างปลอดภัย
+
+schema ไม่เคยถูกแช่แข็ง — field ถูกเพิ่มและลบไปเรื่อย ๆ ตามธุรกิจที่เปลี่ยน compatibility mode คือกฎที่ registry บังคับ *ก่อน* ที่จะรับเวอร์ชันใหม่ การเปลี่ยนแปลงจึงพัง reader หรือ writer ที่คุณแคร์ไม่ได้:
+
+- **BACKWARD** (ค่า default) — schema ใหม่อ่านข้อมูลที่เขียนด้วย schema **เก่า** ได้ ให้อัปเกรด **consumer ก่อน** การเพิ่ม field ที่มี default หรือลบ field เป็นเรื่องปลอดภัย
+- **FORWARD** — schema เก่าอ่านข้อมูลที่เขียนด้วย schema **ใหม่** ได้ ให้อัปเกรด **producer ก่อน**
+- **FULL** — เป็นจริงทั้งสองทางพร้อมกัน: ใหม่อ่านเก่าได้ *และ* เก่าอ่านใหม่ได้
+
+```bash
+# Set BACKWARD compatibility for a subject, then let producers register v2
+curl -X PUT http://localhost:8081/config/orders-value \
+  -H "Content-Type: application/json" \
+  -d '{"compatibility": "BACKWARD"}'
+```
+
+ถ้า schema ที่เสนอมาละเมิด mode registry จะปฏิเสธการลงทะเบียน — การเปลี่ยนแปลงที่ไม่ compatible จะ fail เร็วตั้งแต่ตอน deploy แทนที่จะไปพังตอนตีสามบน production
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Schema Registry** คือ **contract** ระหว่างทีม: schema ถูกเก็บแบบ **versioned** ตาม subject แต่ละ record พกแค่ **schema id** และ **compatibility mode** (BACKWARD, FORWARD, FULL) ช่วยให้ schema **วิวัฒน์** ได้โดยไม่ทำให้ producer หรือ consumer พัง
+</Callout>
+
+export const quizSchema = [
+  {
+    q: 'record ของ Kafka พกอะไรไปด้วยเมื่อใช้ Schema Registry',
+    options: [
+      'schema เต็ม ๆ ฝังอยู่ในทุก record',
+      'schema id เล็ก ๆ ที่ชี้ไปยัง schema แบบมีเวอร์ชันใน registry',
+      'ไม่พกอะไรเลย — consumer เดา schema เอง',
+      'สำเนาของ registry ทั้งก้อน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องลงทะเบียน schema ให้กับ topic',
+    options: [
+      'เพื่อทำให้ record ใหญ่ขึ้นและอ่านง่ายขึ้น',
+      'เพื่อเปลี่ยนข้อสมมติที่ซ่อนอยู่เรื่องรูปร่างของ record ให้เป็น contract ที่ชัดเจนซึ่งทั้งสองฝั่งตกลงกัน',
+      'Kafka ปฏิเสธที่จะเก็บ bytes ถ้าไม่มี schema',
+      'มันเข้ารหัสข้อมูลให้อัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ภายใต้ compatibility แบบ BACKWARD คุณควรอัปเกรดฝั่งไหนก่อน',
+    options: [
+      'producer ก่อน',
+      'consumer ก่อน — schema ใหม่อ่านข้อมูลที่เขียนด้วย schema เก่าได้',
+      'ลำดับไม่สำคัญ',
+      'ต้องอัปเกรดทั้งสองฝั่งพร้อมกันเป๊ะ ๆ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใด NOT ใช่ format การ serialize ที่ Schema Registry จัดการโดยทั่วไป',
+    options: [
+      'Avro',
+      'Protobuf',
+      'JSON Schema',
+      'แถว CSV ดิบที่ไม่มีการประกาศ type ใด ๆ',
+    ],
+    answer: 3,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/schema-registry" questions={quizSchema} />
+
+<ProgressTracker client:visible id="streams-connect-schema/schema-registry" />

@@ -1,0 +1,119 @@
+---
+title: 'Transactions'
+description: 'Atomic multi-partition writes with the transactional producer — transactional.id, initTransactions, begin and commit, read_committed, and the KIP-890 hardening in Kafka 4.x.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A Kafka **transaction** lets a producer write to multiple partitions (and commit consumer offsets) **atomically** — everything in the transaction becomes visible together on commit, or none of it does on abort.
+
+## Configuring a transactional producer
+
+Transactions build on the idempotent producer. You add a **`transactional.id`** — a stable identifier that lets Kafka fence out zombie instances of the same logical producer — and call `initTransactions()` once at startup:
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("enable.idempotence", "true");     // required foundation
+props.put("transactional.id", "payments-tx-1");  // stable id enables transactions
+// ... serializers ...
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();   // registers the txn id, fences older instances
+```
+
+## The transaction lifecycle
+
+Wrap a unit of work in `beginTransaction()` … `commitTransaction()`. Any sends between them are buffered into the transaction; `commitTransaction()` makes them all visible atomically, and `abortTransaction()` discards them:
+
+```java
+producer.beginTransaction();
+try {
+    producer.send(new ProducerRecord<>("accounts", debitKey, debit));
+    producer.send(new ProducerRecord<>("accounts", creditKey, credit));
+    producer.commitTransaction();     // both writes appear together, or neither
+} catch (KafkaException e) {
+    producer.abortTransaction();       // roll back the whole unit
+}
+```
+
+## Consumers must read committed
+
+Transactions only matter if readers ignore aborted and in-flight data. Set the consumer\'s isolation level to **`read_committed`** so it never sees records from aborted or open transactions:
+
+```properties
+isolation.level=read_committed
+enable.auto.commit=false
+```
+
+<Mermaid title="A transaction commits multiple writes atomically" code={txnDiagram} />
+
+export const txnDiagram = `flowchart LR
+  init["initTransactions() once"] --> begin["beginTransaction()"]
+  begin --> s1["send to accounts-0"]
+  begin --> s2["send to accounts-2"]
+  s1 --> commit["commitTransaction(): all visible together"]
+  s2 --> commit
+  begin -.->|on error| abort["abortTransaction(): nothing visible"]`;
+
+## KIP-890 in Kafka 4.x
+
+Kafka 4.x finalizes **KIP-890, Transactions Server-Side Defense**, which strengthens the transactional protocol against edge cases like hanging transactions and zombie producers. When the 4.0 upgrade is finalized the new, hardened protocol is enabled — so transactional pipelines on Kafka 4.x are more robust than on older versions with no code change on your side.
+
+<Callout title="The one-line takeaway">
+A **transaction** makes multi-partition writes **atomic**: configure `enable.idempotence=true` plus a stable **`transactional.id`**, call `initTransactions()` once, then `beginTransaction()` / `commitTransaction()` (or `abortTransaction()`). Readers must use **`isolation.level=read_committed`** to skip aborted/open data. Kafka 4.x hardens all of this via **KIP-890**, transparently.
+</Callout>
+
+export const quizTransactions = [
+  {
+    q: 'What does a Kafka transaction guarantee?',
+    options: [
+      'Faster writes to a single partition',
+      'Multiple writes (and offset commits) become visible atomically — all on commit, or none on abort',
+      'Automatic compression',
+      'That records are never retained',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the role of `transactional.id`?',
+    options: [
+      'It names the topic',
+      'A stable identifier for the logical producer that lets Kafka fence out zombie instances',
+      'It sets the partition count',
+      'It is the consumer group id',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What must a consumer set to correctly read transactional data?',
+    options: [
+      '`isolation.level=read_uncommitted`',
+      '`isolation.level=read_committed`, so it skips aborted and in-flight records',
+      '`enable.auto.commit=true`',
+      'A larger fetch size',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does KIP-890 do in Kafka 4.x?',
+    options: [
+      'Removes transactions',
+      'Strengthens the transactional protocol (server-side defense) against hanging transactions and zombies, transparently',
+      'Requires ZooKeeper for transactions',
+      'Disables idempotence',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/transactions" questions={quizTransactions} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/transactions" />

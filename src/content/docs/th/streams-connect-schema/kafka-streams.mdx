@@ -1,0 +1,126 @@
+---
+title: 'Kafka Streams'
+description: 'Kafka Streams library ภาษา Java สำหรับ stream processing — KStream กับ KTable, stream-table duality, operation แบบ stateless กับ stateful, state store ที่หนุนด้วย changelog topic และการประมวลผลแบบ exactly-once'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Kafka Streams** คือ library ภาษา Java — ไม่ใช่ cluster แยกต่างหาก — ที่คุณฝังไว้ในแอปของตัวเองเพื่อ transform, aggregate และ join topic ของ Kafka แบบ stream ต่อเนื่อง โดยที่เรื่อง state และการรับประกัน exactly-once ถูกจัดการให้เรียบร้อย
+
+## KStream, KTable และ duality
+
+Kafka Streams ให้มุมมองต่อ topic สองแบบ:
+
+- **`KStream`** — ลำดับ **event** ที่อิสระต่อกันและไม่มีจุดสิ้นสุด ทุก record คือ fact ใหม่ ("ผู้ใช้คลิก") ไม่มีอะไรถูกเขียนทับ
+- **`KTable`** — **changelog** ที่ตีความว่าเป็นค่าล่าสุด **ต่อ key** แต่ละ record อัปเดต row ของ key นั้น เหมือนทำ `UPSERT` ลง table
+
+นี่คือ **stream-table duality**: table คือ snapshot ที่ได้จากการเล่นซ้ำ stream ของ update ส่วน stream คือลำดับของการเปลี่ยนแปลงที่ได้จากการเฝ้าดู table topic เดียวกันอ่านได้ทั้งสองแบบขึ้นกับสิ่งที่คุณต้องการ — feed ของ event ที่ไหลอยู่ หรือ state ปัจจุบันต่อ key
+
+<Mermaid title="A stream of updates folds into a table; a table emits a stream of changes" code={dualityDiagram} />
+
+export const dualityDiagram = `flowchart LR
+  s["KStream (events)"] -->|"aggregate / reduce"| t["KTable (latest per key)"]
+  t -->|"toStream()"| s2["KStream (changes)"]`;
+
+## operation แบบ stateless กับ stateful
+
+operation แบ่งเป็นสองตระกูล:
+
+- **stateless** — จัดการแต่ละ record แยกกัน: `map`, `filter`, `flatMap`, `branch` ไม่ต้องจำ record ก่อนหน้า
+- **stateful** — ผลลัพธ์ขึ้นกับ record ที่เห็นมาแล้ว: `aggregate`, `count`, `reduce`, `join` และ **windowing** (จัดกลุ่ม record เป็นถังตามเวลา) พวกนี้ต้องมีที่เก็บผลลัพธ์ที่กำลังสะสม
+
+ที่เก็บนั้นคือ **state store** — key-value store แบบ local (default คือ RocksDB) ที่อยู่ใน instance แอปของคุณ เพื่อให้รอดจากการ crash ทุก state store ถูกหนุนด้วย **changelog topic** ใน Kafka: ทุก update ถูกเขียนลง changelog ด้วย ดังนั้นถ้า instance restart ที่อื่น Streams จะสร้าง store ขึ้นใหม่ด้วยการเล่นซ้ำ changelog นั้น state ใน local ของคุณจึงทนทานโดยที่คุณไม่ต้องดูแล database เอง
+
+## topology นับคำ
+
+นี่คือตัวอย่างคลาสสิก — นับว่าแต่ละคำปรากฏบ่อยแค่ไหนใน input topic:
+
+```java
+StreamsBuilder builder = new StreamsBuilder();
+
+// Read the input topic as a stream of (key, line) events
+KStream<String, String> lines = builder.stream("text-input");
+
+KTable<String, Long> counts = lines
+    .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
+    .groupBy((key, word) -> word)     // re-key by the word itself
+    .count();                         // stateful: running total per word -> a KTable
+
+// Write the changelog of counts out to an output topic
+counts.toStream().to("word-counts");
+
+KafkaStreams streams = new KafkaStreams(builder.build(), props);
+streams.start();
+```
+
+`count()` สร้าง `KTable` ที่หนุนด้วย state store และ changelog ของมัน ส่วน `toStream().to(...)` ส่งค่านับที่อัปเดตแล้วทุกครั้งต่อไปยัง downstream
+
+## exactly-once และ streams protocol
+
+stream processing ที่อ่าน อัปเดต state แล้วเขียน เป็นเรื่องที่ทำ *ผิด* ได้ง่ายเมื่อเกิด failure — คุณอาจนับซ้ำ Kafka Streams ทำให้มันเป็นแค่การตั้งค่าบรรทัดเดียว เมื่อตั้ง `processing.guarantee` เป็น `exactly_once_v2` Streams จะห่อรอบ read-process-write แต่ละรอบ (รวมถึง changelog ของ state store และ consumer offset) ไว้ใน transaction เดียวของ Kafka การ retry จึงไม่ apply update ซ้ำสองครั้ง:
+
+```java
+// Turn on end-to-end exactly-once for the whole topology
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
+
+// Modern Kafka: use the dedicated broker-side rebalance protocol for Streams groups
+props.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, "streams");
+```
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Kafka Streams** คือ **library ภาษา Java แบบฝัง** สำหรับ stream processing: **`KStream`** คือ feed ของ event **`KTable`** คือค่าล่าสุดต่อ key และ **stream-table duality** เชื่อมทั้งสองเข้าด้วยกัน operation แบบ **stateless** ไม่ต้องจำอะไร ส่วน **stateful** (aggregate, join, windowing) ใช้ **state store** ที่หนุนด้วย **changelog topic** และ `processing.guarantee=exactly_once_v2` ทำให้ read-process-write ปลอดภัย
+</Callout>
+
+export const quizStreams = [
+  {
+    q: 'KStream กับ KTable ต่างกันอย่างไร',
+    options: [
+      'KStream คือ database และ KTable คือไฟล์',
+      'KStream คือลำดับ event ที่ไม่มีจุดสิ้นสุด ส่วน KTable คือค่าล่าสุดต่อ key (changelog)',
+      'ทั้งสองเหมือนกันทุกอย่าง',
+      'KTable เก็บได้แค่ record เดียวทั้งหมด',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'state store ของ Kafka Streams รอดจากการ crash ของแอปได้อย่างไร',
+    options: [
+      'มันไม่รอด — state หายไปเมื่อ restart',
+      'ทุก update ถูกเขียนลง changelog topic ด้วย จึงสร้าง store ขึ้นใหม่ได้ด้วยการเล่นซ้ำ',
+      'มันถูกก๊อปไปยังทุก consumer ด้วยมือ',
+      'มันถูกเก็บไว้ใน JVM heap ตลอดกาลเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใดเป็น operation แบบ STATEFUL',
+    options: [
+      'map',
+      'filter',
+      'aggregate / count / join พร้อม windowing',
+      'flatMap',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'processing.guarantee=exactly_once_v2 ให้อะไร',
+    options: [
+      'throughput เร็วขึ้นด้วยการทิ้ง acknowledgement',
+      'มันห่อ read-process-write (รวมถึง state และ offset) ไว้ใน transaction การ retry จึงไม่ apply update ซ้ำสองครั้ง',
+      'มันปิด state store',
+      'มันเปลี่ยน Kafka Streams ให้เป็น cluster แยกต่างหาก',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/kafka-streams" questions={quizStreams} />
+
+<ProgressTracker client:visible id="streams-connect-schema/kafka-streams" />

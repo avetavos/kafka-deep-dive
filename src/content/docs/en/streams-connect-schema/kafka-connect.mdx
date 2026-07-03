@@ -1,0 +1,125 @@
+---
+title: 'Kafka Connect'
+description: 'No-code integration with Kafka Connect — source and sink connectors, workers, tasks, converters, distributed vs standalone mode, and when to use Connect instead of writing a producer or consumer.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Kafka Connect** is a ready-made framework for moving data **into and out of** Kafka with configuration instead of code — you point a **source connector** at a database or file to pull data in, or a **sink connector** at a search index or warehouse to push data out, and Connect handles scaling, offsets, and restarts for you.
+
+## Source and sink connectors
+
+A vast amount of "Kafka work" is not business logic at all — it is plumbing: read rows from Postgres into a topic, or write a topic into Elasticsearch. Writing that plumbing by hand means re-solving offset tracking, retries, and parallelism every time. Connect packages it as reusable **connectors**:
+
+- **Source connector** — external system → Kafka (a database, a file, a change-data-capture stream).
+- **Sink connector** — Kafka → external system (a database, a search index, a data warehouse, object storage).
+
+Because a connector is just config, hundreds already exist. You rarely write one; you configure one.
+
+```json
+// A JDBC source connector: poll a Postgres table into a topic
+{
+  "name": "orders-source",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
+    "connection.url": "jdbc:postgresql://db:5432/shop",
+    "table.whitelist": "orders",          // which table to pull
+    "mode": "incrementing",               // track new rows by a column
+    "incrementing.column.name": "id",
+    "topic.prefix": "pg-",                // -> topic "pg-orders"
+    "tasks.max": "3"                       // up to 3 parallel tasks
+  }
+}
+```
+
+## Workers, tasks, and converters
+
+Three moving parts do the work:
+
+- **Worker** — the JVM process that runs connectors. One or more workers form a Connect cluster.
+- **Task** — the unit of parallelism. A connector splits its job into up to `tasks.max` tasks, which workers spread across the cluster (e.g. one task per table or per partition range).
+- **Converter** — translates between Connect's internal record format and the bytes on the topic. This is where Schema Registry plugs in: an `AvroConverter` serializes with a schema id, a `JsonConverter` writes plain JSON.
+
+<Mermaid title="Connect moves data between external systems and Kafka" code={connectDiagram} />
+
+export const connectDiagram = `flowchart LR
+  db["Postgres"] -->|"source connector"| worker["Connect worker + tasks"]
+  worker -->|"converter"| topic["Topic: pg-orders"]
+  topic -->|"converter"| worker2["Connect worker + tasks"]
+  worker2 -->|"sink connector"| es["Elasticsearch"]`;
+
+## Distributed vs standalone
+
+Connect runs in two modes:
+
+- **Standalone** — a single worker, config in a local file. Simple, no fault tolerance. Good for a laptop demo or a one-off file ingest.
+- **Distributed** — multiple workers coordinating like a consumer group, with connector configs and offsets stored **in Kafka topics**. If a worker dies, its tasks rebalance onto the survivors. This is what you run in production, and you manage it over a REST API:
+
+```bash
+# Deploy the connector above to a distributed Connect cluster
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @orders-source.json
+```
+
+## When to use Connect instead of code
+
+Reach for Connect when the job is **moving data with no custom logic** — ingest a table, mirror a topic to S3, feed a search index. You get offset management, restarts, and scaling for free. Write a producer or consumer instead when you need real **business logic**: enrichment against another service, non-trivial branching, or transformations that outgrow a simple converter. If you find yourself wanting to *transform and join* streams, that is the next lesson's job (Kafka Streams), not Connect's.
+
+<Callout title="The one-line takeaway">
+**Kafka Connect** moves data in and out of Kafka by **configuration**: **source connectors** pull data in, **sink connectors** push it out, **workers** run **tasks** and **converters** handle serialization. Run **distributed** in production for fault tolerance, and choose Connect over hand-written clients whenever the job is **moving data, not applying logic**.
+</Callout>
+
+export const quizConnect = [
+  {
+    q: 'What is the difference between a source and a sink connector?',
+    options: [
+      'Source writes Kafka to an external system; sink reads it in',
+      'Source pulls data from an external system into Kafka; sink pushes data from Kafka to an external system',
+      'They are the same thing with different names',
+      'Source is for files only, sink is for databases only',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In Kafka Connect, what is a task?',
+    options: [
+      'A separate JVM installation per connector',
+      'The unit of parallelism a connector is split into and spread across workers',
+      'A schema stored in the registry',
+      'A single Kafka message',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why run Connect in distributed mode in production?',
+    options: [
+      'It is the only mode that supports connectors',
+      'Multiple workers coordinate and rebalance tasks on failure, with config and offsets stored in Kafka',
+      'It stores everything in a local file for speed',
+      'It removes the need for converters',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When should you write a producer or consumer instead of using Connect?',
+    options: [
+      'When you just need to copy a table into a topic',
+      'When the job needs real business logic like enrichment, branching, or joins',
+      'Never — Connect handles every case',
+      'Only when Kafka is offline',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/kafka-connect" questions={quizConnect} />
+
+<ProgressTracker client:visible id="streams-connect-schema/kafka-connect" />

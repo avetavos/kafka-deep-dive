@@ -1,0 +1,102 @@
+---
+title: 'Key กับ Partitioning'
+description: 'message key แมป record ไป partition ยังไง ทำไม key เดียวกันได้ ordering ต่อ key sticky partitioner สำหรับ null key และข้อควรระวังเรื่องเพิ่ม partition.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในประโยคเดียว
+
+**Key** ของ record เป็นตัวตัดสินว่ามันไป partition ไหน — default partitioner จะ hash key ให้ **key เดียวกันลง partition เดียวกันเสมอ** ซึ่งเป็นวิธีได้ ordering ต่อ entity (ต่อ user, ต่อ order, ต่อ account).
+
+## Key เข้า partition ออก
+
+`ProducerRecord` ทุกตัวมี key แบบ optional partitioner ของ producer จะแปลง key เป็นเลข partition:
+
+```java
+// Same key "user-42" → same partition, every time → ordered per user
+producer.send(new ProducerRecord<>("orders", "user-42", "placed order #918"));
+producer.send(new ProducerRecord<>("orders", "user-42", "cancelled order #918"));
+```
+
+สำหรับ key ที่ **ไม่ null** default partitioner คำนวณประมาณ `hash(key) % numberOfPartitions` การ hash แบบ deterministic ทำให้ทุก record ของ `user-42` ไป partition เดียวกัน event ของ user นั้นจึงอยู่ใน log เดียวที่ ordered ทั้งหมด ส่วน key ต่างกันก็กระจายไปคนละ partition ช่วยบาลานซ์โหลด.
+
+## Null key กับ sticky partitioner
+
+ถ้า key เป็น `null` แปลว่าคุณไม่สนว่า record ลง partition ไหน สนแค่ให้กระจายเท่ากัน Kafka ใช้ **sticky partitioner**: ส่ง batch ของ record null-key ไป **partition เดียว** จน batch เต็มหรือ `linger.ms` หมด แล้วค่อยเปลี่ยน partition การ stick กับ partition เดียวต่อ batch ทำให้ได้ batch ใหญ่และมีประสิทธิภาพกว่า (request น้อยลงแต่ใหญ่ขึ้น) และยังกระจายเท่ากันเมื่อเวลาผ่านไป.
+
+<Mermaid title="record ที่มี key hash ไป partition คงที่ ส่วน null key batch แบบ sticky" code={keyDiagram} />
+
+export const keyDiagram = `flowchart TB
+  k1["key = user-42"] -->|hash % N| p1["partition 1 (เสมอ)"]
+  k2["key = user-99"] -->|hash % N| p2["partition 2 (เสมอ)"]
+  k3["key = null"] -->|sticky batch| p3["partition เดียวต่อ batch แล้วหมุนไป"]`;
+
+## ข้อควรระวังเรื่องเพิ่ม partition
+
+เพราะ mapping คือ `hash(key) % numberOfPartitions` การ **เปลี่ยนจำนวน partition ทำให้ key ลง partition เปลี่ยน** เพิ่ม partition ให้ topic ที่ใช้งานอยู่ แล้ว `user-42` อาจ hash ไป partition ใหม่ — event ในอนาคตของมันไปคนละที่กับของเดิม ทำลาย ordering ต่อ key ที่คุณพึ่งพาอยู่.
+
+ผลในทางปฏิบัติ:
+
+- เตรียม partition ให้พอ **ตั้งแต่แรก** สำหรับ topic ที่ใช้ key และ ordering สำคัญ.
+- ถ้าจำเป็นต้องขยาย ต้องเข้าใจว่า ordering ต่อ key ของเดิมถูกรักษาไว้แค่ภายในแต่ละ partition เก่า ไม่ข้ามเส้นแบ่ง.
+
+## Co-partitioning สำหรับ join
+
+เมื่ออยาก **join** สอง stream ด้วย key เดียวกัน (เช่น `orders` กับ `payments` ที่ key ด้วย `orderId` ทั้งคู่) ให้ทั้งสอง topic มี **จำนวน partition เท่ากัน** และ **partitioner เดียวกัน** จากนั้น `orderId=918` จะลง partition 3 ใน *ทั้งสอง* topic และ consumer หรือ stream task ตัวเดียวเห็นทั้งสองฝั่งแบบ local — ไม่ต้อง shuffle ข้าม partition นี่คือ **co-partitioning** และ Kafka Streams บังคับต้องมีสำหรับ join ตาม key.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Key** ของ record เลือก partition ผ่าน `hash(key) % partitions` ดังนั้น **key เดียวกันลง partition เดียวกันเสมอ** — กลไกเบื้องหลัง ordering ต่อ entity **Null key** ใช้ **sticky partitioner** สร้าง batch ที่มีประสิทธิภาพและกระจายเท่ากัน ระวัง: **เพิ่ม partition ทำให้ key ถูก remap** จึงควรเตรียมตั้งแต่แรก ให้ topic ที่เกี่ยวข้องมี **จำนวน partition เท่ากัน** เพื่อ **co-partition** สำหรับ join.
+</Callout>
+
+export const quizKeys = [
+  {
+    q: 'อะไรเป็นตัวกำหนดว่า record ที่มี key ไป partition ไหน?',
+    options: [
+      'สุ่มใหม่ทุกครั้ง',
+      'default partitioner hash key: hash(key) % จำนวน partition',
+      'timestamp ของ record',
+      'consumer group id',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมใช้ key อย่าง user id ถึงได้ ordering ต่อ user?',
+    options: [
+      'key ถูกเก็บใน database',
+      'key เดียวกัน hash ไป partition เดียวกันเสมอ event ของ user นั้นจึงอยู่ใน log เดียวที่ ordered',
+      'Kafka sort record ตาม key ตอนอ่าน',
+      'ไม่ได้ key ไม่มีผลต่อ ordering',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'sticky partitioner ทำอะไรกับ record ที่ null key?',
+    options: [
+      'ส่งแต่ละ record ไป partition สุ่ม',
+      'ส่งทั้ง batch ไป partition เดียวจนเต็มแล้วหมุนไป — เพื่อ batch ที่มีประสิทธิภาพและกระจายเท่ากันเมื่อเวลาผ่านไป',
+      'ปฏิเสธ record ที่ไม่มี key',
+      'ใช้ partition 0 เสมอ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการเพิ่ม partition ให้ topic ที่ใช้ key ถึงเสี่ยง?',
+    options: [
+      'มันลบข้อมูลเดิม',
+      'hash(key) % partitions เปลี่ยน key อาจ map ไป partition ใหม่ ทำลาย ordering ต่อ key นับจากนั้น',
+      'ต้องหยุดทั้ง cluster',
+      'ไม่มีผลกับ record ที่มี key',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/keys-and-partitioning" questions={quizKeys} />
+
+<ProgressTracker client:visible id="topics-and-partitions/keys-and-partitioning" />

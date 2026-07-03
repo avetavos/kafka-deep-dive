@@ -1,0 +1,119 @@
+---
+title: 'Transactions'
+description: 'เขียนข้าม partition แบบ atomic ด้วย transactional producer transactional.id initTransactions begin และ commit read_committed และการเสริมความแข็งแรงจาก KIP-890 ใน Kafka 4.x'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**transaction** ของ Kafka ให้ producer เขียนไปหลาย partition (และ commit consumer offset) แบบ **atomic** ทุกอย่างใน transaction ปรากฏพร้อมกันตอน commit หรือไม่ปรากฏเลยตอน abort
+
+## ตั้งค่า transactional producer
+
+transaction ต่อยอดจาก idempotent producer คุณเพิ่ม **`transactional.id`** ซึ่งเป็น id ที่เสถียรและให้ Kafka fence ตัว zombie ของ producer เชิงตรรกะเดียวกันออกไป แล้วเรียก `initTransactions()` หนึ่งครั้งตอน startup
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("enable.idempotence", "true");     // required foundation
+props.put("transactional.id", "payments-tx-1");  // stable id enables transactions
+// ... serializers ...
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+producer.initTransactions();   // registers the txn id, fences older instances
+```
+
+## วงจรชีวิตของ transaction
+
+ห่อหน่วยงานหนึ่งไว้ใน `beginTransaction()` … `commitTransaction()` send ทุกตัวระหว่างนั้นถูก buffer เข้า transaction `commitTransaction()` ทำให้ทุกตัวปรากฏพร้อมกันแบบ atomic และ `abortTransaction()` ทิ้งทั้งหมด
+
+```java
+producer.beginTransaction();
+try {
+    producer.send(new ProducerRecord<>("accounts", debitKey, debit));
+    producer.send(new ProducerRecord<>("accounts", creditKey, credit));
+    producer.commitTransaction();     // both writes appear together, or neither
+} catch (KafkaException e) {
+    producer.abortTransaction();       // roll back the whole unit
+}
+```
+
+## consumer ต้องอ่านแบบ committed
+
+transaction มีความหมายก็ต่อเมื่อฝั่งอ่านเมิน data ที่ abort และที่ยัง in-flight ตั้ง isolation level ของ consumer เป็น **`read_committed`** เพื่อให้มันไม่เห็น record จาก transaction ที่ abort หรือที่ยังเปิดอยู่
+
+```properties
+isolation.level=read_committed
+enable.auto.commit=false
+```
+
+<Mermaid title="transaction commit หลาย write แบบ atomic" code={txnDiagram} />
+
+export const txnDiagram = `flowchart LR
+  init["initTransactions() once"] --> begin["beginTransaction()"]
+  begin --> s1["send to accounts-0"]
+  begin --> s2["send to accounts-2"]
+  s1 --> commit["commitTransaction(): all visible together"]
+  s2 --> commit
+  begin -.->|on error| abort["abortTransaction(): nothing visible"]`;
+
+## KIP-890 ใน Kafka 4.x
+
+Kafka 4.x finalize **KIP-890 Transactions Server-Side Defense** ที่เสริมความแข็งแรงให้ transactional protocol รับมือ edge case อย่าง transaction ที่ค้างและ zombie producer พอ finalize การอัปเกรด 4.0 protocol ใหม่ที่แข็งแรงกว่าก็ถูกเปิดใช้ ทำให้ transactional pipeline บน Kafka 4.x ทนทานกว่าเวอร์ชันเก่าโดยที่คุณไม่ต้องแก้ code ฝั่งตัวเอง
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**transaction** ทำให้การเขียนข้าม partition เป็น **atomic** ตั้ง `enable.idempotence=true` บวก **`transactional.id`** ที่เสถียร เรียก `initTransactions()` หนึ่งครั้ง แล้วใช้ `beginTransaction()` / `commitTransaction()` (หรือ `abortTransaction()`) ฝั่งอ่านต้องใช้ **`isolation.level=read_committed`** เพื่อข้าม data ที่ abort หรือเปิดค้าง Kafka 4.x เสริมความแข็งแรงทั้งหมดนี้ผ่าน **KIP-890** แบบโปร่งใส
+</Callout>
+
+export const quizTransactions = [
+  {
+    q: 'transaction ของ Kafka รับประกันอะไร',
+    options: [
+      'เขียนไป partition เดียวเร็วขึ้น',
+      'การเขียนหลายตัว (และ commit offset) ปรากฏแบบ atomic ทั้งหมดตอน commit หรือไม่มีเลยตอน abort',
+      'บีบอัดอัตโนมัติ',
+      'record ไม่เคยถูก retain',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'บทบาทของ `transactional.id` คืออะไร',
+    options: [
+      'มันตั้งชื่อ topic',
+      'id ที่เสถียรของ producer เชิงตรรกะ ที่ให้ Kafka fence ตัว zombie ออกไป',
+      'มันตั้งจำนวน partition',
+      'มันคือ consumer group id',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'consumer ต้องตั้งอะไรเพื่ออ่าน transactional data ให้ถูกต้อง',
+    options: [
+      '`isolation.level=read_uncommitted`',
+      '`isolation.level=read_committed` เพื่อข้าม record ที่ abort และที่ยัง in-flight',
+      '`enable.auto.commit=true`',
+      'fetch size ที่ใหญ่ขึ้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'KIP-890 ทำอะไรใน Kafka 4.x',
+    options: [
+      'เอา transaction ออก',
+      'เสริมความแข็งแรงให้ transactional protocol (server-side defense) รับมือ transaction ค้างและ zombie แบบโปร่งใส',
+      'บังคับให้ใช้ ZooKeeper สำหรับ transaction',
+      'ปิด idempotence',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/transactions" questions={quizTransactions} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/transactions" />

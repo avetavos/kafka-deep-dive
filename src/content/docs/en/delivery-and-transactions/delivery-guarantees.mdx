@@ -1,0 +1,94 @@
+---
+title: 'End-to-End Delivery Guarantees'
+description: 'Putting producer and consumer guarantees together — how acks, idempotence, and commit placement combine into an end-to-end story.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+An end-to-end guarantee is only as strong as its weakest link — the **producer** side (`acks` and idempotence) and the **consumer** side (commit placement) each contribute, and you have to reason about them **together**.
+
+## Two halves of one guarantee
+
+Delivery semantics are not a single switch. Data flows producer → log → consumer, and each hop has its own failure mode:
+
+- **Producer → log.** With `acks=all` and `enable.idempotence=true`, a record is written durably and retries do not create duplicates in the partition. With `acks=0` or `acks=1`, a broker failure at the wrong moment can lose the write.
+- **Log → consumer.** Commit **after** processing gives at-least-once; commit **before** gives at-most-once. The log itself never loses committed records within retention.
+
+Combine them and you get the real end-to-end behavior:
+
+| Producer | Consumer commit | End-to-end |
+| --- | --- | --- |
+| `acks=all` + idempotent | after processing | at-least-once (no loss, possible dupes) |
+| `acks=1` | after processing | at-least-once, but a rare broker failure can still lose a write |
+| `acks=all` + idempotent | before processing | at-most-once (no dupes, possible loss) |
+| transactional producer | offsets in the transaction | exactly-once inside Kafka |
+
+<Mermaid title="Each hop contributes to the end-to-end guarantee" code={e2eDiagram} />
+
+export const e2eDiagram = `flowchart LR
+  prod["Producer: acks=all + idempotence"] -->|durable, no dupes| log["Partition log"]
+  log -->|committed records retained| cons["Consumer"]
+  cons -->|commit after processing| out["at-least-once end-to-end"]
+  out -->|idempotent sink or transactions| eos["effectively exactly-once"]`;
+
+## The default worth designing for
+
+Most systems run **at-least-once end-to-end**: `acks=all`, idempotent producer, commit after processing — then make the downstream effect **idempotent** so duplicates are harmless. It is simple, robust, and fast. Reach for full **exactly-once** (transactions) only when the pipeline stays inside Kafka and duplicates are genuinely unacceptable, because it adds coordination cost. The rest of this module builds out that exactly-once path.
+
+<Callout title="The one-line takeaway">
+An end-to-end guarantee is the **combination** of the producer half (`acks=all` + idempotence for no-loss, no-dupe writes) and the consumer half (commit placement for at-most vs at-least-once). The robust default is **at-least-once end-to-end plus an idempotent sink**; true **exactly-once** comes from Kafka **transactions** and is worth its cost only when duplicates are unacceptable.
+</Callout>
+
+export const quizGuarantees = [
+  {
+    q: 'Why must you reason about producer and consumer guarantees together?',
+    options: [
+      'They are unrelated and can be ignored',
+      'Each hop (producer to log, log to consumer) has its own failure mode; the end-to-end guarantee is only as strong as the weakest link',
+      'The consumer controls the producer',
+      'Only the producer side matters',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What combination gives robust at-least-once with no loss?',
+    options: [
+      '`acks=0` and commit before processing',
+      '`acks=all` + idempotent producer, and commit after processing',
+      'No acks and auto-commit',
+      'A single broker with no replication',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'For most systems, what is the sensible default to design around?',
+    options: [
+      'Exactly-once everywhere, always',
+      'At-least-once end-to-end plus an idempotent downstream sink so duplicates are harmless',
+      'At-most-once to maximize speed',
+      'No delivery guarantee',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When is full exactly-once (transactions) worth its cost?',
+    options: [
+      'For every pipeline regardless of need',
+      'When the pipeline stays inside Kafka and duplicates are genuinely unacceptable',
+      'Only when there is a single consumer',
+      'Never; it does not work',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/delivery-guarantees" questions={quizGuarantees} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/delivery-guarantees" />

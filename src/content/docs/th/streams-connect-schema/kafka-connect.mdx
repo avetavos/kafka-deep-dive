@@ -1,0 +1,125 @@
+---
+title: 'Kafka Connect'
+description: 'การเชื่อมต่อข้อมูลแบบ no-code ด้วย Kafka Connect — source และ sink connector, worker, task, converter, โหมด distributed กับ standalone และเมื่อไรควรใช้ Connect แทนการเขียน producer หรือ consumer'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Kafka Connect** คือ framework สำเร็จรูปสำหรับย้ายข้อมูล **เข้าและออก** จาก Kafka ด้วยการตั้งค่าแทนการเขียนโค้ด — ชี้ **source connector** ไปที่ database หรือไฟล์เพื่อดึงข้อมูลเข้ามา หรือชี้ **sink connector** ไปที่ search index หรือ warehouse เพื่อส่งข้อมูลออกไป แล้ว Connect จะจัดการเรื่อง scaling, offset และการ restart ให้เอง
+
+## source และ sink connector
+
+งาน "เกี่ยวกับ Kafka" จำนวนมากไม่ใช่ business logic เลย — มันคืองานท่อ: อ่าน row จาก Postgres เข้า topic หรือเขียน topic ลง Elasticsearch การเขียนท่อพวกนี้เองหมายถึงต้องแก้ปัญหา offset tracking, retry และ parallelism ซ้ำทุกครั้ง Connect แพ็กมันเป็น **connector** ที่ใช้ซ้ำได้:
+
+- **source connector** — ระบบภายนอก → Kafka (database, ไฟล์, stream แบบ change-data-capture)
+- **sink connector** — Kafka → ระบบภายนอก (database, search index, data warehouse, object storage)
+
+เพราะ connector เป็นแค่ config จึงมีให้ใช้อยู่แล้วเป็นร้อย ๆ ตัว คุณแทบไม่ต้องเขียนเอง แค่ตั้งค่ามันเท่านั้น
+
+```json
+// A JDBC source connector: poll a Postgres table into a topic
+{
+  "name": "orders-source",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSourceConnector",
+    "connection.url": "jdbc:postgresql://db:5432/shop",
+    "table.whitelist": "orders",          // which table to pull
+    "mode": "incrementing",               // track new rows by a column
+    "incrementing.column.name": "id",
+    "topic.prefix": "pg-",                // -> topic "pg-orders"
+    "tasks.max": "3"                       // up to 3 parallel tasks
+  }
+}
+```
+
+## worker, task และ converter
+
+มีสามชิ้นส่วนที่ทำงานร่วมกัน:
+
+- **worker** — process JVM ที่รัน connector หนึ่ง worker หรือมากกว่ารวมกันเป็น Connect cluster
+- **task** — หน่วยของ parallelism connector แบ่งงานเป็น task ได้ถึง `tasks.max` ตัว แล้ว worker กระจายมันไปทั่ว cluster (เช่น หนึ่ง task ต่อหนึ่ง table หรือต่อช่วง partition)
+- **converter** — แปลงระหว่างรูปแบบ record ภายในของ Connect กับ bytes บน topic ตรงนี้เองที่ Schema Registry เสียบเข้ามา: `AvroConverter` serialize พร้อม schema id ส่วน `JsonConverter` เขียนเป็น JSON ธรรมดา
+
+<Mermaid title="Connect moves data between external systems and Kafka" code={connectDiagram} />
+
+export const connectDiagram = `flowchart LR
+  db["Postgres"] -->|"source connector"| worker["Connect worker + tasks"]
+  worker -->|"converter"| topic["Topic: pg-orders"]
+  topic -->|"converter"| worker2["Connect worker + tasks"]
+  worker2 -->|"sink connector"| es["Elasticsearch"]`;
+
+## distributed กับ standalone
+
+Connect รันได้สองโหมด:
+
+- **standalone** — worker เดียว config อยู่ในไฟล์ local ง่าย ไม่มี fault tolerance เหมาะกับ demo บนเครื่องหรืองาน ingest ไฟล์ครั้งเดียวจบ
+- **distributed** — หลาย worker ทำงานประสานกันเหมือน consumer group โดยเก็บ config ของ connector และ offset ไว้ **ใน topic ของ Kafka** ถ้า worker ตัวหนึ่งตาย task ของมันจะ rebalance ไปยังตัวที่รอด นี่คือสิ่งที่คุณรันบน production และจัดการผ่าน REST API:
+
+```bash
+# Deploy the connector above to a distributed Connect cluster
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @orders-source.json
+```
+
+## เมื่อไรควรใช้ Connect แทนการเขียนโค้ด
+
+หยิบ Connect มาใช้เมื่องานคือ **ย้ายข้อมูลโดยไม่มี logic พิเศษ** — ingest table, mirror topic ไป S3, ป้อน search index คุณได้ offset management, การ restart และ scaling มาฟรี ให้เขียน producer หรือ consumer แทนเมื่อคุณต้องการ **business logic** จริง ๆ: การ enrich กับอีก service, การ branch ที่ซับซ้อน หรือ transformation ที่โตเกิน converter ธรรมดา ถ้าคุณเริ่มอยาก *transform และ join* stream นั่นคืองานของบทถัดไป (Kafka Streams) ไม่ใช่งานของ Connect
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Kafka Connect** ย้ายข้อมูลเข้าและออกจาก Kafka ด้วย **การตั้งค่า**: **source connector** ดึงข้อมูลเข้า **sink connector** ส่งข้อมูลออก **worker** รัน **task** และ **converter** จัดการ serialization รันแบบ **distributed** บน production เพื่อ fault tolerance และเลือก Connect แทน client ที่เขียนเองทุกครั้งที่งานคือ **ย้ายข้อมูล ไม่ใช่ใส่ logic**
+</Callout>
+
+export const quizConnect = [
+  {
+    q: 'source connector กับ sink connector ต่างกันอย่างไร',
+    options: [
+      'source เขียน Kafka ไปยังระบบภายนอก ส่วน sink อ่านเข้ามา',
+      'source ดึงข้อมูลจากระบบภายนอกเข้า Kafka ส่วน sink ส่งข้อมูลจาก Kafka ไปยังระบบภายนอก',
+      'มันคือสิ่งเดียวกันแค่คนละชื่อ',
+      'source ใช้กับไฟล์เท่านั้น sink ใช้กับ database เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน Kafka Connect task คืออะไร',
+    options: [
+      'การติดตั้ง JVM แยกต่อหนึ่ง connector',
+      'หน่วยของ parallelism ที่ connector ถูกแบ่งออกและกระจายไปตาม worker',
+      'schema ที่เก็บอยู่ใน registry',
+      'ข้อความ Kafka หนึ่งข้อความ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องรัน Connect แบบ distributed บน production',
+    options: [
+      'เป็นโหมดเดียวที่รองรับ connector',
+      'หลาย worker ประสานงานและ rebalance task เมื่อเกิด failure โดยเก็บ config และ offset ไว้ใน Kafka',
+      'มันเก็บทุกอย่างไว้ในไฟล์ local เพื่อความเร็ว',
+      'มันตัดความจำเป็นของ converter ออกไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เมื่อไรควรเขียน producer หรือ consumer แทนการใช้ Connect',
+    options: [
+      'เมื่อแค่ต้องการก๊อป table เข้า topic',
+      'เมื่องานต้องการ business logic จริง ๆ เช่น enrichment, branching หรือ join',
+      'ไม่มีทางเลย — Connect จัดการได้ทุกกรณี',
+      'เฉพาะตอนที่ Kafka offline เท่านั้น',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/kafka-connect" questions={quizConnect} />
+
+<ProgressTracker client:visible id="streams-connect-schema/kafka-connect" />

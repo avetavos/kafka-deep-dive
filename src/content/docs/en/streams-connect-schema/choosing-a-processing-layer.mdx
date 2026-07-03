@@ -1,0 +1,105 @@
+---
+title: 'Choosing a Processing Layer'
+description: 'A decision guide for Kafka processing — plain consumer, Kafka Streams, ksqlDB, Kafka Connect, and external processors, with a practical way to pick the right one and close the module.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+There is no single "right" way to process a Kafka topic — pick the **lightest tool that fits the job**, from a plain consumer for full control, to Kafka Streams for embedded logic, to ksqlDB for declarative SQL, to Connect for pure data movement.
+
+## The five options
+
+Each layer trades control for convenience:
+
+- **Plain consumer** — you write the loop with the raw client. Maximum control, any language, but you own offsets, retries, state, and scaling by hand.
+- **Kafka Streams** — a JVM **library** you embed in your service. Real code (map, join, windowing) with state and exactly-once handled for you, but Java/Scala only and it lives inside your app.
+- **ksqlDB / SQL** — write stream processing as **declarative SQL** (`CREATE STREAM ... SELECT ...`). Fastest to express, no code to deploy, but bounded by what SQL can say.
+- **Kafka Connect** — **move data**, no logic. Ingest a database or sink to a warehouse with config only.
+- **External stream processor** — Flink, Spark Structured Streaming, and friends. A separate cluster for very large jobs, complex event-time semantics, or when you need one engine across many sources.
+
+<Mermaid title="Pick by what the job needs" code={pickDiagram} />
+
+export const pickDiagram = `flowchart TD
+  start["What does the job need?"] --> move{"Just move data,\nno logic?"}
+  move -->|"yes"| connect["Kafka Connect"]
+  move -->|"no"| logic{"Express it in SQL?"}
+  logic -->|"yes"| ksql["ksqlDB"]
+  logic -->|"no"| jvm{"JVM app, embedded?"}
+  jvm -->|"yes"| streams["Kafka Streams"]
+  jvm -->|"no"| scale{"Huge scale or\nnon-JVM control?"}
+  scale -->|"external engine"| flink["Flink / Spark"]
+  scale -->|"full control"| consumer["Plain consumer"]`;
+
+## How to pick
+
+Work down from the simplest fit:
+
+1. **Only moving data?** Use **Connect** — do not write code to copy a table.
+2. **Logic that fits SQL?** Use **ksqlDB** — filters, joins, and windowed aggregates with no deployment.
+3. **Logic that needs real code, on the JVM?** Use **Kafka Streams** — embedded, stateful, exactly-once, scales with your app.
+4. **Need another language, or total control of the loop?** Use a **plain consumer**.
+5. **Massive scale or advanced event-time processing across many systems?** Reach for an **external processor** like Flink.
+
+A healthy system usually mixes them: Connect ingests, Streams or ksqlDB transforms, and a plain consumer serves the last mile into a service. The rule of thumb is simply: **do not pay for power you will not use.**
+
+## Closing the module
+
+You now have the whole processing toolkit. **Schema Registry** gives your records a versioned contract so teams can evolve safely. **Connect** moves data in and out without code. **Kafka Streams** processes streams with real, stateful logic inside your app. And this guide tells you **which** to reach for. Together with the earlier modules on brokers, producers, consumers, and delivery guarantees, you can now design an end-to-end Kafka system — and justify every layer in it.
+
+<Callout title="The one-line takeaway">
+Pick the **lightest layer that fits**: **Connect** to move data, **ksqlDB** for SQL-expressible logic, **Kafka Streams** for embedded JVM code with state, a **plain consumer** for full control or another language, and an **external processor** for very large or advanced jobs — real systems combine several.
+</Callout>
+
+export const quizChoosing = [
+  {
+    q: 'A team needs to copy a Postgres table into a Kafka topic with no transformation. Best tool?',
+    options: [
+      'Kafka Streams',
+      'Kafka Connect — it moves data with configuration and no code',
+      'A plain consumer written from scratch',
+      'An external Flink cluster',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does ksqlDB let you do?',
+    options: [
+      'Replace all brokers with a database',
+      'Express stream processing as declarative SQL with no code to deploy',
+      'Only move data, never transform it',
+      'Run Kafka without any topics',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why choose a plain consumer over Kafka Streams?',
+    options: [
+      'It always scales better',
+      'You need another language or full control of offsets, retries, and the loop',
+      'It handles exactly-once state automatically',
+      'It requires no code at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the overall rule of thumb for choosing a processing layer?',
+    options: [
+      'Always use the most powerful engine available',
+      'Pick the lightest tool that fits the job — do not pay for power you will not use',
+      'Only ever use a plain consumer',
+      'Never combine more than one layer',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/choosing-a-processing-layer" questions={quizChoosing} />
+
+<ProgressTracker client:visible id="streams-connect-schema/choosing-a-processing-layer" />

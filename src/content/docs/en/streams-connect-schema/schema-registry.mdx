@@ -1,0 +1,119 @@
+---
+title: 'Schema Registry'
+description: 'Why producers and consumers must agree on record shape, how Schema Registry stores versioned schemas, records carry a schema id, and compatibility modes let schemas evolve safely.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Schema Registry** is a shared, versioned contract for the shape of your records — producers register a schema, every record carries a small **schema id** instead of the full definition, and consumers fetch that schema by id so both sides always agree on how to read the bytes.
+
+## Why a schema at all?
+
+Kafka itself does not care what is inside a record — to a broker, a value is just bytes. That freedom becomes a problem the moment a second team consumes your topic. If a producer renames a field or changes a type, every consumer breaks, silently, in production. A **schema** turns an implicit assumption into an explicit contract.
+
+Schema Registry stores those schemas out of band, keyed by **subject** (usually `<topic>-value`). It supports the three common serialization formats:
+
+- **Avro** — compact binary, rich schema evolution rules, the most common choice.
+- **Protobuf** — Google's schema language, great cross-language tooling.
+- **JSON Schema** — human-readable, useful when you already speak JSON.
+
+```json
+// An Avro schema registered as the subject "orders-value"
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.shop.orders",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "amount",  "type": "double" },
+    { "name": "currency", "type": "string", "default": "USD" } // default => safe to add
+  ]
+}
+```
+
+## Records carry an id, not the schema
+
+Shipping the full schema with every record would waste bandwidth. Instead, the serializer registers the schema once, gets back an integer **schema id**, and prefixes each record's value with a tiny header: one magic byte, then the 4-byte id, then the payload. The consumer reads the id, fetches the matching schema from the registry (and caches it), and deserializes.
+
+<Mermaid title="Producers and consumers share a contract through the registry" code={registryDiagram} />
+
+export const registryDiagram = `flowchart LR
+  prod["Producer"] -->|"register schema, get id"| reg["Schema Registry"]
+  prod -->|"record = id + payload"| topic["Topic: orders"]
+  topic -->|"read record"| cons["Consumer"]
+  cons -->|"fetch schema by id"| reg`;
+
+## Compatibility modes: evolving safely
+
+A schema is never frozen — fields get added and removed as the business changes. Compatibility modes are the rules the registry enforces *before* it accepts a new version, so a change can never break the readers or writers you care about:
+
+- **BACKWARD** (the default) — new schema can read data written with the **old** schema. You upgrade **consumers first**. Adding a field with a default or removing a field is safe.
+- **FORWARD** — old schema can read data written with the **new** schema. You upgrade **producers first**.
+- **FULL** — both directions hold at once: new reads old *and* old reads new.
+
+```bash
+# Set BACKWARD compatibility for a subject, then let producers register v2
+curl -X PUT http://localhost:8081/config/orders-value \
+  -H "Content-Type: application/json" \
+  -d '{"compatibility": "BACKWARD"}'
+```
+
+If a proposed schema violates the mode, the registry rejects the registration — the incompatible change fails fast at deploy time instead of at 3am in production.
+
+<Callout title="The one-line takeaway">
+A **Schema Registry** is the **contract** between teams: schemas are stored **versioned** by subject, each record carries only a **schema id**, and **compatibility modes** (BACKWARD, FORWARD, FULL) let schemas **evolve** without breaking producers or consumers.
+</Callout>
+
+export const quizSchema = [
+  {
+    q: 'What does a Kafka record carry when using Schema Registry?',
+    options: [
+      'The full schema embedded in every record',
+      'A small schema id that points to the versioned schema in the registry',
+      'Nothing — the schema is guessed by the consumer',
+      'A copy of the entire registry',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why register a schema for a topic at all?',
+    options: [
+      'To make records larger and easier to read',
+      'To turn an implicit assumption about record shape into an explicit contract both sides agree on',
+      'Kafka refuses to store bytes without one',
+      'It encrypts the data automatically',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Under BACKWARD compatibility, which side do you upgrade first?',
+    options: [
+      'Producers first',
+      'Consumers first — the new schema can read data written with the old schema',
+      'Order does not matter',
+      'You must upgrade both at the exact same instant',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is NOT a serialization format Schema Registry commonly manages?',
+    options: [
+      'Avro',
+      'Protobuf',
+      'JSON Schema',
+      'A raw CSV row with no declared types',
+    ],
+    answer: 3,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/schema-registry" questions={quizSchema} />
+
+<ProgressTracker client:visible id="streams-connect-schema/schema-registry" />

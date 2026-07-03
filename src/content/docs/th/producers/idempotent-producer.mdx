@@ -1,0 +1,108 @@
+---
+title: 'Idempotent Producer'
+description: 'enable.idempotence กัน retry ไม่ให้สร้าง duplicate อย่างไรด้วย producer id epoch และ sequence number ข้อกำหนดของ config และทำไมมันไม่เหมือน transactions.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Idempotent producer** ติด tag ให้ทุก record ด้วย producer id, epoch และ sequence number ต่อ partition เพื่อให้ broker **ทิ้ง duplicate** ที่เกิดจาก retry ได้ — ให้การส่งแบบ exactly-once **ต่อ partition**.
+
+## ปัญหา duplicate ที่ retry สร้างขึ้น
+
+ถ้าไม่มี idempotence การ retry อาจสร้าง record ซ้ำเงียบ ๆ producer ส่ง record broker เขียนสำเร็จ แต่ acknowledge หายระหว่างทางกลับ producer timeout แล้ว retry และ broker ก็เขียน **record เดิมเป็นครั้งที่สอง** ตอนนี้เรามีสองสำเนา แถมแยกไม่ออกด้วย.
+
+`enable.idempotence=true` — เป็น **ค่า default** ใน Kafka สมัยใหม่ — แก้เรื่องนี้ broker assign **producer id (PID)** และ **epoch** ให้แต่ละ producer และ producer ก็ stamp ทุก record ด้วย **sequence number ที่เพิ่มขึ้นเรื่อย ๆ** ต่อ partition เมื่อ record มาถึง broker เช็ค sequence number: ถ้าเคยเห็นเลขนี้สำหรับ PID และ partition นั้นแล้ว มันจะ **acknowledge แต่ไม่เขียน** record ซ้ำอีก.
+
+```properties
+# Idempotence is on by default in modern Kafka; shown explicitly here
+enable.idempotence=true
+# These are implied/required by idempotence:
+acks=all
+# retries must be > 0 (defaults high) so the producer actually retries
+retries=2147483647
+# ordering is preserved only if in-flight requests per connection stays <= 5
+max.in.flight.requests.per.connection=5
+```
+
+## มันต้องการอะไร และรับประกันอะไร
+
+idempotence ไม่ได้ยืนได้ด้วยตัวเอง มันต้องการ config เฉพาะเพื่อให้การรับประกันเป็นจริง:
+
+- **`acks=all`** — record ต้องถูกยืนยันโดยทุก in-sync replica.
+- **`retries > 0`** — retry คือต้นเหตุของ duplicate ตั้งแต่แรก ถ้าไม่มี retry ก็ไม่มีอะไรให้ dedupe.
+- **`max.in.flight.requests.per.connection <= 5`** — ยอมให้มี batch in-flight ได้ถึงห้าตัว **โดยยังรักษา ordering** ไว้ เพราะ broker ติดตาม sequence number และปฏิเสธอะไรที่มาผิดลำดับ.
+
+เมื่อเงื่อนไขเหล่านี้เป็นจริง เราจะได้ **exactly-once delivery ต่อ partition ตอน retry**: ไม่ว่า record จะถูก retry กี่ครั้ง มันถูกเขียน **ครั้งเดียว** ตัว **epoch** คือสิ่งที่ทำให้ปลอดภัยข้ามการ restart ของ producer และ network partition — epoch ใหม่กว่าจะ **fence** producer instance เก่าที่อาจเป็น zombie ทำให้ write ค้างเก่าถูกปฏิเสธ.
+
+<Mermaid title="The broker dedupes a retried record by its sequence number" code={idempotentDiagram} />
+
+export const idempotentDiagram = `flowchart LR
+  send1["Send seq=7 (PID 100, epoch 3)"] --> write["Broker writes seq=7"]
+  write --> lostack["Ack lost on the way back"]
+  lostack --> retry["Producer retries seq=7"]
+  retry --> check["Broker: already saw seq=7 for this PID"]
+  check --> dedupe["Acknowledge but do NOT write again"]`;
+
+## idempotence ไม่ใช่ transactions
+
+จุดนี้คนสับสนบ่อย idempotence รับประกันว่า record ถูกเขียน **ครั้งเดียวต่อ partition** แม้มี retry — แต่มันทำได้ **แค่นั้น** มัน **ไม่ได้** ทำให้การ write หลาย record หลาย partition เป็น atomic และ **ไม่ได้** ผูก write ของ producer เข้ากับการ commit offset ของ consumer.
+
+การรับประกันที่แข็งกว่านั้น — การ write แบบ atomic ข้าม partition และ exactly-once processing จริง ๆ — คือสิ่งที่ **transactions** ให้ ซึ่งสร้าง **ทับบน** idempotent producer อีกที โมดูล Delivery Semantics และ Transactions จะครอบคลุม `transactional.id`, `beginTransaction()` และ `commitTransaction()` ตอนนี้จำเส้นแบ่งไว้: idempotence กำจัด duplicate จาก retry ส่วน transactions เพิ่ม atomicity.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**`enable.idempotence=true`** (ค่า default) stamp record ด้วย **producer id**, **epoch** และ **sequence number** เพื่อให้ broker ทิ้ง **duplicate** จาก retry ให้ผล **exactly-once ต่อ partition** มันต้องการ **`acks=all`**, **`retries > 0`** และ **`max.in.flight.requests.per.connection <= 5`** — และ **ไม่ใช่** สิ่งเดียวกับ **transactions** เต็มรูปแบบ.
+</Callout>
+
+export const quizIdempotent = [
+  {
+    q: 'idempotent producer ป้องกันอะไร',
+    options: [
+      'consumer อ่าน record เก่า',
+      'retry สร้าง record ซ้ำบน broker แบบเงียบ ๆ',
+      'record ถูก compress',
+      'partition ถูก rebalance',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'broker รู้จัก duplicate จาก retry ได้อย่างไร',
+    options: [
+      'ด้วยการเทียบ byte ของ record ทั้งก้อนทุกครั้ง',
+      'ด้วย producer id บวก sequence number ต่อ partition ที่มันเคยเห็นแล้ว',
+      'ด้วย offset ของ consumer group',
+      'ด้วย timestamp ของ record อย่างเดียว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'enable.idempotence ต้องการ config ใดเพื่อให้การรับประกันเป็นจริง',
+    options: [
+      'acks=0 และ retries=0',
+      'acks=all, retries > 0 และ max.in.flight.requests.per.connection <= 5',
+      'transactional.id เฉพาะและ beginTransaction()',
+      'compression.type=zstd และ batch.size ขนาดใหญ่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'idempotence ต่างจาก transactions อย่างไร',
+    options: [
+      'เป็น feature เดียวกันเป๊ะ',
+      'idempotence ให้ exactly-once ต่อ partition ตอน retry ส่วน transactions เพิ่มการ write แบบ atomic ข้าม partition',
+      'transactions อ่อนกว่า idempotence',
+      'idempotence ใช้ได้กับ consumer เท่านั้น',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/idempotent-producer" questions={quizIdempotent} />
+
+<ProgressTracker client:visible id="producers/idempotent-producer" />

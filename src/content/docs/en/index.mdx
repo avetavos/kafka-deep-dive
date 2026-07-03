@@ -1,0 +1,60 @@
+---
+title: Kafka Deep Dive
+description: Master Apache Kafka 4.x from first principles — the log abstraction, topics/partitions/replication, producers and consumers, consumer groups (KIP-848), delivery semantics and transactions, streams and connect, and running Kafka in production. KRaft-only, no ZooKeeper.
+template: splash
+hero:
+  tagline: A standalone, developer-focused course on Apache Kafka 4.x. From the append-only log and partitioning to producers, consumer groups, exactly-once transactions, and production operations — taught through real client code, CLI, and diagrams. Kafka 4.x is KRaft-only; ZooKeeper is gone.
+  actions:
+    - text: Start here
+      link: /kafka/en/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: Jump to Producers
+      link: /kafka/en/producers/producer-api/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What you'll learn
+
+<CardGrid>
+  <Card title="Foundations & the Log" icon="rocket">
+    Kafka as a distributed log, the append-only abstraction, brokers/topics/partitions/offsets, and KRaft. [Start →](/kafka/en/foundations/)
+  </Card>
+  <Card title="Topics, Partitions & Replication" icon="random">
+    Partitioning and ordering, keys, replication and the ISR, retention and log compaction. [Learn →](/kafka/en/topics-and-partitions/partitions-and-ordering/)
+  </Card>
+  <Card title="Producing Messages" icon="seti:html">
+    The producer API, acks and durability, the idempotent producer, batching and compression. [Produce →](/kafka/en/producers/producer-api/)
+  </Card>
+  <Card title="Consuming & Consumer Groups" icon="seti:plan">
+    The poll loop, consumer groups and rebalancing (KIP-848), offset commits, and delivery semantics. [Consume →](/kafka/en/consumers/consumer-api/)
+  </Card>
+  <Card title="Delivery Semantics & Transactions" icon="seti:config">
+    End-to-end guarantees, transactions (KIP-890), exactly-once processing, and error handling. [Guarantee →](/kafka/en/delivery-and-transactions/delivery-guarantees/)
+  </Card>
+  <Card title="Streams, Connect & Schema" icon="puzzle">
+    Schema Registry, Kafka Connect, Kafka Streams, and choosing a processing layer. [Process →](/kafka/en/streams-connect-schema/schema-registry/)
+  </Card>
+  <Card title="Operations & Production" icon="approve-check">
+    Running Kafka locally, monitoring and consumer lag, tuning, and security. [Operate →](/kafka/en/operations-and-production/running-kafka-locally/)
+  </Card>
+</CardGrid>
+
+## How this course works
+
+<CardGrid>
+  <Card title="The model first, then the code" icon="rocket">
+    Every topic starts from a model — the log, the partition, the consumer group, the transaction — so Kafka's behavior becomes mechanism you understand, not configuration you guess at.
+  </Card>
+  <Card title="Kafka 4.x, verified" icon="random">
+    Written against Kafka 4.x and checked against the official docs via context7 — KRaft (no ZooKeeper), the idempotent producer, the KIP-848 consumer rebalance protocol, and KIP-890 transactions are covered as they exist today.
+  </Card>
+  <Card title="Guarantees, not just APIs" icon="approve-check">
+    Not "here's `send()`" but "here's what `acks=all` plus `min.insync.replicas` actually guarantees, and where a message can still be lost or duplicated." You'll reason about delivery with confidence.
+  </Card>
+  <Card title="Diagrams that explain" icon="puzzle">
+    The log, partition assignment, replication and the ISR, and the transactional loop as theme-aware Mermaid diagrams. Bilingual (English / ไทย) with saved quiz progress.
+  </Card>
+</CardGrid>

@@ -1,0 +1,112 @@
+---
+title: 'Acks and Durability'
+description: 'How acks=0, acks=1, and acks=all trade latency for durability, how min.insync.replicas backs the strongest setting, and the recommended durable producer config.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+The `acks` setting decides **how many replicas must confirm a write before Kafka calls it durable** — trading latency for the guarantee that your record survives a broker failure.
+
+## The three levels of acks
+
+Every partition has one **leader** replica and zero or more **follower** replicas. The `acks` config controls how many of them must acknowledge a write before the producer considers `send()` successful.
+
+- **`acks=0`** — fire-and-forget. The producer does not wait for any acknowledgement; it counts the record as sent the moment it leaves the client. Lowest latency, but a record can be lost silently if the leader is down.
+- **`acks=1`** — leader only. The leader writes the record to its own log and replies. Fast, but if the leader crashes **before** a follower has replicated that record, the record is lost.
+- **`acks=all`** (equivalently **`acks=-1`**) — every **in-sync replica** must confirm. The record is safe as long as one in-sync replica survives. Highest durability, highest latency.
+
+```properties
+# Fire-and-forget: fastest, weakest guarantee
+acks=0
+
+# Leader only: fast, but unreplicated writes can be lost on leader failure
+acks=1
+
+# All in-sync replicas must confirm: strongest durability
+acks=all
+```
+
+## acks=all needs min.insync.replicas to mean anything
+
+`acks=all` alone says "all replicas that are currently **in sync**." If only the leader is in sync at that moment, "all" is just the leader — and you are effectively back to `acks=1`. The broker-side `min.insync.replicas` closes this gap: it sets the **minimum** number of in-sync replicas that must be available for the write to be accepted at all.
+
+With `min.insync.replicas=2` on a topic with replication factor 3, a producer using `acks=all` needs at least **two** replicas in sync. If only one is available, the broker **rejects** the write (a `NotEnoughReplicas` error) rather than accepting a record that could vanish. That rejection is the point — you would rather fail loudly than lose data quietly.
+
+```properties
+# Recommended durable producer configuration (pair with broker/topic min.insync.replicas=2)
+acks=all
+enable.idempotence=true
+# retries defaults high in modern Kafka; delivery.timeout.ms is the real deadline
+delivery.timeout.ms=120000
+```
+
+<Mermaid title="Durability climbs from acks=0 to acks=all with min.insync.replicas" code={acksDiagram} />
+
+export const acksDiagram = `flowchart LR
+  p["Producer send()"] --> a0["acks=0: no wait, lowest latency"]
+  p --> a1["acks=1: leader writes and replies"]
+  p --> aa["acks=all: all in-sync replicas confirm"]
+  aa --> misr["'min.insync.replicas=2' must be met or write is rejected"]
+  misr --> safe["Durable: survives a broker failure"]`;
+
+## The tradeoff, stated plainly
+
+There is no free durability. Each stronger `acks` level adds a network round trip and waits on more machines, so latency rises as the guarantee strengthens. Pick by the cost of losing a record: metrics and logs can often live with `acks=1`, but orders, payments, and anything you cannot recreate should use `acks=all` with `min.insync.replicas=2`.
+
+<Callout title="The one-line takeaway">
+**`acks`** sets how many replicas must confirm a write: **`acks=0`** is fire-and-forget, **`acks=1`** is leader-only, and **`acks=all`** waits for every **in-sync replica**. Back `acks=all` with **`min.insync.replicas=2`** so the broker rejects a write it cannot make durable — trading a little **latency** for records that survive a broker failure.
+</Callout>
+
+export const quizAcks = [
+  {
+    q: 'What does acks=all guarantee compared to acks=1?',
+    options: [
+      'Nothing different — they are aliases',
+      'The record is confirmed by every in-sync replica, not just the leader',
+      'It disables replication entirely',
+      'It writes to every topic in the cluster',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does acks=all need min.insync.replicas to be meaningful?',
+    options: [
+      'Without it, records are stored only in memory',
+      'Because acks=all means all currently in-sync replicas; if only the leader is in sync it behaves like acks=1',
+      'min.insync.replicas controls the number of partitions',
+      'It sets how many consumers can read the topic',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'With replication factor 3 and min.insync.replicas=2, what happens if only one replica is in sync during an acks=all send?',
+    options: [
+      'The write succeeds silently',
+      'The broker rejects the write rather than accept a record that could be lost',
+      'The record is written to a temporary file',
+      'The producer switches to acks=0 automatically',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the core tradeoff as you raise the acks level?',
+    options: [
+      'Higher durability at the cost of higher latency',
+      'Lower durability but lower cost',
+      'More partitions but fewer replicas',
+      'Faster consumers but slower producers',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="producers/acks-and-durability" questions={quizAcks} />
+
+<ProgressTracker client:visible id="producers/acks-and-durability" />

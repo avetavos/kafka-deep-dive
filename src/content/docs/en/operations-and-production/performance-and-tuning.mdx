@@ -1,0 +1,111 @@
+---
+title: 'Performance & Tuning'
+description: 'The levers that trade throughput against latency in Kafka — producer batching and compression, acks, partition sizing for consumer parallelism, and broker-side page cache and disk.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Tuning Kafka is mostly about choosing where you sit on the **throughput-versus-latency** curve — bigger producer batches, compression, more partitions, and stronger `acks` each push one way or the other, so you tune toward your workload rather than chasing a single "fast" setting.
+
+## Producer levers: batching, compression, acks
+
+The producer is where most throughput is won or lost. Three settings dominate:
+
+- **Batching** — `linger.ms` and `batch.size` let the producer wait a few milliseconds and pack many records into one request. Larger batches mean far higher throughput at the cost of a little latency per record.
+- **Compression** — `compression.type` (`lz4`, `zstd`, `snappy`, `gzip`) shrinks each batch, cutting network and disk usage. It trades CPU for throughput and is almost always worth it under load.
+- **acks** — `acks=all` waits for the ISR to persist the record (durable, higher latency); `acks=1` waits for only the leader (faster, weaker guarantee). This is the classic durability-versus-latency dial.
+
+```properties
+# Throughput-leaning producer: wait a little, batch bigger, compress, stay durable
+linger.ms=10
+batch.size=65536
+compression.type=lz4
+acks=all
+```
+
+<Mermaid title="The throughput versus latency trade-off" code={tuneFlow} />
+
+export const tuneFlow = `flowchart LR
+  batch["Bigger batches + linger.ms"] --> tp["Higher throughput"]
+  comp["Compression (lz4 / zstd)"] --> tp
+  acksall["acks=all"] --> dur["Stronger durability"]
+  acksall --> lat["Higher latency"]
+  small["Small batches + acks=1"] --> low["Lower latency"]`;
+
+## Sizing partitions to throughput
+
+Partitions are your **parallelism unit**: a partition is consumed by at most one consumer in a group, so the partition count is the ceiling on consumer parallelism. Size it from a target:
+
+> partitions ≈ target throughput ÷ per-consumer (or per-partition) throughput
+
+If one consumer instance handles 10 MB/s and you need 100 MB/s, you need at least 10 partitions to let 10 consumers run in parallel. Round up and leave headroom for growth and for uneven key distribution.
+
+<Callout title="Do not over-partition">
+More partitions is not free throughput. Each partition is open files, replication traffic, memory, and controller metadata — and it lengthens **rebalance** and failover time. Thousands of partitions per broker add latency and recovery risk. Size to your target with modest headroom, not to the largest number you can imagine. You can add partitions later; you cannot easily remove them.
+</Callout>
+
+## Broker-side: page cache, disk, network
+
+Brokers are deliberately simple, and their speed comes from the operating system:
+
+- **Page cache** — Kafka does **not** maintain its own big in-process cache. It writes to the OS page cache and relies on the kernel to serve recent reads from memory. Leave plenty of free RAM for the page cache; do not give the JVM a huge heap that starves it.
+- **Disk** — sequential writes make spinning disks and especially SSDs efficient. Use fast local disks, and spread load with multiple log directories if needed. Disk throughput and `fsync` behavior bound your durability and speed.
+- **Network** — replication and consumer fan-out are network-bound. A `replication-factor` of 3 means every produced byte is written roughly three times across the network, so provision NICs accordingly.
+
+<Callout title="The one-line takeaway">
+Kafka performance is a **throughput-versus-latency** trade-off you tune deliberately: on the producer use **batching** (`linger.ms`, `batch.size`), **compression**, and the right **`acks`**; size **partitions** to your target throughput and consumer parallelism **without over-partitioning**; and on the broker respect the **page cache**, fast sequential **disk**, and **network** headroom for replication. Tune toward your workload, not toward a mythical fastest setting.
+</Callout>
+
+export const quizPerf = [
+  {
+    q: 'What do larger producer batches (via linger.ms and batch.size) mainly trade?',
+    options: [
+      'Durability for security',
+      'A little per-record latency for much higher throughput',
+      'Disk space for CPU only',
+      'Nothing — they have no effect',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does partition count cap consumer parallelism?',
+    options: [
+      'Because each partition is consumed by at most one consumer within a group',
+      'Because partitions limit the number of producers',
+      'Because each partition needs its own broker',
+      'It does not — parallelism is unlimited',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What is the risk of creating far more partitions than you need?',
+    options: [
+      'Nothing; more partitions always means more speed',
+      'More open files, replication traffic, memory, and longer rebalance and failover times',
+      'Topics become read-only',
+      'Consumers can no longer commit offsets',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does Kafka rely on the operating system for read speed?',
+    options: [
+      'It keeps a large in-process cache and ignores the OS',
+      'It uses the OS page cache, so free RAM lets the kernel serve recent reads from memory',
+      'It reads directly from ZooKeeper',
+      'It caches everything in the JVM heap',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerf} />
+
+<ProgressTracker client:visible id="operations-and-production/performance-and-tuning" />

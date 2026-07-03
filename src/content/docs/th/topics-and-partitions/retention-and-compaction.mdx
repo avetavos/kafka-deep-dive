@@ -1,0 +1,115 @@
+---
+title: 'Retention กับ Compaction'
+description: 'Kafka เก็บข้อมูลนานแค่ไหน retention ตามเวลาและขนาด cleanup policy delete กับ compact log compaction ตาม key และ tombstone.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในประโยคเดียว
+
+Kafka ไม่ได้เก็บข้อมูลตลอดไปโดย default — **cleanup policy** ของ topic ตัดสินว่า record เก่าจะถูก **ลบ** หลังพ้น retention window หรือถูก **compact** ให้เหลือแค่ **ค่าล่าสุดต่อ key**.
+
+## Retention: ลบตามเวลาหรือขนาด
+
+ด้วย policy default `cleanup.policy=delete` Kafka ลบ log segment เก่าเมื่อเกิน threshold:
+
+```properties
+# Keep records for 7 days (whichever limit hits first)
+cleanup.policy=delete
+retention.ms=604800000
+# ...or cap the partition at 50 GB
+retention.bytes=53687456000
+```
+
+Retention บังคับที่ระดับ **segment** ทั้งก้อน ไม่ใช่ทีละ record และดูที่ **อายุหรือขนาด** — ไม่ได้ดูว่ามีใคร consume ไปแล้วหรือยัง consumer ที่ตามหลังเกิน retention window จะพลาด record ที่หมดอายุไป policy นี้เหมาะกับ event stream ที่ event เก่าหมดคุณค่า: clickstream, log, metric.
+
+## Compaction: เก็บค่าล่าสุดต่อ key
+
+ตั้ง `cleanup.policy=compact` แล้ว Kafka เปลี่ยนกลยุทธ์ทั้งหมด แทนที่จะทิ้งข้อมูลเก่าตามอายุ มันเก็บ **record ล่าสุดของแต่ละ key** และค่อยๆ garbage-collect ค่าเก่าของ key นั้น:
+
+```text
+before compaction:  (a,1)(b,1)(a,2)(c,1)(b,2)(a,3)
+after compaction:   (c,1)(b,2)(a,3)     ← latest value per key survives
+```
+
+แบบนี้เปลี่ยน topic ให้เป็น **snapshot ของ state ปัจจุบันตาม key** ที่ durable และ replay ได้ — เหมาะกับ changelog, config และ state store ที่ Kafka Streams เก็บ consumer ใหม่เอี่ยมอ่านทั้ง compacted topic แล้วสร้าง state ล่าสุดของทุก key ขึ้นมาใหม่ได้.
+
+<Mermaid title="delete ทิ้ง segment เก่า ส่วน compact เก็บค่าล่าสุดต่อ key" code={retentionDiagram} />
+
+export const retentionDiagram = `flowchart TB
+  topic["Topic cleanup.policy"] --> del["delete: ทิ้ง segment ที่พ้น retention.ms / retention.bytes"]
+  topic --> comp["compact: เก็บ record ล่าสุดต่อ key, GC ค่าเก่า"]
+  del --> use1["event stream: log, click, metric"]
+  comp --> use2["state/changelog: config, snapshot, Streams store"]`;
+
+## Tombstone: ลบ key
+
+ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บมันไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น.
+
+```java
+// Tombstone: null value tells a compacted topic to forget this key
+producer.send(new ProducerRecord<>("user-config", "user-42", null));
+```
+
+รวม policy ได้ด้วย `cleanup.policy=compact,delete` เพื่อ compact ตาม key **และ** ยังทยอยลบข้อมูลที่เก่ามากออกไป.
+
+## เลือก policy
+
+- **`delete`** — ตัว record คือประเด็น history สำคัญ ค่าล่าสุดต่อ key ไม่สำคัญ เหมาะกับ event stream.
+- **`compact`** — **ค่าล่าสุดของ key** คือประเด็น อยากได้ snapshot ที่สร้างใหม่ได้ เหมาะกับ state, changelog, config topic.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**`cleanup.policy`** ของ topic เลือก lifecycle ของมัน **`delete`** ทยอยลบ record ตาม **`retention.ms`** / **`retention.bytes`** โดยไม่สนการ consume — เหมาะกับ event stream **`compact`** เก็บ **ค่าล่าสุดต่อ key** เปลี่ยน topic เป็น state snapshot ที่สร้างใหม่ได้ — เหมาะกับ changelog และ config ส่วน **tombstone** (value null) ลบ key ภายใต้ compaction.
+</Callout>
+
+export const quizRetention = [
+  {
+    q: 'cleanup.policy=delete ทำอะไร?',
+    options: [
+      'ลบ topic ทันที',
+      'ลบ log segment เก่าเมื่อเกิน retention.ms หรือ retention.bytes โดยไม่สนว่าถูก consume แล้วหรือยัง',
+      'เก็บแค่ record ล่าสุดต่อ key',
+      'ลบ record หลังทุก consumer อ่าน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'log compaction เก็บอะไรไว้?',
+    options: [
+      'record แรกสุดที่เคยเขียน',
+      'record ล่าสุดของแต่ละ key และ GC ค่าเก่าต่อ key',
+      'สุ่ม record มาบางส่วน',
+      'เฉพาะ record ที่เล็กกว่า 1 KB',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ลบ key ออกจาก compacted topic ยังไง?',
+    options: [
+      'รัน SQL DELETE',
+      'เขียน tombstone — record ที่มี key นั้นและ value เป็น null',
+      'ลด retention.ms เป็นศูนย์',
+      'ลบ key จาก compacted topic ไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'topic แบบไหนเหมาะกับ cleanup.policy=compact ที่สุด?',
+    options: [
+      'clickstream ที่ทุก event สำคัญ',
+      'changelog/state topic ที่อยากได้ค่าล่าสุดต่อ key และ snapshot ที่สร้างใหม่ได้',
+      'metric feed อายุสั้น',
+      'topic ที่ควรถูกลบหลังหนึ่งวัน',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/retention-and-compaction" questions={quizRetention} />
+
+<ProgressTracker client:visible id="topics-and-partitions/retention-and-compaction" />

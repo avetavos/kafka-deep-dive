@@ -1,0 +1,98 @@
+---
+title: 'KRaft กับ Cluster'
+description: 'Kafka 4.x ประสานงานตัวเองด้วย KRaft ยังไงหลังถอด ZooKeeper ออก controller quorum, metadata ที่เป็น log และอะไรที่เปลี่ยนไปสำหรับ developer'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Kafka cluster ต้องมีที่เก็บ metadata ของ cluster ว่า broker ตัวไหน lead partition ไหน, มี topic อะไรบ้าง, ใครอยู่ใน ISR และใน **Kafka 4.x** งานนี้ทำโดย **KRaft** ซึ่งเป็น controller quorum แบบ Raft ที่ built-in เข้ามา โดย **ZooKeeper ถูกถอดออกหมดแล้ว**
+
+## ทำไมถึงเปลี่ยน
+
+ตลอดประวัติศาสตร์ส่วนใหญ่ของ Kafka ใช้ ensemble ของ **ZooKeeper** ภายนอกเก็บ metadata ของ cluster มันเป็นระบบแยกต่างหากที่ต้อง deploy, secure, tune และทำความเข้าใจ แถมกลายเป็นคอขวดด้าน scalability เมื่อ cluster โตจนมี partition เยอะ **KRaft** (Kafka Raft) ย้ายการจัดการ metadata **เข้ามาไว้ใน** Kafka เอง ตั้งแต่ **Kafka 4.0 KRaft เป็น mode เดียว** ZooKeeper mode ถูกถอดออกทั้งหมด และ flag `--zookeeper` ของ CLI ก็หายไปแล้ว
+
+<Callout title="ถ้าคุณเรียน Kafka มาเมื่อไม่กี่ปีก่อน">
+tutorial เก่า ๆ จะ start ZooKeeper ก่อนแล้วส่ง `--zookeeper host:2181` เข้า admin command นั่น **ล้าสมัยแล้ว** ใน Kafka 4.x ไม่มี ZooKeeper ให้ start และทุก command ตอนนี้รับ `--bootstrap-server host:9092` ถ้าเห็น `--zookeeper` ในคู่มือ แสดงว่ามันมาก่อนยุค KRaft
+</Callout>
+
+## metadata ก็เป็น log เหมือนกัน
+
+KRaft เอาปรัชญาของ Kafka เองมาใช้กับการประสานงาน cluster มันเก็บ metadata เป็น **log ที่ replicate ได้** broker กลุ่มหนึ่งทำหน้าที่เป็น **controller** รวมกันเป็น **quorum** โดยมีตัวหนึ่งเป็น leader ที่ถูกเลือก ทุกการเปลี่ยน metadata ไม่ว่าจะ create topic, เลือก partition leader ใหม่ หรือ update ISR ล้วนเป็น event ที่ถูก append เข้า **metadata log** ภายในและ replicate ไปยัง controller ตัวอื่นผ่าน protocol แบบ Raft
+
+ผลลัพธ์คือความ consistent และความเร็ว broker ตาม metadata ทันด้วยวิธีเดียวกับที่ consumer ตามข้อมูลทัน คืออ่าน log จาก offset การ failover ของ leader และการกระจาย metadata เร็วกว่าโมเดล watch สมัย ZooKeeper มาก
+
+<Mermaid title="KRaft: controller quorum ที่ replicate metadata log" code={kraftDiagram} />
+
+export const kraftDiagram = `flowchart TB
+  subgraph quorum["Controller quorum (KRaft)"]
+    lead["Active controller (leader)"] -->|replicate metadata log| f1["Controller (follower)"]
+    lead -->|replicate metadata log| f2["Controller (follower)"]
+  end
+  lead -->|metadata updates| brk["Brokers (data plane)"]
+  brk --> cli["Clients discover leaders via bootstrap-server"]`;
+
+## มันหมายความว่าอะไรสำหรับคุณในฐานะ developer
+
+ในชีวิตประจำวัน KRaft แทบมองไม่เห็นจากฝั่ง client คุณยังเชื่อมต่อด้วย `--bootstrap-server`, produce และ consume เหมือนเดิมเป๊ะ ที่เปลี่ยนคือ mental model กับงาน operations
+
+- **ระบบเดียว ไม่ใช่สอง** ไม่มี ZooKeeper ให้ deploy หรือ monitor broker และ controller เป็น process ของ Kafka cluster เล็ก ๆ รวมสองบทบาทไว้ด้วยกันได้เลย
+- **recovery เร็วขึ้น** การ failover ของ controller และการกระจาย metadata เร็วขึ้น ทำให้ leadership ของ partition ลงตัวเร็วขึ้นหลัง broker ตาย
+- **default สมัยใหม่** Kafka 4.x ยังปล่อย **KIP-848** next-generation consumer rebalance protocol เป็น GA และเสริมความแข็งแรงให้ transaction (**KIP-890**) ทั้งสองอย่างจะพูดถึงต่อในคอร์สนี้
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Kafka 4.x เป็น KRaft-only** ZooKeeper หายไปแล้ว metadata ของ cluster ตอนนี้อยู่ใน **Raft log ที่ replicate ได้** จัดการโดย **controller quorum** ภายใน Kafka ให้ failover เร็วขึ้นและเหลือระบบเดียวให้ดูแลแทนที่จะเป็นสอง สำหรับ developer แล้ว API ไม่เปลี่ยน เชื่อมต่อด้วย **`--bootstrap-server`** และให้มอง `--zookeeper` เป็นสัญญาณว่า docs ล้าสมัย
+</Callout>
+
+export const quizKraft = [
+  {
+    q: 'อะไรมาแทน ZooKeeper สำหรับเก็บ metadata ของ cluster ใน Kafka 4.x',
+    options: [
+      'relational database',
+      'KRaft ซึ่งเป็น controller quorum แบบ Raft ที่ built-in อยู่ใน Kafka',
+      'Redis',
+      'ไม่มีอะไรแทน Kafka 4.x ยังต้องใช้ ZooKeeper อยู่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'KRaft เก็บ metadata ของ cluster ยังไง',
+    options: [
+      'ในไฟล์ JSON บน broker ตัวเดียว',
+      'เป็น log ที่ replicate ได้ ถูก append และ replicate ข้าม controller quorum ผ่าน Raft',
+      'ใน memory เท่านั้น หายเมื่อ restart',
+      'ในแต่ละ client',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'คุณเห็น tutorial ใช้ `--zookeeper localhost:2181` มันบอกอะไรคุณ',
+    options: [
+      'มันคือ syntax ปัจจุบันที่แนะนำสำหรับ Kafka 4.x',
+      'มันมาก่อนยุค KRaft flag นี้ถูกถอดออกใน Kafka 4.x ให้ใช้ `--bootstrap-server` แทน',
+      'คุณต้องติดตั้ง ZooKeeper เพื่อรัน Kafka 4.x',
+      'topic จะกลายเป็น read-only',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'จากมุมของ developer อะไรเปลี่ยนไปเมื่อใช้ KRaft',
+    options: [
+      'API ของ producer กับ consumer ถูกเขียนใหม่ทั้งหมด',
+      'เปลี่ยนน้อยมากที่ระดับ client คุณยังใช้ `--bootstrap-server` การเปลี่ยนเป็นเรื่อง operations (ไม่มี ZooKeeper) พร้อม failover ที่เร็วขึ้น',
+      'คุณต้องจัดการ Raft log เองด้วยมือ',
+      'consumer track offset ไม่ได้อีกต่อไป',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/kraft-and-the-cluster" questions={quizKraft} />
+
+<ProgressTracker client:visible id="foundations/kraft-and-the-cluster" />

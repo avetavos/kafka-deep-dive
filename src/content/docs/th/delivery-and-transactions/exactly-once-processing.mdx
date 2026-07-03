@@ -1,0 +1,111 @@
+---
+title: 'Exactly-Once Processing'
+description: 'รูปแบบ consume-transform-produce ด้วย transactions ใช้ sendOffsetsToTransaction commit input offset กับ output record แบบ atomic'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+use case คลาสสิกของ exactly-once คือ **consume-transform-produce** อ่านจาก input topic แปลง แล้วเขียนไป output topic และ Kafka ทำให้มันเป็น exactly-once ด้วยการ commit **input offset ภายใน transaction เดียวกัน** กับ output record
+
+## ทำไม offset ต้องเข้าไปอยู่ใน transaction
+
+ลองนึกถึงการอ่าน `orders` เติมข้อมูลแต่ละตัว แล้วเขียนไป `orders-enriched` ถ้าคุณ commit output ใน transaction แต่ commit input offset แยกต่างหาก การล่มระหว่างสองจังหวะจะทำให้ประมวลผลซ้ำ (output ซ้ำ) หรือข้าม (input หาย) วิธีแก้คือ commit offset ของ consumer **ให้เป็นส่วนหนึ่งของ transaction ของ producer** ด้วย `sendOffsetsToTransaction()` ทีนี้ output record กับความคืบหน้าของ input จะ commit หรือ abort **พร้อมกัน**
+
+```java
+producer.initTransactions();
+consumer.subscribe(List.of("orders"));
+
+while (running) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
+    if (records.isEmpty()) continue;
+
+    producer.beginTransaction();
+    for (ConsumerRecord<String, String> record : records) {
+        producer.send(new ProducerRecord<>("orders-enriched", record.key(), enrich(record.value())));
+    }
+    // Commit the input offsets in the SAME transaction as the output
+    Map<TopicPartition, OffsetAndMetadata> offsets = offsetsFor(records);
+    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+
+    producer.commitTransaction();   // outputs + offsets are atomic
+}
+```
+
+## จัดการ failure ให้ถูก
+
+exception สองกลุ่มสำคัญ `ProducerFencedException` และ `OutOfOrderSequenceException` เป็นแบบ **กู้คืนไม่ได้** อีก instance เข้ามายึด `transactional.id` ของคุณแล้ว ให้ shutdown ส่วน `KafkaException` ทั่วไปภายใน transaction ควร **abort แล้ว retry** จาก offset ที่ commit ล่าสุด
+
+```java
+} catch (ProducerFencedException | OutOfOrderSequenceException e) {
+    shutdown();                       // a zombie was fenced; give up this instance
+} catch (KafkaException e) {
+    producer.abortTransaction();      // roll back and retry the batch
+}
+```
+
+<Mermaid title="consume-transform-produce เป็นหน่วย atomic เดียว" code={eosDiagram} />
+
+export const eosDiagram = `flowchart LR
+  in["poll from orders"] --> begin["beginTransaction()"]
+  begin --> transform["transform + send to orders-enriched"]
+  transform --> off["sendOffsetsToTransaction(input offsets)"]
+  off --> commit["commitTransaction(): outputs + offsets atomic"]
+  commit --> in`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+exactly-once **consume-transform-produce** ทำงานด้วยการเอา input offset ของ consumer **เข้าไปอยู่ใน transaction ของ producer** ผ่าน `sendOffsetsToTransaction()` เพื่อให้ output record กับความคืบหน้าของ input commit แบบ atomic มอง `ProducerFencedException` เป็น fatal (zombie ถูก fence) และ `KafkaException` เป็น **abort แล้ว retry** นี่ให้ exactly-once สำหรับ pipeline ที่อยู่ภายใน Kafka
+</Callout>
+
+export const quizEos = [
+  {
+    q: 'ใน consume-transform-produce ทำไมต้อง commit input offset ภายใน transaction',
+    options: [
+      'เพื่อให้เร็วขึ้น',
+      'เพื่อให้ output record กับความคืบหน้าของ input commit หรือ abort พร้อมกัน ไม่งั้นการล่มจะทำข้อมูลซ้ำหรือหาย',
+      'เพราะ commit offset วิธีอื่นไม่ได้',
+      'เพื่อลดจำนวน partition',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'method ไหน commit consumer offset เป็นส่วนหนึ่งของ producer transaction',
+    options: [
+      'consumer.commitSync()',
+      'producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata())',
+      'producer.flush()',
+      'consumer.seekToBeginning()',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ควรจัดการ ProducerFencedException ยังไง',
+    options: [
+      'retry transaction ทันที',
+      'มองว่ากู้คืนไม่ได้แล้ว shutdown อีก instance เข้ามายึด transactional.id ไปแล้ว',
+      'เพิกเฉย',
+      'สลับไปใช้ auto-commit',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การตอบสนองที่ถูกต้องต่อ KafkaException ทั่วไปภายใน transaction คืออะไร',
+    options: [
+      'commit ต่อไปเลย',
+      'abort transaction แล้ว retry batch จาก offset ที่ commit ล่าสุด',
+      'ลบ topic ทิ้ง',
+      'ปิด idempotence',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/exactly-once-processing" questions={quizEos} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/exactly-once-processing" />

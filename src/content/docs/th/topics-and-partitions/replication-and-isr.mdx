@@ -1,0 +1,102 @@
+---
+title: 'Replication กับ ISR'
+description: 'Kafka รักษาความ durable ยังไง replication factor leader กับ follower replica in-sync replica set min.insync.replicas และ leader election ที่ปลอดภัย.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในประโยคเดียว
+
+Kafka รอด broker ล่มด้วยการเก็บแต่ละ partition ไว้บนหลาย broker — หนึ่ง **leader** และหลาย **follower** — และติดตามว่า copy ไหนตามทันครบใน **in-sync replica (ISR)** set เพื่อให้ leader ที่ล่มถูกแทนที่ได้โดยไม่เสียข้อมูลที่ ack ไปแล้ว.
+
+## Leader กับ follower
+
+แต่ละ partition มี **replication factor**: จำนวน copy ที่ Kafka เก็บ ด้วย `replication-factor 3` partition อยู่บน 3 broker หนึ่งตัวเป็น **leader** — จัดการ read และ write ทั้งหมดของ partition นั้น ที่เหลือเป็น **follower** ที่ไม่ทำอะไรนอกจาก fetch จาก leader ตลอดเวลาเพื่อให้เหมือนกันเป๊ะ.
+
+```bash
+# 3 copies of every partition, spread across 3 brokers
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic payments --partitions 6 --replication-factor 3
+```
+
+ถ้า broker ของ leader ล่ม follower ตัวหนึ่งถูกเลื่อนเป็น leader และ partition ยังให้บริการต่อ client ค้นหา leader ใหม่ผ่าน bootstrap server — ไม่เสียข้อมูล แค่สะดุดสั้นๆ.
+
+## In-sync replica set
+
+ไม่ใช่ทุก follower จะตามทันเสมอ — บางตัวอาจช้าหรือหลุดการเชื่อมต่อชั่วคราว Kafka ติดตาม **ISR**: เซ็ตของ replica (leader บวก follower) ที่ตามทัน log ของ leader ครบ มีแต่สมาชิก ISR เท่านั้นที่มีสิทธิ์เป็น leader เพราะมีแต่พวกนี้ที่มีข้อมูลที่ ack แล้วครบ.
+
+สอง config เปลี่ยน ISR ให้เป็นสัญญาความ durable:
+
+- **`acks=all`** (ฝั่ง producer) — write ถูก ack ก็ต่อเมื่อ **สมาชิก ISR ทุกตัว** มีข้อมูลแล้ว.
+- **`min.insync.replicas`** (ฝั่ง topic/broker) — **ขนาด ISR ขั้นต่ำ** ที่ write จะถูกยอมรับ ด้วย `min.insync.replicas=2` ถ้า ISR เหลือ 1 write แบบ `acks=all` จะ **ถูกปฏิเสธ** แทนที่จะเสี่ยงเหลือ copy เดียว.
+
+<Mermaid title="leader replicate ไป follower ส่วน ISR คุม write ที่ durable" code={isrDiagram} />
+
+export const isrDiagram = `flowchart TB
+  prod["Producer (acks=all)"] --> leader["Leader replica"]
+  leader -->|replicate| f1["Follower (อยู่ใน ISR)"]
+  leader -->|replicate| f2["Follower (อยู่ใน ISR)"]
+  leader -.->|ตามช้า หลุดจาก ISR| f3["Follower (นอก ISR)"]
+  isr["write ถูก ack เมื่อ ISR ทุกตัวมีแล้ว min.insync.replicas คุมขนาด ISR"]`;
+
+## Durability มาก่อน availability
+
+สูตรความ durable แบบคลาสสิกคือ `replication-factor=3`, `min.insync.replicas=2`, `acks=all` ทน broker ล่มได้ 1 ตัว โดยยังบังคับให้ทุก write ที่ ack แล้วมี 2 copy — คุณไม่พึ่ง disk เดียว.
+
+ถ้า ISR เหลือศูนย์และ replica ที่ค้าง ไม่ sync เป็นตัวรอดตัวเดียวล่ะ? การเลือกมันขึ้นมาจะทำให้ partition กลับ online แต่ **เสีย** record ที่มันไม่เคยได้รับ default ของ Kafka คือ **`unclean.leader.election.enable=false`** ปฏิเสธการแลกนี้: มันเก็บ partition ไว้ offline จนกว่า replica ที่ in-sync จะกลับมา โดยเลือก **durability มาก่อน availability** คุณเปลี่ยนให้ availability มาก่อนได้ แต่ต้องเข้าใจความเสี่ยงเรื่องเสียข้อมูล.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kafka replicate แต่ละ partition ไป **leader** บวก **follower** ส่วน **ISR** คือเซ็ตของ replica ที่ตามทันครบ **`acks=all`** รอ ISR ทุกตัว และ **`min.insync.replicas`** บังคับขนาด ISR ขั้นต่ำ สูตรปลอดภัยคือ **RF=3, min.insync.replicas=2, acks=all** โดย default Kafka ปิด **unclean leader election** เลือก **durability มาก่อน availability** — ไม่เลื่อน replica ที่ค้างขึ้นมาแล้วเสียข้อมูลที่ ack ไปแล้ว.
+</Callout>
+
+export const quizIsr = [
+  {
+    q: 'ISR (in-sync replica set) คืออะไร?',
+    options: [
+      'broker ทุกตัวใน cluster',
+      'เซ็ตของ replica ที่ตามทัน leader ครบ มีสิทธิ์เป็น leader ได้โดยไม่เสียข้อมูล',
+      'รายการ consumer ที่อ่าน partition',
+      'offset ที่ producer เขียนไปแล้ว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'min.insync.replicas คุมอะไร?',
+    options: [
+      'จำนวน partition ของ topic',
+      'ขนาด ISR ขั้นต่ำที่ write แบบ acks=all จะถูกยอมรับ',
+      'จำนวน consumer group ที่อนุญาต',
+      'ระยะเวลา retention',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ชุดค่าไหนคือสูตร durable-write มาตรฐาน?',
+    options: [
+      'replication-factor=1, acks=0',
+      'replication-factor=3, min.insync.replicas=2, acks=all',
+      'replication-factor=2, acks=0, min.insync.replicas=1',
+      'replication-factor=1, min.insync.replicas=3',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม unclean.leader.election.enable เป็น false โดย default?',
+    options: [
+      'เพื่อให้ cluster เร็วขึ้น',
+      'เพื่อเลี่ยงการเลื่อน replica ที่ค้าง ไม่ sync ขึ้นมา ซึ่งจะเสียข้อมูลที่ ack แล้ว — durability มาก่อน availability',
+      'เพราะ leader election ไม่รองรับใน KRaft',
+      'เพื่อลดจำนวน partition',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/replication-and-isr" questions={quizIsr} />
+
+<ProgressTracker client:visible id="topics-and-partitions/replication-and-isr" />

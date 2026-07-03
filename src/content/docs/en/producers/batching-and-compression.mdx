@@ -1,0 +1,123 @@
+---
+title: 'Batching and Compression'
+description: 'How linger.ms and batch.size trade latency for throughput, the compression codecs, buffer.memory back-pressure, and delivery.timeout.ms as the total send deadline.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+The producer **groups records into batches** and optionally **compresses** them, so a little extra waiting (`linger.ms`) and bigger batches (`batch.size`) buy dramatically higher **throughput** — as long as writes stay inside `delivery.timeout.ms`.
+
+## linger.ms and batch.size trade latency for throughput
+
+The producer does not send each record on its own. It accumulates records per partition into a **batch** and sends the batch as one request. Two settings shape that batch:
+
+- **`batch.size`** — the maximum size in **bytes** of a single batch. A batch ships when it fills up to this size (or when `linger.ms` elapses).
+- **`linger.ms`** — how long the producer will **wait** for more records before sending a not-yet-full batch. It defaults to `0` (send as soon as possible). Raising it to, say, `10` lets more records accumulate, producing fuller batches.
+
+Larger batches mean fewer requests, better compression, and higher throughput — at the cost of a few extra milliseconds of latency per record. That is the central lever.
+
+```properties
+# Wait up to 10 ms to fill a batch, and allow bigger batches for throughput
+linger.ms=10
+batch.size=65536
+```
+
+## compression.type shrinks batches on the wire
+
+Compression is applied **per batch**, so bigger batches compress better. The `compression.type` config picks the codec, each a different point on the speed-versus-ratio curve:
+
+- **`lz4`** — very fast, good ratio; a common default choice.
+- **`zstd`** — excellent ratio, still fast; great when network or storage is the bottleneck.
+- **`snappy`** — fast, modest ratio.
+- **`gzip`** — best ratio, but the most CPU-heavy and slowest.
+- **`none`** — no compression (the default).
+
+```properties
+# Compress each batch; lz4 and zstd are the usual picks for throughput
+compression.type=lz4
+```
+
+## buffer.memory, back-pressure, and the delivery deadline
+
+Because `send()` is asynchronous, records sit in an in-memory buffer before the I/O thread transmits them. `buffer.memory` caps the total size of that buffer. When it fills — because the app produces faster than the network can drain — `send()` **blocks** (up to `max.block.ms`), applying **back-pressure** so a fast producer cannot exhaust memory.
+
+Two timeouts bound the whole journey. `delivery.timeout.ms` (default **120000**) is the **total deadline** from the moment `send()` returns until the record is acknowledged — it covers batching delay, network sends, **and all retries**. It should be **>= `request.timeout.ms` + `linger.ms`**. If a record cannot be delivered within it, the send fails permanently.
+
+```properties
+# 32 MiB send buffer; when full, send() applies back-pressure and blocks
+buffer.memory=33554432
+# Total deadline covering batching + retries; must be >= request.timeout.ms + linger.ms
+delivery.timeout.ms=120000
+request.timeout.ms=30000
+```
+
+<Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
+
+export const batchDiagram = `flowchart LR
+  send["send() adds record to buffer"] --> buf["'buffer.memory': full means back-pressure"]
+  buf --> batch["Batch fills to 'batch.size' or 'linger.ms' elapses"]
+  batch --> comp["Compress batch: lz4 / zstd / snappy / gzip"]
+  comp --> io["I/O thread sends; retries allowed"]
+  io --> deadline["Must finish within 'delivery.timeout.ms' (120000)"]`;
+
+## Tuning for throughput
+
+To push throughput up, raise `linger.ms` a little (5-20 ms), enlarge `batch.size`, and turn on `lz4` or `zstd` compression — the three work together, since more waiting makes fuller batches and fuller batches compress better. Keep `buffer.memory` comfortable so back-pressure does not stall you, and make sure `delivery.timeout.ms` is generous enough to absorb retries during a broker hiccup.
+
+<Callout title="The one-line takeaway">
+The producer batches records: **`linger.ms`** and **`batch.size`** trade a little **latency** for much higher **throughput**, and **`compression.type`** (**lz4**, **zstd**, snappy, gzip) shrinks each batch. **`buffer.memory`** applies **back-pressure** when full, and **`delivery.timeout.ms`** (default **120000**) is the total send deadline covering all retries.
+</Callout>
+
+export const quizBatching = [
+  {
+    q: 'What do linger.ms and batch.size trade off?',
+    options: [
+      'Durability for security',
+      'A little latency for higher throughput via fuller batches',
+      'Ordering for parallelism',
+      'Disk space for memory',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which compression codec gives the best ratio but is the most CPU-heavy?',
+    options: [
+      'lz4',
+      'snappy',
+      'gzip',
+      'none',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What happens when buffer.memory fills up?',
+    options: [
+      'Records are dropped silently',
+      'send() blocks, applying back-pressure so the producer cannot exhaust memory',
+      'The producer switches to acks=0',
+      'The broker deletes old records',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does delivery.timeout.ms (default 120000) bound?',
+    options: [
+      'Only the time to serialize a record',
+      'The total deadline from send() to acknowledgement, covering batching and all retries',
+      'How long a consumer may lag',
+      'The retention period of the topic',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/batching-and-compression" questions={quizBatching} />
+
+<ProgressTracker client:visible id="producers/batching-and-compression" />

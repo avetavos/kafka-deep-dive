@@ -1,0 +1,123 @@
+---
+title: 'Batching กับ Compression'
+description: 'linger.ms และ batch.size แลก latency กับ throughput อย่างไร codec ของ compression buffer.memory กับ back-pressure และ delivery.timeout.ms ในฐานะเส้นตายรวมของการส่ง.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+producer **รวม record เป็น batch** และ **compress** ตามต้องการ ดังนั้นการรอเพิ่มอีกนิด (`linger.ms`) กับ batch ที่ใหญ่ขึ้น (`batch.size`) จึงซื้อ **throughput** ที่สูงขึ้นมาก — ตราบใดที่ write ยังอยู่ในกรอบ `delivery.timeout.ms`.
+
+## linger.ms กับ batch.size แลก latency กับ throughput
+
+producer ไม่ได้ส่งทีละ record มันสะสม record ต่อ partition เข้าเป็น **batch** แล้วส่ง batch เป็น request เดียว มีสองค่าที่กำหนดรูปร่างของ batch:
+
+- **`batch.size`** — ขนาดสูงสุดเป็น **byte** ของ batch เดียว batch จะถูกส่งเมื่อเต็มถึงขนาดนี้ (หรือเมื่อ `linger.ms` หมดเวลา).
+- **`linger.ms`** — producer จะ **รอ** record เพิ่มนานแค่ไหนก่อนส่ง batch ที่ยังไม่เต็ม ค่า default คือ `0` (ส่งให้เร็วที่สุด) เพิ่มเป็น เช่น `10` จะให้ record สะสมได้มากขึ้น เกิด batch ที่เต็มกว่า.
+
+batch ที่ใหญ่ขึ้นหมายถึง request น้อยลง compress ได้ดีขึ้น และ throughput สูงขึ้น — แลกกับ latency ที่เพิ่มไม่กี่ millisecond ต่อ record นี่คือคันโยกหลัก.
+
+```properties
+# Wait up to 10 ms to fill a batch, and allow bigger batches for throughput
+linger.ms=10
+batch.size=65536
+```
+
+## compression.type ย่อ batch บนสาย
+
+compression ถูกทำ **ต่อ batch** ดังนั้น batch ที่ใหญ่กว่าจึง compress ได้ดีกว่า ค่า `compression.type` เลือก codec แต่ละตัวอยู่คนละจุดบนเส้นความเร็วต่ออัตราการย่อ:
+
+- **`lz4`** — เร็วมาก อัตราย่อดี เป็นตัวเลือก default ที่นิยม.
+- **`zstd`** — อัตราย่อเยี่ยม ยังเร็วอยู่ เหมาะเมื่อ network หรือ storage เป็นคอขวด.
+- **`snappy`** — เร็ว อัตราย่อพอประมาณ.
+- **`gzip`** — อัตราย่อดีสุด แต่กิน CPU มากสุดและช้าสุด.
+- **`none`** — ไม่ compress (ค่า default).
+
+```properties
+# Compress each batch; lz4 and zstd are the usual picks for throughput
+compression.type=lz4
+```
+
+## buffer.memory, back-pressure และเส้นตายของการส่ง
+
+เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O thread จะส่งออก `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อมันเต็ม — เพราะแอปผลิตเร็วกว่าที่ network จะระบายทัน — `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด.
+
+มีสอง timeout ที่คุมทั้งเส้นทาง `delivery.timeout.ms` (ค่า default **120000**) คือ **เส้นตายรวม** ตั้งแต่ตอน `send()` คืนค่าจนถึงตอน record ถูก acknowledge — ครอบคลุมทั้ง delay ของ batching, การส่งผ่าน network **และ retry ทั้งหมด** ควรตั้งให้ **>= `request.timeout.ms` + `linger.ms`** ถ้าส่ง record ไม่สำเร็จภายในเวลานี้ การ send จะ fail ถาวร.
+
+```properties
+# 32 MiB send buffer; when full, send() applies back-pressure and blocks
+buffer.memory=33554432
+# Total deadline covering batching + retries; must be >= request.timeout.ms + linger.ms
+delivery.timeout.ms=120000
+request.timeout.ms=30000
+```
+
+<Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
+
+export const batchDiagram = `flowchart LR
+  send["send() adds record to buffer"] --> buf["'buffer.memory': full means back-pressure"]
+  buf --> batch["Batch fills to 'batch.size' or 'linger.ms' elapses"]
+  batch --> comp["Compress batch: lz4 / zstd / snappy / gzip"]
+  comp --> io["I/O thread sends; retries allowed"]
+  io --> deadline["Must finish within 'delivery.timeout.ms' (120000)"]`;
+
+## จูนเพื่อ throughput
+
+ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+producer รวม record เป็น batch: **`linger.ms`** และ **`batch.size`** แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก และ **`compression.type`** (**lz4**, **zstd**, snappy, gzip) ย่อแต่ละ batch **`buffer.memory`** ใส่ **back-pressure** เมื่อเต็ม และ **`delivery.timeout.ms`** (ค่า default **120000**) คือเส้นตายรวมของการส่งที่ครอบคลุม retry ทั้งหมด.
+</Callout>
+
+export const quizBatching = [
+  {
+    q: 'linger.ms และ batch.size แลกอะไรกับอะไร',
+    options: [
+      'durability แลกกับ security',
+      'latency นิดหน่อยแลกกับ throughput ที่สูงขึ้นผ่าน batch ที่เต็มกว่า',
+      'ordering แลกกับ parallelism',
+      'พื้นที่ disk แลกกับ memory',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'compression codec ตัวไหนให้อัตราย่อดีสุดแต่กิน CPU มากสุด',
+    options: [
+      'lz4',
+      'snappy',
+      'gzip',
+      'none',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'เกิดอะไรขึ้นเมื่อ buffer.memory เต็ม',
+    options: [
+      'record ถูกทิ้งเงียบ ๆ',
+      'send() block ใส่ back-pressure เพื่อไม่ให้ producer ใช้หน่วยความจำจนหมด',
+      'producer สลับไปใช้ acks=0',
+      'broker ลบ record เก่า',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'delivery.timeout.ms (ค่า default 120000) คุมอะไร',
+    options: [
+      'แค่เวลาในการ serialize record',
+      'เส้นตายรวมตั้งแต่ send() จนถึง acknowledge ครอบคลุม batching และ retry ทั้งหมด',
+      'consumer lag ได้นานแค่ไหน',
+      'ระยะเวลา retention ของ topic',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/batching-and-compression" questions={quizBatching} />
+
+<ProgressTracker client:visible id="producers/batching-and-compression" />

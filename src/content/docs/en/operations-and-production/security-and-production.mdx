@@ -1,0 +1,125 @@
+---
+title: 'Security & Production'
+description: 'Securing Kafka for production — TLS encryption in transit, SASL authentication, ACL authorization with kafka-acls.sh, and a readiness checklist for durable, safe clusters.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Securing Kafka is three layers stacked together — **encryption in transit** with TLS, **authentication** with SASL or mTLS to prove who a client is, and **authorization** with ACLs to control what that client may do — all sitting on top of a durably configured cluster.
+
+## Encryption and authentication
+
+By default a Kafka listener speaks plaintext. For production you enable **TLS/SSL** so traffic between clients and brokers, and between brokers themselves, is encrypted in transit. On top of that you add **authentication** so the broker knows who is connecting. Kafka supports several SASL mechanisms plus mutual TLS:
+
+- **SASL/SCRAM** — salted challenge-response with credentials stored in the cluster; a common, self-contained choice.
+- **SASL/PLAIN** — username and password, only safe **over TLS**.
+- **SASL/OAUTHBEARER** — OAuth 2.0 bearer tokens, for integrating with an identity provider.
+- **mTLS** — the client's TLS certificate itself is the identity, so no separate password is needed.
+
+```properties
+# Broker listener using TLS for encryption + SASL/SCRAM for authentication
+listeners=SASL_SSL://:9093
+security.inter.broker.protocol=SASL_SSL
+sasl.enabled.mechanisms=SCRAM-SHA-256
+ssl.keystore.location=/etc/kafka/broker.keystore.jks
+ssl.truststore.location=/etc/kafka/broker.truststore.jks
+```
+
+## Authorization with ACLs
+
+Authentication proves identity; **authorization** decides what that identity may do. Kafka's authorizer checks **ACLs** — rules like "user `analytics` may Read topic `orders`." You manage them with `kafka-acls.sh`, always against `--bootstrap-server`:
+
+```bash
+# Allow user "analytics" to consume from topic "orders"
+kafka-acls.sh --bootstrap-server localhost:9092 \
+  --add --allow-principal User:analytics \
+  --operation Read --topic orders --group analytics-group
+
+# Allow user "order-service" to produce to topic "orders"
+kafka-acls.sh --bootstrap-server localhost:9092 \
+  --add --allow-principal User:order-service \
+  --operation Write --topic orders
+```
+
+<Mermaid title="Three layers of Kafka security" code={secFlow} />
+
+export const secFlow = `flowchart LR
+  client["Client"] -->|"TLS: encrypt in transit"| enc["Encryption"]
+  enc -->|"SASL / mTLS: who are you"| authn["Authentication"]
+  authn -->|"ACLs: what may you do"| authz["Authorization"]
+  authz --> broker["Broker serves the request"]`;
+
+## Production readiness checklist
+
+Security is one column of production readiness; durability and observability are the others. Before a cluster carries real traffic, confirm:
+
+- **Replication factor >= 3** on important topics, so two brokers can be lost without data loss.
+- **`min.insync.replicas=2`** paired with **`acks=all`** — writes require at least two in-sync replicas, the durable production combo.
+- **TLS everywhere**, **SASL or mTLS authentication**, and **ACLs** locking down each principal to least privilege.
+- **Monitoring and alerting** on consumer lag, under-replicated partitions, and request latency.
+- **Quotas** to stop a single misbehaving client from starving the cluster of bandwidth or requests.
+
+```properties
+# Durable topic-level defaults for production
+default.replication.factor=3
+min.insync.replicas=2
+# and producers set acks=all
+```
+
+<Callout title="The one-line takeaway">
+Production Kafka layers **TLS** encryption, **SASL/mTLS** authentication, and **ACLs** (via **`kafka-acls.sh`**) for authorization on top of a durable core: **replication factor >= 3**, **`min.insync.replicas=2`**, and **`acks=all`**, with **monitoring**, alerting, and **quotas** in place. Congratulations — you have completed the **Kafka Deep Dive**: from logs, brokers, and KRaft, through producers, consumers, delivery semantics, Streams and Connect, to running and securing Kafka in production. Go build something durable.
+</Callout>
+
+export const quizSecurity = [
+  {
+    q: 'What are the three layers of Kafka security?',
+    options: [
+      'Encryption in transit (TLS), authentication (SASL/mTLS), and authorization (ACLs)',
+      'Backups, snapshots, and replication',
+      'Batching, compression, and acks',
+      'ZooKeeper, KRaft, and JMX',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Which tool manages Kafka authorization rules?',
+    options: [
+      '`kafka-storage.sh`',
+      '`kafka-acls.sh --bootstrap-server ...`',
+      '`kafka-console-producer.sh`',
+      '`kafka-topics.sh --acl`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the durable production combination for writes?',
+    options: [
+      'replication factor 1 and acks=0',
+      'replication factor >= 3, min.insync.replicas=2, and acks=all',
+      'A single broker with no replicas',
+      'acks=1 with no minimum ISR',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why set quotas on a production cluster?',
+    options: [
+      'To encrypt traffic between brokers',
+      'To stop a single misbehaving client from starving the cluster of bandwidth or requests',
+      'To increase the replication factor automatically',
+      'To disable ACLs',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/security-and-production" questions={quizSecurity} />
+
+<ProgressTracker client:visible id="operations-and-production/security-and-production" />

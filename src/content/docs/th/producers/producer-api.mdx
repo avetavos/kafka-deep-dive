@@ -1,0 +1,134 @@
+---
+title: 'Producer API'
+description: 'ทำความรู้จัก KafkaProducer client กับ ProducerRecord การ send แบบ asynchronous ที่คืน Future callback สำหรับ completion และ error พร้อม key และ value serializer และตัวอย่าง Java แบบสั้น.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Producer** สร้าง `ProducerRecord` (topic, key ที่ใส่หรือไม่ใส่ก็ได้, value) แล้วส่งเข้า `send()` ซึ่งคืน `Future` และทำงานเสร็จแบบ **asynchronous** จากนั้น Kafka จะ append record นั้นลง partition ของ topic.
+
+## KafkaProducer กับ ProducerRecord
+
+`KafkaProducer` เป็น client แบบ thread-safe สร้างครั้งเดียวแล้วใช้ซ้ำตลอดอายุแอปได้เลย เราไม่เขียน byte ดิบไปหา broker เอง แต่ห่อข้อมูลไว้ใน `ProducerRecord` แล้วส่งให้ `send()`.
+
+`ProducerRecord` พก 3 อย่างที่เราสนใจมากสุด:
+
+- **topic** — ชื่อ stream ที่จะเขียนลง (จำเป็น).
+- **key** — ใส่หรือไม่ก็ได้ record ที่มี key เดียวกันจะไปลง partition เดียวกัน ซึ่งเป็นวิธีที่ Kafka รักษา ordering ต่อ key.
+- **value** — payload หรือตัว event data นั่นเอง.
+
+เพราะ broker เข้าใจแค่ byte เท่านั้น producer จึงต้องมี **serializer** สำหรับ key และอีกตัวสำหรับ value ค่า config `key.serializer` และ `value.serializer` บอก client ว่าจะแปลง Java object เป็น `byte[]` อย่างไร ถ้าเป็น text ธรรมดา `StringSerializer` คือตัวเลือกปกติ.
+
+```properties
+# Minimum producer configuration
+# bootstrap.servers is the initial broker list the client contacts to discover the cluster
+bootstrap.servers=localhost:9092
+# Serializers turn your key/value objects into the bytes the broker stores
+key.serializer=org.apache.kafka.common.serialization.StringSerializer
+value.serializer=org.apache.kafka.common.serialization.StringSerializer
+```
+
+## send() เป็น asynchronous — ใช้ callback
+
+`send()` **ไม่** block รอจน record ถึง broker แต่จะ buffer record ไว้ คืน `Future<RecordMetadata>` กลับมาทันที แล้วให้ background I/O thread ส่งจริงผ่าน network ถ้าอยากรู้ผลลัพธ์ เลือกได้ระหว่างเรียก `.get()` บน `Future` (ซึ่ง block) หรือ — ดีกว่ามากสำหรับ throughput — ลงทะเบียน `Callback` ที่ยิงเมื่อ completion หรือ error.
+
+```java
+import org.apache.kafka.clients.producer.*;
+import java.util.Properties;
+
+public class MinimalProducer {
+  public static void main(String[] args) {
+    Properties props = new Properties();
+    // bootstrap.servers: initial brokers used to discover the whole cluster
+    props.put("bootstrap.servers", "localhost:9092");
+    props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+    props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+    // The producer is thread-safe: create once, reuse, close at the end
+    try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+      // topic = "orders", key = "order-42", value = the event payload
+      ProducerRecord<String, String> record =
+          new ProducerRecord<>("orders", "order-42", "{\"amount\":19.99}");
+
+      // send() returns immediately with a Future; the callback reports the result
+      producer.send(record, (RecordMetadata metadata, Exception exception) -> {
+        if (exception != null) {
+          // completion with an error — log, retry, or route to a dead-letter path
+          System.err.println("send failed: " + exception.getMessage());
+        } else {
+          // success — Kafka assigned this record a partition and an offset
+          System.out.printf("sent to %s-%d @ offset %d%n",
+              metadata.topic(), metadata.partition(), metadata.offset());
+        }
+      });
+    } // close() flushes buffered records and releases resources
+  }
+}
+```
+
+<Mermaid title="From ProducerRecord to an assigned offset" code={producerDiagram} />
+
+export const producerDiagram = `flowchart LR
+  app["Your app builds a 'ProducerRecord'"] --> ser["Serializers: key and value to bytes"]
+  ser --> buf["Producer buffer (per partition)"]
+  buf --> io["Background I/O thread sends batch"]
+  io --> broker["Broker appends to partition"]
+  broker --> cb["Callback fires: RecordMetadata or Exception"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ห่อข้อมูลไว้ใน **`ProducerRecord`** (topic, key, value) ตั้งค่า **key และ value serializer** แล้วเรียก **`send()`** — มันเป็น **asynchronous** และคืน **`Future`** ดังนั้นให้ลงทะเบียน **`Callback`** เพื่อจัดการ completion และ error แทนการ block.
+</Callout>
+
+export const quizProducerApi = [
+  {
+    q: 'ProducerRecord มี 3 field หลักอะไรบ้าง',
+    options: [
+      'broker, offset, timestamp',
+      'topic, key และ value',
+      'partition, replica และ leader',
+      'group, consumer และ cursor',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'send() คืนค่าอะไร และทำงานเสร็จเมื่อไร',
+    options: [
+      'มัน block แล้วคืน offset ตรง ๆ เมื่อเขียนเสร็จ',
+      'มันคืน Future ทันที แล้วทำงานเสร็จแบบ asynchronous เบื้องหลัง',
+      'มันคืน void และไม่เคยรายงานว่าสำเร็จหรือล้มเหลว',
+      'มันคืน byte ดิบที่ส่งไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม producer ต้องมี key.serializer และ value.serializer',
+    options: [
+      'เพื่อเข้ารหัสทุก record แบบ end to end',
+      'เพื่อแปลง object ของ key และ value เป็น byte array ที่ broker เก็บ',
+      'เพื่อ compress record ก่อนส่งผ่าน network',
+      'เพื่อเลือกว่า consumer group ไหนอ่าน record',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'bootstrap.servers ใช้ทำอะไร',
+    options: [
+      'มันระบุ broker ทุกตัวที่ต้อง online ไม่งั้นการ send จะล้มเหลว',
+      'มันคือ list broker เริ่มต้นที่ client ติดต่อเพื่อ discover cluster',
+      'มันตั้งระยะเวลา retention ของ topic',
+      'มันเลือก partition ที่ record จะลง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/producer-api" questions={quizProducerApi} />
+
+<ProgressTracker client:visible id="producers/producer-api" />

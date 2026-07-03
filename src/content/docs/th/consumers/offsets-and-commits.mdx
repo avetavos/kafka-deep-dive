@@ -1,0 +1,126 @@
+---
+title: 'Offsets & Commits'
+description: 'consumer บันทึกความคืบหน้าอย่างไร ทั้ง committed offset, auto-commit เทียบกับ manual commitSync และ commitAsync และดีฟอลต์แบบ at-least-once'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+consumer บันทึกว่าประมวลผลไปถึงไหนด้วยการ **commit offset** ต่อ partition Kafka เก็บมันไว้ใน topic ภายในชื่อ `__consumer_offsets` และ **จุดที่คุณ commit** เทียบกับ **จุดที่คุณ process** เป็นตัวตัดสินว่าคุณจะทำ record หายหรือซ้ำได้
+
+## committed เทียบกับ current position
+
+แต่ละ partition พก offset สองตัวมาด้วย:
+
+- **Position** offset ตัวถัดไปที่ consumer จะ fetch (ขยับไปเรื่อยเมื่อ poll)
+- **Committed offset** offset ตัวสุดท้ายที่ consumer บันทึกอย่างถาวรว่า "เสร็จแล้ว"
+
+เมื่อ restart หรือ rebalance consumer จะกลับมาเริ่มจาก **committed** offset ดังนั้น commit จึงเป็นคำสัญญาว่า "ทุกอย่างก่อนหน้านี้ process แล้ว อย่าส่งมาอีก"
+
+## auto-commit สะดวกแต่เสี่ยง
+
+โดยดีฟอลต์ `enable.auto.commit=true` จะ commit offset ล่าสุดที่ poll มาทุก ๆ `auto.commit.interval.ms` (5 วินาที) มันง่าย แต่มัน commit ตามเวลาโดยไม่สนว่าการประมวลผลของคุณสำเร็จหรือไม่ ถ้า crash หลัง auto-commit แต่ก่อน process จะทำให้ record เหล่านั้น **หาย** สำหรับงานที่สำคัญ ให้ปิดมัน แล้ว commit **หลัง** process:
+
+```java
+props.put("enable.auto.commit", "false");   // take control of commits
+
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+    for (ConsumerRecord<String, String> record : records) {
+        process(record);                     // do the work FIRST
+    }
+    consumer.commitSync();                    // then commit — at-least-once
+}
+```
+
+## commitSync เทียบกับ commitAsync
+
+- **`commitSync()`** block จนกว่า broker จะ ack และ retry เมื่อเจอ error ที่ลองใหม่ได้ ปลอดภัยแต่ช้ากว่า
+- **`commitAsync()`** ยิงแล้วไปต่อ มี callback ให้เลือกใส่ เร็วกว่าแต่ไม่ retry อัตโนมัติ (pattern ที่พบบ่อยคือใช้ `commitAsync` ในลูป และ `commitSync` ปิดท้ายตอน shutdown)
+
+## จะเริ่มอ่านจากไหน และ replay ด้วย seek()
+
+committed offset จะมีประโยชน์ก็ต่อเมื่อมันมีอยู่ ครั้งแรกที่ group อ่าน partition หนึ่ง หรือถ้า committed offset หมดอายุตาม retention ไปแล้ว `auto.offset.reset` จะเป็นตัวตัดสินว่าจะเริ่มตรงไหน:
+
+- **`earliest`** เริ่มจากต้น partition แล้ว process history ที่เก็บไว้ทั้งหมดใหม่
+- **`latest`** เริ่มจากท้าย อ่านเฉพาะ record ที่เข้ามานับจากนี้ (นี่คือดีฟอลต์)
+
+คุณยัง override ตำแหน่งเองได้ด้วย `seek()` ย้าย partition ไปที่ offset ไหนก็ได้เพื่อ **replay** record เก่าหรือข้ามไปข้างหน้า:
+
+```java
+props.put("auto.offset.reset", "earliest"); // where to begin when there is no committed offset
+
+// Replay partition 0 of "orders" starting from offset 100
+TopicPartition tp = new TopicPartition("orders", 0);
+consumer.seek(tp, 100);                      // the next poll() fetches from offset 100
+// consumer.seekToBeginning(List.of(tp));    // or replay the whole partition from the start
+```
+
+<Mermaid title="Commit หลัง process ให้ผลเป็น at-least-once" code={commitDiagram} />
+
+export const commitDiagram = `flowchart LR
+  poll["poll batch"] --> proc["process records"]
+  proc --> commit["commitSync() after success"]
+  commit --> poll
+  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates)"]`;
+
+## ทำไมดีฟอลต์นี้จึงเป็น at-least-once
+
+commit **หลัง** process แล้ว crash ระหว่างสองจุดนั้น หมายความว่า record เหล่านั้นจะถูกอ่านและ process ซ้ำตอน restart คือ **at-least-once** อาจซ้ำได้ ส่วน commit **ก่อน** process แล้ว crash หมายถึงมันถูกข้ามไป คือ **at-most-once** อาจหายได้ at-least-once เป็นดีฟอลต์ที่ใช้กันทั่วไป จะทำให้มันเป็น exactly-once จริง ๆ ต้องอาศัย idempotent processing หรือ transaction ซึ่ง module ถัดไปจะครอบคลุม
+
+<Callout title="สรุปหนึ่งบรรทัด">
+consumer commit **offset** เพื่อทำเครื่องหมายความคืบหน้า (เก็บใน `__consumer_offsets`) และกลับมาเริ่มจาก **committed** offset หลัง restart **auto-commit** ง่ายแต่ commit ตามเวลาและอาจทำ record หาย เพื่อความถูกต้องให้ปิดมันแล้ว **commit หลัง process** ด้วย `commitSync()`/`commitAsync()` การ commit หลัง process ให้ผลเป็น **at-least-once** (อาจซ้ำ) คือดีฟอลต์ที่ต้องออกแบบเผื่อไว้ ใช้ **`auto.offset.reset`** ตัดสินว่า group ใหม่เอี่ยมจะเริ่มตรงไหน (`earliest`/`latest`) และใช้ **`seek()`** เพื่อ replay
+</Callout>
+
+export const quizOffsets = [
+  {
+    q: 'Kafka เก็บ committed consumer offset ไว้ที่ไหน?',
+    options: [
+      'บน local disk ของ consumer เท่านั้น',
+      'ใน topic ภายในชื่อ `__consumer_offsets`',
+      'ใน ZooKeeper',
+      'ในฐานข้อมูล relational ที่คุณต้องจัดหาเอง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม auto-commit จึงเสี่ยงสำหรับงานประมวลผลที่สำคัญ?',
+    options: [
+      'มัน commit น้อยเกินไปจนไม่มีประโยชน์',
+      'มัน commit ตามเวลาโดยไม่สนว่า process สำเร็จหรือไม่ ดังนั้น crash อาจทำ record หาย',
+      'มันทำ record ซ้ำทุกตัว',
+      'มันปิดการทำงานของ poll loop',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การ commit offset หลัง process ให้ delivery semantic แบบใด?',
+    options: [
+      'At-most-once (record อาจหาย)',
+      'At-least-once — crash ก่อน commit ทำให้ record ถูก process ซ้ำ (อาจซ้ำได้)',
+      'Exactly-once โดยไม่ต้องทำอะไรเพิ่ม',
+      'ไม่มี delivery guarantee เลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'commitSync กับ commitAsync ต่างกันอย่างไร?',
+    options: [
+      'commitSync เร็วกว่าและไม่เคย retry',
+      'commitSync จะ block และ retry เมื่อเจอ error ที่ลองใหม่ได้ ส่วน commitAsync คืนทันทีโดยไม่ retry อัตโนมัติ',
+      'ทั้งคู่เหมือนกันทุกอย่าง',
+      'commitAsync เขียนลง disk ส่วน commitSync เขียนลง memory',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/offsets-and-commits" questions={quizOffsets} />
+
+<ProgressTracker client:visible id="consumers/offsets-and-commits" />

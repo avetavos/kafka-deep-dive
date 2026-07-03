@@ -1,0 +1,90 @@
+---
+title: 'Delivery Semantics'
+description: 'at-most-once, at-least-once และ exactly-once จากมุมของ consumer แต่ละแบบหมายถึงอะไร จุด commit เป็นตัวตัดสินอย่างไร และทำไม idempotency จึงสำคัญ.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+delivery semantics มีสามแบบ — **at-most-once**, **at-least-once** และ **exactly-once** — จากที่นั่งของ consumer คุณเลือกระหว่างสองแบบแรกได้จาก **จังหวะที่คุณ commit** เป็นหลัก แล้วไปถึงแบบที่สามด้วย idempotent processing หรือ transaction.
+
+## สาม guarantee
+
+- **At-most-once** — แต่ละ record ถูกส่งศูนย์หรือหนึ่งครั้ง record อาจ **หาย** แต่ไม่มีทางซ้ำ ได้แบบนี้จากการ commit offset **ก่อน** process: ถ้า crash หลัง commit แต่ยังทำไม่เสร็จ record จะถูกข้ามตอน restart.
+- **At-least-once** — แต่ละ record ถูกส่งหนึ่งครั้งขึ้นไป record อาจ **ซ้ำ** แต่ไม่มีทางหาย ได้แบบนี้จากการ commit **หลัง** process: crash ก่อน commit จะทำให้อ่าน batch ซ้ำ นี่คือดีฟอลต์ที่ใช้จริงในทางปฏิบัติ.
+- **Exactly-once** — แต่ละ record ส่งผลต่อผลลัพธ์เพียงครั้งเดียว ไม่มีหายไม่มีซ้ำ แบบนี้ต้องการมากกว่าแค่จังหวะ commit.
+
+<Mermaid title="Commit placement selects the first two semantics" code={semanticsDiagram} />
+
+export const semanticsDiagram = `flowchart TB
+  poll["poll batch"] --> choice{"commit before or after processing?"}
+  choice -->|before| amo["at-most-once: crash then skip (loss)"]
+  choice -->|after| alo["at-least-once: crash then reprocess (duplicates)"]
+  alo --> idem["make processing idempotent to reach effectively exactly-once"]`;
+
+## ไปให้ถึง exactly-once
+
+at-least-once บวกกับ **idempotent processing** คือเส้นทางที่พบบ่อยที่สุด: ออกแบบ side effect ให้การ process record เดิมซ้ำสองครั้งให้ผลเหมือนทำครั้งเดียว กลยุทธ์ที่ใช้ได้จริง:
+
+- **Upsert ด้วย natural key** แทนการ insert ตรง ๆ เพื่อให้ record ซ้ำเขียนทับแทนที่จะเพิ่มซ้ำ.
+- **Dedup ด้วย record id** ที่ producer ประทับมา แล้วทิ้ง id ที่เคย apply ไปแล้ว.
+- ทำ operation ปลายทางให้ **commutative/idempotent** (เช่น "set status = shipped" ไม่ใช่ "increment count").
+
+เส้นทางที่แข็งแรงกว่าในระดับ framework คือ Kafka **transaction** — เขียน output record และ commit input offset พร้อมกันแบบ atomic — ซึ่ง module ถัดไปจะครอบคลุมเต็ม ๆ มันให้ exactly-once สำหรับ pipeline แบบ **consume-transform-produce** ที่อยู่ภายใน Kafka.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**At-most-once** (commit ก่อน process → อาจหาย), **at-least-once** (commit หลัง → อาจซ้ำ) และ **exactly-once** คือสาม semantic จังหวะ commit เลือกสองแบบแรก โดย **at-least-once เป็นดีฟอลต์ที่สมเหตุสมผล** ไปถึง effectively-exactly-once ได้ด้วยการทำ process ให้ **idempotent** (upsert, dedup ด้วย id, operation แบบ commutative) หรือใช้ Kafka **transaction** สำหรับ consume-transform-produce ภายใน Kafka.
+</Callout>
+
+export const quizSemantics = [
+  {
+    q: 'อะไรคือลักษณะของ at-most-once delivery?',
+    options: [
+      'record อาจซ้ำได้แต่ไม่มีทางหาย',
+      'record อาจหายได้แต่ไม่มีทางซ้ำ — คุณ commit ก่อน process',
+      'record ถูกส่งแบบ exactly once เสมอ',
+      'record ไม่เคยถูกส่งเลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'โดยทั่วไปคุณทำ at-least-once ได้อย่างไร?',
+    options: [
+      'commit offset ก่อน process record',
+      'commit offset หลัง process สำเร็จ เพื่อให้ crash อ่าน batch ซ้ำ',
+      'ปิดการ commit offset ทั้งหมด',
+      'ใช้ partition เดียว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'วิธีที่ใช้ได้จริงในการทำให้ at-least-once ทำงานเหมือน exactly-once คืออะไร?',
+    options: [
+      'ตั้งใจ process record สองครั้ง',
+      'ทำ process ให้ idempotent — upsert ด้วย key หรือ dedup ด้วย record id เพื่อให้ process ซ้ำไม่มีผลเพิ่ม',
+      'ปิด consumer group',
+      'เพิ่ม poll timeout ให้นานขึ้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เส้นทาง exactly-once ที่แข็งแรงที่สุดระดับ framework ใน Kafka ใช้อะไร?',
+    options: [
+      'auto-commit ด้วย interval สั้น ๆ',
+      'transaction ที่เขียน output record และ commit input offset พร้อมกันแบบ atomic',
+      'replication factor ที่ใหญ่ขึ้น',
+      'อ่านตั้งแต่ต้นทุกครั้ง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/delivery-semantics" questions={quizSemantics} />
+
+<ProgressTracker client:visible id="consumers/delivery-semantics" />

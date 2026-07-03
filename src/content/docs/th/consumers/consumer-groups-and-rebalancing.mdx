@@ -1,0 +1,116 @@
+---
+title: 'Consumer Groups & Rebalancing'
+description: 'consumer group แชร์ partition กันอย่างไร rebalance คืออะไร และ KIP-848 consumer rebalance protocol ตัวใหม่ที่ GA แล้วใน Kafka 4.x.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+**consumer group** คือกลุ่มของ consumer ที่แชร์ partition ของ topic กัน — แต่ละ partition ถูกจัดการโดย consumer เพียงตัวเดียวใน group — และ **rebalancing** คือกระบวนการจัดสรร partition ใหม่เมื่อสมาชิกใน group เปลี่ยนไป.
+
+## group แบ่งงานกันทำ
+
+consumer ทุกตัวประกาศ `group.id` Kafka จะยก **partition** แต่ละอันให้ consumer เพียง **ตัวเดียว** ภายใน group ดังนั้น topic ที่มี 6 partition จะถูกประมวลผลพร้อมกันได้สูงสุด 6 consumer เพิ่ม consumer ตัวที่ 7 เข้าไปมันจะนั่งว่าง — เพดานของ parallelism คือจำนวน partition ไม่ใช่จำนวน consumer.
+
+group ต่างกันเป็นอิสระต่อกัน: `analytics` กับ `billing` ต่างได้ stream เต็ม ๆ ของตัวเอง และ track offset ของตัวเอง ส่วนภายใน group เดียวกัน partition จะถูกแบ่งกัน.
+
+คุณตรวจดู group, สมาชิก และ lag ได้จาก CLI:
+
+```bash
+# Show members, assigned partitions, and lag for a group
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group billing
+```
+
+<Mermaid title="One group divides partitions; another group reads the same topic independently" code={groupDiagram} />
+
+export const groupDiagram = `flowchart TB
+  subgraph t["Topic orders: 3 partitions"]
+    p0["orders-0"]
+    p1["orders-1"]
+    p2["orders-2"]
+  end
+  subgraph g1["Group billing"]
+    c1["consumer A"]
+    c2["consumer B"]
+  end
+  p0 --> c1
+  p1 --> c1
+  p2 --> c2
+  t --> g2["Group analytics (own offsets, full copy)"]`;
+
+## Rebalancing
+
+เมื่อ consumer เข้า, ออก หรือตาย — หรือมีการเพิ่ม partition — group ต้อง **rebalance**: กระจาย partition ใหม่ไปยังสมาชิกที่มีอยู่ตอนนั้น protocol แบบ classic ทำสิ่งนี้ด้วยขั้นตอน **stop-the-world**: consumer ทุกตัวหยุดประมวลผล คืน partition ทั้งหมด แล้วรอ assignment ใหม่ บน group ขนาดใหญ่ การหยุดแบบนั้นเจ็บมาก.
+
+## KIP-848: rebalance protocol ตัวใหม่
+
+Kafka 4.0 มาพร้อม **next-generation consumer rebalance protocol (KIP-848)** ในสถานะ **generally available** มันย้าย logic การ assign ไปไว้ที่ **group coordinator** ฝั่ง broker และทำให้ rebalance เป็นแบบ **incremental** — เพิกถอนเฉพาะ partition ที่ต้องย้ายจริง ๆ ส่วนที่เหลือประมวลผลต่อได้ ผลลัพธ์คือ rebalance สั้นลงและรบกวนงานน้อยลง โดยเฉพาะกับ group ขนาดใหญ่.
+
+```properties
+# Opt into the new consumer group protocol (KIP-848), GA in Kafka 4.0
+group.protocol=consumer
+# The classic (older) protocol is still available:
+# group.protocol=classic
+```
+
+<Callout title="ถ้าคุณเรียน Kafka เมื่อหลายปีก่อน">
+คำแนะนำเดิมคือ "เลี่ยง rebalance เพราะมัน stop the world" แต่ด้วย KIP-848 (`group.protocol=consumer`, GA ใน Kafka 4.0) rebalance เป็นแบบ **incremental และขับโดย broker** — partition ที่ไม่โดนแตะยังไหลต่อเนื่อง เมื่อเปิดใช้แล้ว group จะ downgrade ได้ถึงแค่ Kafka 3.4.1 หรือใหม่กว่าเท่านั้น.
+</Callout>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**consumer group** แบ่ง partition ของ topic ให้สมาชิก — หนึ่ง partition ต่อหนึ่ง consumer ดังนั้นจำนวน partition จึงเป็นเพดานของ parallelism — ส่วน group ที่แยกกันต่างอ่าน stream ทั้งเส้น การเปลี่ยนสมาชิกจะ trigger **rebalance** และ Kafka 4.0 ทำให้ราบรื่นขึ้นมากด้วย protocol **KIP-848** (`group.protocol=consumer`) ที่ขับโดย broker และเป็น **incremental** แทน stop-the-world.
+</Callout>
+
+export const quizGroups = [
+  {
+    q: 'ภายใน consumer group เดียว มี consumer กี่ตัวที่อ่าน partition หนึ่ง ๆ?',
+    options: [
+      'consumer ทุกตัวอ่านทุก partition',
+      'ตัวเดียวเท่านั้น — แต่ละ partition ถูก assign ให้ consumer ตัวเดียวใน group',
+      'อย่างน้อยสองตัว เพื่อความ redundant',
+      'ไม่มีเลย broker เป็นคนอ่าน partition',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'topic มี 4 partition แล้วคุณสตาร์ท 6 consumer ใน group เดียว จะเกิดอะไรขึ้น?',
+    options: [
+      'consumer ทั้ง 6 แชร์ทุก partition ร่วมกัน',
+      'consumer 4 ตัวได้ partition คนละอัน อีก 2 ตัวนั่งว่าง — partition เป็นเพดานของ parallelism',
+      'Kafka สร้าง partition เพิ่มอีก 2 อันอัตโนมัติ',
+      'group สตาร์ทไม่ขึ้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'อะไรที่ดีขึ้นเรื่อง rebalancing ใน Kafka 4.0 ด้วย KIP-848?',
+    options: [
+      'ตัด rebalance ออกไปทั้งหมด',
+      'rebalance กลายเป็น incremental และขับโดย broker — เพิกถอนเฉพาะ partition ที่ย้าย แทนที่จะ stop-the-world',
+      'ตอนนี้ consumer แชร์ partition กันได้แล้ว',
+      'ไม่ track offset อีกต่อไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'consumer group สองกลุ่มที่อ่าน topic เดียวกันสัมพันธ์กันอย่างไร?',
+    options: [
+      'แชร์ offset กันและแย่ง record กัน',
+      'เป็นอิสระต่อกัน — แต่ละกลุ่มได้ stream เต็ม ๆ และ track offset ของตัวเอง',
+      'อ่าน topic ได้ทีละกลุ่มเท่านั้น',
+      'กลุ่มที่สองต้องรอกลุ่มแรกทำเสร็จก่อน',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/consumer-groups-and-rebalancing" questions={quizGroups} />
+
+<ProgressTracker client:visible id="consumers/consumer-groups-and-rebalancing" />

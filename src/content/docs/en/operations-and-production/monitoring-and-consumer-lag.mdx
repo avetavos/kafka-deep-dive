@@ -1,0 +1,118 @@
+---
+title: 'Monitoring & Consumer Lag'
+description: 'The metrics that tell you a Kafka cluster is healthy — JMX broker metrics, under-replicated partitions, request latency, and the single most important app signal, consumer lag.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kafka exposes hundreds of metrics through **JMX**, but the single most important application-level signal is **consumer lag** — the gap between a partition's **log-end-offset** and the consumer group's **committed offset**, which tells you whether your consumers are keeping up.
+
+## Consumer lag: the one number to watch
+
+A producer keeps appending records, advancing each partition's **log-end-offset** (the position of the newest record). A consumer group commits how far it has processed. **Lag** is the difference:
+
+> lag = log-end-offset − committed offset
+
+Lag near zero means consumers are keeping pace. Lag that grows steadily means consumers are falling behind — records are arriving faster than they are processed, and end-to-end latency is climbing. You read it directly with the consumer-groups tool:
+
+```bash
+# Describe a consumer group: shows CURRENT-OFFSET, LOG-END-OFFSET, and LAG per partition
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group order-processor
+```
+
+The output has a `LAG` column per partition. Watch its **trend**, not one reading: flat or falling is healthy; steadily rising is the earliest warning that a consumer is overloaded, stuck, or crashed.
+
+<Mermaid title="Consumer lag is the gap between newest and processed offset" code={lagFlow} />
+
+export const lagFlow = `flowchart LR
+  prod["Producer appends records"] --> leo["Log-end-offset (newest)"]
+  cons["Consumer group commits"] --> cur["Committed offset (processed)"]
+  leo -->|"difference"| lag["LAG = log-end-offset - committed offset"]
+  cur --> lag`;
+
+## Broker-side metrics via JMX
+
+Kafka brokers publish metrics over **JMX**, which tools like Prometheus (via the JMX exporter), Grafana, or your APM scrape. A few are non-negotiable:
+
+- **Under-replicated partitions** (`UnderReplicatedPartitions`) — partitions whose ISR is smaller than the replication factor. Should be **zero**; anything above means a replica is lagging or a broker is down and durability is at risk.
+- **Offline partitions** (`OfflinePartitionsCount`) — partitions with no leader, so they are unavailable. Should always be **zero**.
+- **Active controller** (`ActiveControllerCount`) — exactly **one** across the cluster. Zero or more than one signals a controller problem.
+- **Request latency** — produce and fetch request times (`TotalTimeMs` broken into queue, local, and remote phases). Rising latency points at disk, network, or replication pressure before clients feel it.
+
+```properties
+# Enable JMX on a broker by exporting the port before start (example)
+# then a JMX exporter or your APM scrapes these MBeans
+JMX_PORT=9999
+```
+
+<Callout title="Metrics tell you what; lag tells you whether it matters">
+Broker metrics like under-replicated partitions warn about **cluster health**. Consumer lag warns about **your application's health** — whether the data your service depends on is being processed in time. Alert on both, but if you can only watch one dashboard, watch **lag per consumer group**.
+</Callout>
+
+## What to alert on
+
+Turn the key metrics into alerts, not just dashboards:
+
+- **Consumer lag** rising past a threshold (or beyond an SLA in seconds) for any critical group.
+- **Under-replicated partitions** greater than zero for more than a brief moment.
+- **Offline partitions** greater than zero — page immediately.
+- **Request latency** p99 crossing your budget for produce or fetch.
+
+<Callout title="The one-line takeaway">
+Watch Kafka through **JMX** — **under-replicated partitions** and **offline partitions** must be **zero**, **one** active controller, and produce/fetch **latency** within budget — but the sharpest application signal is **consumer lag** (**log-end-offset − committed offset**), read with **`kafka-consumer-groups.sh --describe --group`**. A steadily rising lag trend is your earliest sign that consumers cannot keep up.
+</Callout>
+
+export const quizMonitor = [
+  {
+    q: 'How is consumer lag defined?',
+    options: [
+      'The number of brokers in the cluster',
+      'The log-end-offset minus the consumer group\'s committed offset for a partition',
+      'The time since the last broker restart',
+      'The number of partitions a topic has',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command reads consumer lag per partition?',
+    options: [
+      '`kafka-topics.sh --describe`',
+      '`kafka-consumer-groups.sh --bootstrap-server ... --describe --group X`',
+      '`kafka-storage.sh format`',
+      '`kafka-console-consumer.sh --lag`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What value should the under-replicated partitions metric normally show?',
+    options: [
+      'Equal to the number of topics',
+      'Zero — anything above means a replica is behind or a broker is down',
+      'Equal to the replication factor',
+      'As high as possible',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A consumer group\'s lag has been rising steadily for an hour. What does that indicate?',
+    options: [
+      'The cluster is over-provisioned and healthy',
+      'Consumers are falling behind — records arrive faster than they are processed',
+      'The topic has been deleted',
+      'Replication is complete',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/monitoring-and-consumer-lag" questions={quizMonitor} />
+
+<ProgressTracker client:visible id="operations-and-production/monitoring-and-consumer-lag" />

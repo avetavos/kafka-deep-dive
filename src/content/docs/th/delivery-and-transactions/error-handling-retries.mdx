@@ -1,0 +1,127 @@
+---
+title: 'Error Handling & Retries'
+description: 'pipeline ที่ทนทาน producer retries กับ delivery.timeout.ms แยก error แบบ retriable กับ fatal รูปแบบ dead-letter topic และ idempotent consumer เป็น safety net'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+code Kafka ที่ทนทานจะจัดทุก failure ลงหนึ่งในสามถัง **retriable** (ปล่อยให้ producer retry ภายใน `delivery.timeout.ms`), **abortable** (roll transaction กลับแล้วลองใหม่) หรือ **fatal** (close producer แล้วให้อีก instance เข้ามาแทน) และ dead-letter record ที่ไม่มีวันสำเร็จ
+
+## producer retry อัตโนมัติและมีกรอบเวลา
+
+producer retry error แบบ retriable เอง เช่น leader election หรือ network สะดุดชั่วคราว ตัวคุมยุคใหม่ไม่ใช่ *จำนวน* retry แต่เป็น **งบเวลา** `delivery.timeout.ms` (default **120000**) คือขอบบนว่า `send()` ใช้เวลานานแค่ไหนในการรายงานสำเร็จหรือล้มเหลว ครอบคลุมทั้ง batching การ ack ของ broker และทุก retry ข้างใต้ มันต้องอย่างน้อยเท่ากับ `request.timeout.ms + linger.ms`
+
+```properties
+delivery.timeout.ms=120000     # total deadline for a send, including all retries
+request.timeout.ms=30000       # per-attempt broker wait
+retries=2147483647             # effectively unlimited; the deadline bounds it
+enable.idempotence=true        # retries stay duplicate-free within a partition
+```
+
+เมื่อเปิด `enable.idempotence=true` retry เหล่านี้ไม่สร้าง duplicate ใน partition เลย คุณจึง retry ได้ดุดันโดยไม่ทำ stream พัง
+
+## retriable vs abortable vs fatal ใน transaction
+
+ภายใน transactional loop exception ไม่เท่ากันหมด action ในการกู้คืนต่างกันตามกลุ่ม
+
+- **`TransactionAbortableException`** transaction commit ไม่ได้แต่ producer ยังปกติดี เรียก `abortTransaction()` แล้ว **retry batch** จาก offset ที่ commit ล่าสุด
+- **`ProducerFencedException`** และ **`OutOfOrderSequenceException`** เป็น **fatal** อีก instance เข้ามายึด `transactional.id` ของคุณ (zombie ถูก fence) หรือ idempotent sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ **close แล้ว shutdown** เพื่อให้ instance ที่ปกติทำงานต่อ
+
+```java
+try {
+    producer.beginTransaction();
+    for (ConsumerRecord<String, String> record : records) {
+        producer.send(new ProducerRecord<>("orders-enriched", record.key(), transform(record)));
+    }
+    producer.sendOffsetsToTransaction(offsetsFor(records), consumer.groupMetadata());
+    producer.commitTransaction();
+} catch (ProducerFencedException | OutOfOrderSequenceException e) {
+    producer.close();       // FATAL: a zombie was fenced — give up this instance
+    shutdown();
+} catch (TransactionAbortableException e) {
+    producer.abortTransaction();   // roll back and retry the batch
+}
+```
+
+## poison message, dead-letter topic และ safety net
+
+**poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ payload พัง schema ที่ parse ไม่ได้ หรือ downstream ที่ล้มถาวร retry มันไปเรื่อย ๆ จะทำให้ทั้ง partition ค้างอยู่หลังมัน วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)** หลังลองล้มเหลว N ครั้ง ก็ produce record บวก context ของ error ไปยัง topic `orders-dlq` แยกต่างหาก commit ข้ามมันไป แล้วปล่อยให้ flow หลักเดินต่อ คนหรือ job แยกค่อยมาตรวจ DLT ทีหลัง
+
+```java
+try {
+    process(record);
+} catch (NonRetriableException e) {
+    // Route the bad record aside instead of blocking the partition
+    dlqProducer.send(new ProducerRecord<>("orders-dlq", record.key(), record.value()));
+}
+// commit past the record either way, so the partition keeps advancing
+```
+
+ใต้ทั้งหมดนี้ **idempotent consumer คือ safety net** เพราะ at-least-once หมายความว่า record ถูกส่งซ้ำได้หลังการล่มใด ๆ ให้ทำ logic ประมวลผลของคุณให้ทำซ้ำได้อย่างปลอดภัย เช่น `UPSERT` ที่ key ด้วย event id, conditional write หรือ dedupe table แล้ว retry, batch ที่ abort-แล้ว-retry หรือการส่งซ้ำหลัง producer ถูก fence ก็จะ converge ไปที่ state ที่ถูกต้องเดียวกัน
+
+<Mermaid title="จัดแต่ละ failure retry, abort-แล้ว-retry, dead-letter หรือ shut down" code={errorDiagram} />
+
+export const errorDiagram = `flowchart TB
+  fail["failure during send or process"] --> retriable{"which kind?"}
+  retriable -->|"transient"| retry["producer retries within delivery.timeout.ms"]
+  retriable -->|"TransactionAbortableException"| abort["abortTransaction() then retry batch"]
+  retriable -->|"ProducerFenced / OutOfOrderSequence"| fatal["close producer and shut down"]
+  retriable -->|"poison message"| dlq["send to dead-letter topic, commit past it"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+จัด failure ตามกลุ่ม error ชั่วคราวจัดการด้วย **retry อัตโนมัติที่มีกรอบ `delivery.timeout.ms`** (default 120000 และ **`enable.idempotence=true`** ทำให้ไม่ซ้ำ) **`TransactionAbortableException`** หมายถึง **abort แล้ว retry batch** ส่วน **`ProducerFencedException`** และ **`OutOfOrderSequenceException`** เป็น **fatal — close แล้ว shut down** route poison message ไป **dead-letter topic** และเก็บ **idempotent consumer** ไว้เป็น safety net เพื่อให้การส่งซ้ำใด ๆ ลงเอยที่ state เดียวกัน
+</Callout>
+
+export const quizErrors = [
+  {
+    q: '`delivery.timeout.ms` กำหนดกรอบอะไร',
+    options: [
+      'consumer รอระหว่าง poll นานแค่ไหน',
+      'เวลารวมที่ send ใช้ในการรายงานสำเร็จหรือล้มเหลว รวม batching และทุก retry (default 120000)',
+      'retention period ของ topic',
+      'ช่วงเวลา heartbeat',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ควรจัดการ TransactionAbortableException ยังไง',
+    options: [
+      'close producer แล้ว shut down ถาวร',
+      'เรียก abortTransaction() แล้ว retry batch จาก offset ที่ commit ล่าสุด',
+      'commit transaction ต่อไปเลย',
+      'เพิกเฉยแล้ว send ต่อ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม ProducerFencedException และ OutOfOrderSequenceException ถึงเป็น fatal',
+    options: [
+      'เป็น network error ชั่วคราวที่หายเอง',
+      'อีก instance เข้ามายึด transactional.id หรือ sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ close แล้ว shut down',
+      'หมายความว่า topic ถูกลบ',
+      'เกิดเฉพาะตอนปิด idempotence',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'idempotent consumer มีบทบาทอะไร',
+    options: [
+      'เอาความจำเป็นของ delivery timeout ออก',
+      'เป็น safety net ทำให้การประมวลผลทำซ้ำได้ปลอดภัย การส่งซ้ำหรือ batch ที่ retry จึงลงเอยที่ state ที่ถูกต้องเดียวกัน',
+      'ปิด dead-letter topic',
+      'รับประกันว่าไม่มี duplicate บน network',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/error-handling-retries" questions={quizErrors} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/error-handling-retries" />

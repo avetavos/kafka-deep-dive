@@ -1,0 +1,126 @@
+---
+title: 'Offsets & Commits'
+description: 'How a consumer records its progress — committed offsets, auto-commit vs manual commitSync and commitAsync, and the at-least-once default.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A consumer records how far it has processed by **committing an offset** per partition — Kafka stores it in the internal `__consumer_offsets` topic — and **where you commit** relative to **where you process** decides whether you can lose or duplicate records.
+
+## Committed vs current position
+
+Two offsets travel with each partition:
+
+- **Position** — the next offset the consumer will fetch (advances as you poll).
+- **Committed offset** — the last offset the consumer durably recorded as "done."
+
+On restart or rebalance, a consumer resumes from the **committed** offset. So a commit is a promise: "everything before this is processed; don't send it again."
+
+## Auto-commit is convenient and risky
+
+By default `enable.auto.commit=true` commits the latest polled offset every `auto.commit.interval.ms` (5s). It is easy, but it commits on a timer regardless of whether your processing succeeded — a crash after auto-commit but before processing **loses** those records. For anything that matters, turn it off and commit **after** processing:
+
+```java
+props.put("enable.auto.commit", "false");   // take control of commits
+
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+    for (ConsumerRecord<String, String> record : records) {
+        process(record);                     // do the work FIRST
+    }
+    consumer.commitSync();                    // then commit — at-least-once
+}
+```
+
+## commitSync vs commitAsync
+
+- **`commitSync()`** blocks until the broker acknowledges, retries on retriable errors — safe, slower.
+- **`commitAsync()`** fires and continues, with an optional callback — faster, no automatic retry (a common pattern is `commitAsync` in the loop and a final `commitSync` on shutdown).
+
+## Where to start, and replaying with seek()
+
+A committed offset only helps if one exists. The first time a group reads a partition — or if its committed offset has aged out of retention — `auto.offset.reset` decides where to begin:
+
+- **`earliest`** — start at the beginning of the partition and reprocess all retained history.
+- **`latest`** — start at the end, reading only records that arrive from now on (this is the default).
+
+You can also override the position yourself with `seek()` — move a partition to any offset to **replay** old records or skip ahead:
+
+```java
+props.put("auto.offset.reset", "earliest"); // where to begin when there is no committed offset
+
+// Replay partition 0 of "orders" starting from offset 100
+TopicPartition tp = new TopicPartition("orders", 0);
+consumer.seek(tp, 100);                      // the next poll() fetches from offset 100
+// consumer.seekToBeginning(List.of(tp));    // or replay the whole partition from the start
+```
+
+<Mermaid title="Commit after processing gives at-least-once" code={commitDiagram} />
+
+export const commitDiagram = `flowchart LR
+  poll["poll batch"] --> proc["process records"]
+  proc --> commit["commitSync() after success"]
+  commit --> poll
+  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates)"]`;
+
+## Why this is at-least-once by default
+
+Commit **after** processing and a crash between the two means those records are re-read and reprocessed on restart — **at-least-once**, possible duplicates. Commit **before** processing and a crash means they are skipped — **at-most-once**, possible loss. At-least-once is the common default; making it effectively exactly-once takes idempotent processing or transactions, which the next module covers.
+
+<Callout title="The one-line takeaway">
+A consumer commits **offsets** to mark progress (stored in `__consumer_offsets`), and resumes from the **committed** offset after a restart. **Auto-commit** is easy but commits on a timer and can lose records; for correctness, disable it and **commit after processing** with `commitSync()`/`commitAsync()`. Committing after processing yields **at-least-once** (possible duplicates) — the default to design around. Use **`auto.offset.reset`** to decide where a brand-new group starts (`earliest`/`latest`) and **`seek()`** to replay.
+</Callout>
+
+export const quizOffsets = [
+  {
+    q: 'Where does Kafka store committed consumer offsets?',
+    options: [
+      'On the consumer\'s local disk only',
+      'In the internal `__consumer_offsets` topic',
+      'In ZooKeeper',
+      'In a relational database you must provide',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is auto-commit risky for important processing?',
+    options: [
+      'It commits too rarely to be useful',
+      'It commits on a timer regardless of whether processing succeeded, so a crash can lose records',
+      'It duplicates every record',
+      'It disables the poll loop',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Committing offsets AFTER processing gives which delivery semantic?',
+    options: [
+      'At-most-once (records may be lost)',
+      'At-least-once — a crash before commit means records are reprocessed (possible duplicates)',
+      'Exactly-once with no extra work',
+      'No delivery guarantee at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the difference between commitSync and commitAsync?',
+    options: [
+      'commitSync is faster and never retries',
+      'commitSync blocks and retries on retriable errors; commitAsync returns immediately without automatic retry',
+      'They are identical',
+      'commitAsync writes to disk; commitSync writes to memory',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/offsets-and-commits" questions={quizOffsets} />
+
+<ProgressTracker client:visible id="consumers/offsets-and-commits" />

@@ -1,0 +1,108 @@
+---
+title: 'The Idempotent Producer'
+description: 'How enable.idempotence stops retries from creating duplicates using a producer id, epoch, and sequence numbers, its config requirements, and why it is not the same as transactions.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+An **idempotent producer** tags every record with a producer id, epoch, and per-partition sequence number so the broker can **discard duplicates** created by retries — giving exactly-once delivery **per partition**.
+
+## The duplicate problem retries create
+
+Without idempotence, a retry can silently duplicate a record. The producer sends a record, the broker writes it, but the acknowledgement is lost on the way back. The producer times out, retries, and the broker writes the **same record a second time**. You now have two copies and no way to tell them apart.
+
+`enable.idempotence=true` — the **default** in modern Kafka — fixes this. The broker assigns each producer a **producer id (PID)** and an **epoch**, and the producer stamps every record with a **monotonically increasing sequence number** per partition. When a record arrives, the broker checks the sequence number: if it has already seen it for that PID and partition, it **acknowledges but does not write** the record again.
+
+```properties
+# Idempotence is on by default in modern Kafka; shown explicitly here
+enable.idempotence=true
+# These are implied/required by idempotence:
+acks=all
+# retries must be > 0 (defaults high) so the producer actually retries
+retries=2147483647
+# ordering is preserved only if in-flight requests per connection stays <= 5
+max.in.flight.requests.per.connection=5
+```
+
+## What it requires, and what it guarantees
+
+Idempotence is not free-standing — it needs a specific configuration to hold its guarantee:
+
+- **`acks=all`** — the record must be confirmed by all in-sync replicas.
+- **`retries > 0`** — retries are what create duplicates in the first place; without them there is nothing to dedupe.
+- **`max.in.flight.requests.per.connection <= 5`** — up to five in-flight batches are allowed while **still preserving ordering**, because the broker tracks sequence numbers and rejects anything out of order.
+
+When those hold, you get **exactly-once delivery per partition on retries**: no matter how many times a record is retried, it is written **once**. The **epoch** is what makes this safe across producer restarts and network partitions — a newer epoch **fences** an older, possibly zombie, producer instance so stale writes are refused.
+
+<Mermaid title="The broker dedupes a retried record by its sequence number" code={idempotentDiagram} />
+
+export const idempotentDiagram = `flowchart LR
+  send1["Send seq=7 (PID 100, epoch 3)"] --> write["Broker writes seq=7"]
+  write --> lostack["Ack lost on the way back"]
+  lostack --> retry["Producer retries seq=7"]
+  retry --> check["Broker: already saw seq=7 for this PID"]
+  check --> dedupe["Acknowledge but do NOT write again"]`;
+
+## Idempotence is not transactions
+
+This is a common mix-up. Idempotence guarantees a record is written **once per partition** despite retries — but that is the **only** thing it does. It does **not** make a multi-record, multi-partition write atomic, and it does **not** tie a producer write to a consumer offset commit.
+
+That stronger guarantee — atomic writes across partitions and true exactly-once processing — is what **transactions** provide, built **on top of** the idempotent producer. The Delivery Semantics and Transactions module covers `transactional.id`, `beginTransaction()`, and `commitTransaction()`. For now, hold the boundary: idempotence removes retry duplicates; transactions add atomicity.
+
+<Callout title="The one-line takeaway">
+**`enable.idempotence=true`** (the default) stamps records with a **producer id**, **epoch**, and **sequence number** so the broker discards retry **duplicates**, giving **exactly-once per partition**. It requires **`acks=all`**, **`retries > 0`**, and **`max.in.flight.requests.per.connection <= 5`** — and it is **not** the same as full **transactions**.
+</Callout>
+
+export const quizIdempotent = [
+  {
+    q: 'What does the idempotent producer prevent?',
+    options: [
+      'Consumers reading old records',
+      'Retries silently creating duplicate records on the broker',
+      'Records being compressed',
+      'Partitions being rebalanced',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does the broker recognize a duplicate from a retry?',
+    options: [
+      'By comparing the full record bytes every time',
+      'By the producer id plus a per-partition sequence number it has already seen',
+      'By the consumer group offset',
+      'By the record timestamp alone',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which settings does enable.idempotence require to hold its guarantee?',
+    options: [
+      'acks=0 and retries=0',
+      'acks=all, retries > 0, and max.in.flight.requests.per.connection <= 5',
+      'A dedicated transactional.id and beginTransaction()',
+      'compression.type=zstd and a large batch.size',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How is idempotence different from transactions?',
+    options: [
+      'They are exactly the same feature',
+      'Idempotence gives exactly-once per partition on retries; transactions add atomic multi-partition writes',
+      'Transactions are weaker than idempotence',
+      'Idempotence works only for consumers',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/idempotent-producer" questions={quizIdempotent} />
+
+<ProgressTracker client:visible id="producers/idempotent-producer" />

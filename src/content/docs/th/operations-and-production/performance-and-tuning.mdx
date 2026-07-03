@@ -1,0 +1,111 @@
+---
+title: 'Performance & Tuning'
+description: 'ปุ่มที่แลก throughput กับ latency ใน Kafka producer batching กับ compression, acks, การ size partition เพื่อ consumer parallelism และ page cache กับ disk ฝั่ง broker'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+การจูน Kafka ส่วนใหญ่คือการเลือกว่าคุณจะนั่งตรงไหนบนเส้นโค้ง **throughput เทียบกับ latency** batch producer ใหญ่ขึ้น, compression, partition มากขึ้น และ `acks` แรงขึ้น ต่างดันไปทางใดทางหนึ่ง คุณจึงจูนไปตาม workload ของคุณ ไม่ใช่ไล่ล่าค่า "เร็ว" ค่าเดียว
+
+## ปุ่มฝั่ง producer: batching, compression, acks
+
+producer คือจุดที่ throughput ได้มาหรือเสียไปมากที่สุด สามค่าครองเกม
+
+- **Batching** `linger.ms` กับ `batch.size` ให้ producer รอไม่กี่มิลลิวินาทีแล้วอัดหลาย record ลง request เดียว batch ใหญ่ขึ้นแปลว่า throughput สูงขึ้นมาก แลกกับ latency ต่อ record นิดหน่อย
+- **Compression** `compression.type` (`lz4`, `zstd`, `snappy`, `gzip`) ย่อ batch แต่ละอันให้เล็กลง ลดการใช้ network และ disk มันแลก CPU กับ throughput และเกือบทุกครั้งคุ้มค่าเมื่อโหลดสูง
+- **acks** `acks=all` รอให้ ISR persist record (durable, latency สูงกว่า) `acks=1` รอแค่ leader (เร็วกว่า การันตีอ่อนกว่า) นี่คือปุ่ม durability เทียบกับ latency คลาสสิก
+
+```properties
+# Throughput-leaning producer: wait a little, batch bigger, compress, stay durable
+linger.ms=10
+batch.size=65536
+compression.type=lz4
+acks=all
+```
+
+<Mermaid title="การแลกเปลี่ยนระหว่าง throughput กับ latency" code={tuneFlow} />
+
+export const tuneFlow = `flowchart LR
+  batch["Bigger batches + linger.ms"] --> tp["Higher throughput"]
+  comp["Compression (lz4 / zstd)"] --> tp
+  acksall["acks=all"] --> dur["Stronger durability"]
+  acksall --> lat["Higher latency"]
+  small["Small batches + acks=1"] --> low["Lower latency"]`;
+
+## size partition ตาม throughput
+
+partition คือ **หน่วย parallelism** ของคุณ partition หนึ่งถูก consume โดย consumer ได้มากสุดหนึ่งตัวใน group จำนวน partition จึงเป็นเพดานของ consumer parallelism size มันจากเป้าหมาย
+
+> partition ≈ throughput เป้าหมาย ÷ throughput ต่อ consumer (หรือต่อ partition)
+
+ถ้า consumer หนึ่ง instance รับได้ 10 MB/s และคุณต้องการ 100 MB/s คุณต้องมีอย่างน้อย 10 partition ให้ consumer 10 ตัวรันขนานกัน ปัดขึ้นแล้วเผื่อ headroom ไว้สำหรับการเติบโตและการกระจาย key ที่ไม่สม่ำเสมอ
+
+<Callout title="อย่า over-partition">
+partition เยอะขึ้นไม่ใช่ throughput ฟรี partition แต่ละอันคือ open file, traffic ของ replication, memory และ metadata ของ controller และมันยืดเวลา **rebalance** กับ failover partition หลักพันต่อ broker เพิ่ม latency และความเสี่ยงในการ recovery size ให้พอดีเป้าหมายแล้วเผื่อ headroom พอประมาณ ไม่ใช่ตั้งเป็นตัวเลขใหญ่สุดที่นึกออก คุณเพิ่ม partition ทีหลังได้ แต่เอาออกไม่ได้ง่าย ๆ
+</Callout>
+
+## ฝั่ง broker: page cache, disk, network
+
+broker ถูกออกแบบให้เรียบง่ายโดยตั้งใจ ความเร็วของมันมาจาก operating system
+
+- **Page cache** Kafka **ไม่** ทำ cache ใหญ่ใน process ของตัวเอง มันเขียนลง OS page cache แล้วพึ่ง kernel ให้เสิร์ฟการอ่านล่าสุดจาก memory เหลือ RAM ว่างไว้เยอะ ๆ ให้ page cache อย่าให้ JVM heap ใหญ่จนแย่งมันไป
+- **Disk** การเขียนแบบ sequential ทำให้ดิสก์จานหมุนและโดยเฉพาะ SSD มีประสิทธิภาพ ใช้ local disk ที่เร็ว และกระจายโหลดด้วยหลาย log directory ถ้าจำเป็น throughput ของ disk และพฤติกรรม `fsync` เป็นตัวจำกัด durability กับความเร็ว
+- **Network** replication และ consumer fan-out ผูกกับ network `replication-factor` เท่ากับ 3 แปลว่าทุก byte ที่ produce ถูกเขียนราว ๆ สามครั้งข้าม network จัดสรร NIC ให้เหมาะ
+
+<Callout title="สรุปหนึ่งบรรทัด">
+performance ของ Kafka คือการแลก **throughput เทียบกับ latency** ที่คุณจูนอย่างตั้งใจ ฝั่ง producer ใช้ **batching** (`linger.ms`, `batch.size`), **compression** และ **`acks`** ที่เหมาะ size **partition** ให้ตรง throughput เป้าหมายและ consumer parallelism **โดยไม่ over-partition** และฝั่ง broker เคารพ **page cache**, disk แบบ sequential ที่เร็ว และ **network** ที่เผื่อไว้สำหรับ replication จูนไปตาม workload ไม่ใช่ไปหาค่าที่เร็วที่สุดในตำนาน
+</Callout>
+
+export const quizPerf = [
+  {
+    q: 'batch ของ producer ที่ใหญ่ขึ้น (ผ่าน linger.ms และ batch.size) แลกอะไรเป็นหลัก',
+    options: [
+      'durability กับ security',
+      'latency ต่อ record นิดหน่อย แลกกับ throughput ที่สูงขึ้นมาก',
+      'พื้นที่ disk กับ CPU อย่างเดียว',
+      'ไม่แลกอะไร มันไม่มีผล',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมจำนวน partition ถึงเป็นเพดานของ consumer parallelism',
+    options: [
+      'เพราะ partition หนึ่งถูก consume โดย consumer ได้มากสุดหนึ่งตัวใน group',
+      'เพราะ partition จำกัดจำนวน producer',
+      'เพราะแต่ละ partition ต้องมี broker ของตัวเอง',
+      'มันไม่จำกัด parallelism ไม่มีเพดาน',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'ความเสี่ยงของการสร้าง partition เยอะเกินที่ต้องการคืออะไร',
+    options: [
+      'ไม่มี partition เยอะแปลว่าเร็วขึ้นเสมอ',
+      'open file, traffic ของ replication, memory มากขึ้น และเวลา rebalance กับ failover ยาวขึ้น',
+      'topic กลายเป็น read-only',
+      'consumer commit offset ไม่ได้อีกต่อไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Kafka พึ่ง operating system เรื่องความเร็วในการอ่านยังไง',
+    options: [
+      'มันเก็บ cache ใหญ่ใน process และไม่สน OS',
+      'มันใช้ OS page cache RAM ที่ว่างจึงให้ kernel เสิร์ฟการอ่านล่าสุดจาก memory',
+      'มันอ่านตรงจาก ZooKeeper',
+      'มัน cache ทุกอย่างใน JVM heap',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerf} />
+
+<ProgressTracker client:visible id="operations-and-production/performance-and-tuning" />

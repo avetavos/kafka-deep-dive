@@ -1,0 +1,134 @@
+---
+title: 'The Producer API'
+description: 'The KafkaProducer client — ProducerRecord, asynchronous send that returns a Future, completion and error callbacks, key and value serializers, and a minimal Java example.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **producer** builds a `ProducerRecord` (topic, optional key, value), hands it to `send()` which returns a `Future` and completes **asynchronously**, and Kafka appends it to a partition of the topic.
+
+## The KafkaProducer and the ProducerRecord
+
+The `KafkaProducer` is a thread-safe client you create once and reuse for the life of your application. You never write raw bytes to a broker yourself — you wrap your data in a `ProducerRecord` and pass it to `send()`.
+
+A `ProducerRecord` carries three things you care about most:
+
+- **topic** — the named stream you are writing to (required).
+- **key** — optional; records with the same key go to the same partition, which is how Kafka preserves per-key ordering.
+- **value** — the payload itself (the event data).
+
+Because a broker only understands bytes, the producer needs a **serializer** for the key and another for the value. The `key.serializer` and `value.serializer` config tell the client how to turn your Java objects into `byte[]`. For plain text, `StringSerializer` is the usual choice.
+
+```properties
+# Minimum producer configuration
+# bootstrap.servers is the initial broker list the client contacts to discover the cluster
+bootstrap.servers=localhost:9092
+# Serializers turn your key/value objects into the bytes the broker stores
+key.serializer=org.apache.kafka.common.serialization.StringSerializer
+value.serializer=org.apache.kafka.common.serialization.StringSerializer
+```
+
+## send() is asynchronous — use a callback
+
+`send()` does **not** block until the record reaches the broker. It buffers the record, returns a `Future<RecordMetadata>` immediately, and a background I/O thread does the actual network send. To learn the outcome, either call `.get()` on the `Future` (which blocks) or — far better for throughput — register a `Callback` that fires on completion or error.
+
+```java
+import org.apache.kafka.clients.producer.*;
+import java.util.Properties;
+
+public class MinimalProducer {
+  public static void main(String[] args) {
+    Properties props = new Properties();
+    // bootstrap.servers: initial brokers used to discover the whole cluster
+    props.put("bootstrap.servers", "localhost:9092");
+    props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+    props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+    // The producer is thread-safe: create once, reuse, close at the end
+    try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+      // topic = "orders", key = "order-42", value = the event payload
+      ProducerRecord<String, String> record =
+          new ProducerRecord<>("orders", "order-42", "{\"amount\":19.99}");
+
+      // send() returns immediately with a Future; the callback reports the result
+      producer.send(record, (RecordMetadata metadata, Exception exception) -> {
+        if (exception != null) {
+          // completion with an error — log, retry, or route to a dead-letter path
+          System.err.println("send failed: " + exception.getMessage());
+        } else {
+          // success — Kafka assigned this record a partition and an offset
+          System.out.printf("sent to %s-%d @ offset %d%n",
+              metadata.topic(), metadata.partition(), metadata.offset());
+        }
+      });
+    } // close() flushes buffered records and releases resources
+  }
+}
+```
+
+<Mermaid title="From ProducerRecord to an assigned offset" code={producerDiagram} />
+
+export const producerDiagram = `flowchart LR
+  app["Your app builds a 'ProducerRecord'"] --> ser["Serializers: key and value to bytes"]
+  ser --> buf["Producer buffer (per partition)"]
+  buf --> io["Background I/O thread sends batch"]
+  io --> broker["Broker appends to partition"]
+  broker --> cb["Callback fires: RecordMetadata or Exception"]`;
+
+<Callout title="The one-line takeaway">
+Wrap your data in a **`ProducerRecord`** (topic, key, value), configure **key and value serializers**, and call **`send()`** — it is **asynchronous** and returns a **`Future`**, so register a **`Callback`** to handle completion and errors instead of blocking.
+</Callout>
+
+export const quizProducerApi = [
+  {
+    q: 'What are the three main fields of a ProducerRecord?',
+    options: [
+      'broker, offset, timestamp',
+      'topic, key, and value',
+      'partition, replica, and leader',
+      'group, consumer, and cursor',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does send() return, and when does it complete?',
+    options: [
+      'It blocks and returns the offset directly once written',
+      'It returns a Future immediately and completes asynchronously in the background',
+      'It returns void and never reports success or failure',
+      'It returns the raw bytes that were sent',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does a producer need a key.serializer and value.serializer?',
+    options: [
+      'To encrypt every record end to end',
+      'To turn your key and value objects into the byte arrays the broker stores',
+      'To compress records before the network send',
+      'To choose which consumer group reads the record',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is bootstrap.servers used for?',
+    options: [
+      'It lists every broker that must be online or the send fails',
+      'It is the initial broker list the client contacts to discover the cluster',
+      'It sets the retention period of the topic',
+      'It picks the partition a record lands on',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="producers/producer-api" questions={quizProducerApi} />
+
+<ProgressTracker client:visible id="producers/producer-api" />

@@ -1,0 +1,113 @@
+---
+title: 'Broker, Topic และ Partition'
+description: 'กายวิภาคของ Kafka cluster broker, topic ที่ถูกแบ่งเป็น partition, offset และวิธีที่ partitioning scale topic กระจายทั้ง cluster'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**topic** คือ stream เชิงตรรกะที่ Kafka แบ่งจริงเป็น **partition** แต่ละ partition คือ log ที่มีลำดับหนึ่งอัน และ partition เหล่านั้นถูกกระจายไปตาม **broker** ต่าง ๆ ใน cluster ซึ่งคือวิธีที่ topic เดียว scale เกินหนึ่งเครื่องได้
+
+## broker กับ cluster
+
+**broker** คือ process เซิร์ฟเวอร์ Kafka หนึ่งตัว หลาย broker รวมกันเป็น **cluster** broker แต่ละตัวเก็บข้อมูลบางส่วนและจัดการการอ่านเขียนของ partition ที่ตัวเองเป็นเจ้าของ client เชื่อมต่อไปที่ broker ตัวไหนก็ได้ผ่าน address ของ **bootstrap server** จากตรงนั้นมันจะ discover cluster ทั้งหมดและรู้ว่า broker ตัวไหน lead partition ไหน
+
+```bash
+# Create a topic with 3 partitions and 3 replicas across the cluster
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic orders --partitions 3 --replication-factor 3
+```
+
+## topic ถูกแบ่งเป็น partition
+
+topic อย่าง `orders` ไม่ใช่ log ก้อนใหญ่ก้อนเดียว แต่ถูกแบ่งเป็น **partition** จำนวนคงที่ (`orders-0`, `orders-1`, `orders-2`) แต่ละ partition คือ log แบบ append-only อิสระที่มี offset sequence ของตัวเอง นี่คือหน่วยของทั้ง **parallelism** และ **ordering**
+
+- **Parallelism** partition คนละอันอยู่บน broker คนละตัว การอ่านเขียนเลยกระจายไปหลายเครื่อง ยิ่ง partition เยอะ throughput ยิ่งสูง
+- **Ordering** Kafka การันตีลำดับ **ภายใน** partition แต่ **ไม่ข้าม** partition offset 5 ของ `orders-0` ไม่มีลำดับที่นิยามไว้เทียบกับ offset 5 ของ `orders-1`
+
+<Mermaid title="topic กระจายเป็น partition ข้าม broker" code={clusterDiagram} />
+
+export const clusterDiagram = `flowchart TB
+  subgraph b1["Broker 1"]
+    p0["orders-0 (leader)"]
+  end
+  subgraph b2["Broker 2"]
+    p1["orders-1 (leader)"]
+  end
+  subgraph b3["Broker 3"]
+    p2["orders-2 (leader)"]
+  end
+  topic["Topic: orders (3 partitions)"] --> p0
+  topic --> p1
+  topic --> p2`;
+
+## ระบุตำแหน่ง record: topic, partition, offset
+
+record ใด ๆ ใน Kafka ถูกระบุด้วยพิกัดสามอย่าง
+
+- **topic** stream ไหน (`orders`)
+- **partition** log ไหนใน stream นั้น (`orders-2`)
+- **offset** ตำแหน่งใน log นั้น (`offset 91`)
+
+สามอย่างนี้คือ address ถาวรของ record ตำแหน่งที่ consumer commit ไว้ก็คือสิ่งนี้เป๊ะ ๆ "สำหรับ `orders-2` ฉันประมวลผลถึง offset 91 แล้ว"
+
+## เลือกจำนวน partition
+
+จำนวน partition คือปุ่มปรับ throughput หลักของคุณ แต่มันไม่ฟรี partition แต่ละอันคือไฟล์บนดิสก์และเป็นหน่วยงานสำหรับ consumer กับ controller น้อยไปก็ parallelize ไม่ได้ เยอะไปก็จ่าย overhead ทั้ง metadata, open file และเวลา rebalance วิธีที่นิยมคือ ประเมิน throughput เป้าหมาย, ตั้ง partition ให้พอดีกับมัน แล้วเผื่อ headroom ไว้ คุณ **เพิ่ม** partition ทีหลังได้ แต่การทำแบบนั้นเปลี่ยนวิธีที่ record แบบมี key map ไป partition (ข้อควรระวังที่ module ถัดไปจะอธิบาย)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**broker** คือ Kafka หนึ่งตัว **cluster** คือหลายตัว **topic** ถูกแบ่งเป็น **partition** แต่ละ partition คือ log ที่มีลำดับแยกกันเก็บบน broker ตัวใดตัวหนึ่ง partition เป็นหน่วยของ **parallelism** (กระจายข้าม broker เพื่อ throughput) และของ **ordering** (การันตีภายใน partition ไม่ข้าม) record ทุกตัวถูกระบุด้วย **topic + partition + offset**
+</Callout>
+
+export const quizAnatomy = [
+  {
+    q: 'ความสัมพันธ์ระหว่าง topic กับ partition คืออะไร',
+    options: [
+      'topic กับ partition คือสิ่งเดียวกัน',
+      'topic ถูกแบ่งเป็น partition แต่ละ partition คือ log ที่มีลำดับอิสระ',
+      'partition หนึ่งอันบรรจุหลาย topic',
+      'partition มีไว้เพื่อ replication เท่านั้น ไม่ได้มีไว้สำหรับ topic เดียว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Kafka การันตีลำดับของ record ตรงไหน',
+    options: [
+      'ทั้ง topic',
+      'ภายใน partition เดียว ไม่ข้าม partition ของ topic เดียวกัน',
+      'ทั้ง cluster',
+      'Kafka ไม่เคยการันตีลำดับ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมถึงเพิ่มจำนวน partition ให้ topic',
+    options: [
+      'เพื่อลดการใช้ดิสก์',
+      'เพื่อเพิ่ม parallelism และ throughput partition กระจายการอ่านเขียนข้าม broker และ consumer',
+      'เพื่อการันตีลำดับสมบูรณ์ทั้ง topic',
+      'มันไม่มีผลต่อ performance',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ระบุตำแหน่ง record เฉพาะตัวใน Kafka ยังไง',
+    options: [
+      'ด้วย timestamp ของมันอย่างเดียว',
+      'ด้วยสามอย่างคือ topic, partition และ offset',
+      'ด้วย global auto-increment ID ข้ามทุก topic',
+      'ด้วย hostname ของ broker',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/brokers-topics-partitions" questions={quizAnatomy} />
+
+<ProgressTracker client:visible id="foundations/brokers-topics-partitions" />

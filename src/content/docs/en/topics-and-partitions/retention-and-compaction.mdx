@@ -1,0 +1,115 @@
+---
+title: 'Retention & Compaction'
+description: 'How long Kafka keeps data — time and size retention, delete vs compact cleanup policies, log compaction by key, and tombstones.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kafka does not keep data forever by default — a topic's **cleanup policy** decides whether old records are **deleted** after a retention window, or **compacted** so that only the **latest value per key** survives.
+
+## Retention: delete by time or size
+
+With the default policy `cleanup.policy=delete`, Kafka removes old log segments once they cross a threshold:
+
+```properties
+# Keep records for 7 days (whichever limit hits first)
+cleanup.policy=delete
+retention.ms=604800000
+# ...or cap the partition at 50 GB
+retention.bytes=53687456000
+```
+
+Retention is enforced on whole **segments**, not individual records, and it is about **age or size** — not about whether anyone has consumed the data. A consumer that falls further behind than the retention window will miss records that age out. This is the right policy for event streams where old events lose value: clickstreams, logs, metrics.
+
+## Compaction: keep the latest value per key
+
+Set `cleanup.policy=compact` and Kafka changes strategy entirely. Instead of dropping old data by age, it keeps the **most recent record for each key** and garbage-collects the older values for that key over time:
+
+```text
+before compaction:  (a,1)(b,1)(a,2)(c,1)(b,2)(a,3)
+after compaction:   (c,1)(b,2)(a,3)     ← latest value per key survives
+```
+
+This turns a topic into a durable, replayable **snapshot of current state by key** — perfect for changelogs, configuration, and the state stores Kafka Streams keeps. A brand-new consumer can read the whole compacted topic and rebuild the latest state for every key.
+
+<Mermaid title="Delete drops old segments; compact keeps the latest per key" code={retentionDiagram} />
+
+export const retentionDiagram = `flowchart TB
+  topic["Topic cleanup.policy"] --> del["delete: drop segments past retention.ms / retention.bytes"]
+  topic --> comp["compact: keep latest record per key, GC older values"]
+  del --> use1["event streams: logs, clicks, metrics"]
+  comp --> use2["state/changelog: config, snapshots, Streams stores"]`;
+
+## Tombstones: deleting a key
+
+Under compaction, how do you delete a key entirely? Write a **tombstone** — a record with the key and a **null value**. Compaction treats it as "this key is gone," retains it long enough for all consumers to observe the deletion, then removes both the tombstone and the key's history.
+
+```java
+// Tombstone: null value tells a compacted topic to forget this key
+producer.send(new ProducerRecord<>("user-config", "user-42", null));
+```
+
+You can also combine policies with `cleanup.policy=compact,delete` to compact by key **and** still age out very old data.
+
+## Choosing a policy
+
+- **`delete`** — the record is the point; history matters, current-per-key does not. Event streams.
+- **`compact`** — the **key's latest value** is the point; you want a rebuildable snapshot. State, changelogs, config topics.
+
+<Callout title="The one-line takeaway">
+A topic's **`cleanup.policy`** picks its lifecycle. **`delete`** ages records out by **`retention.ms`** / **`retention.bytes`** regardless of consumption — right for event streams. **`compact`** keeps the **latest value per key**, turning the topic into a rebuildable state snapshot — right for changelogs and config. A **tombstone** (null value) deletes a key under compaction.
+</Callout>
+
+export const quizRetention = [
+  {
+    q: 'What does cleanup.policy=delete do?',
+    options: [
+      'Deletes the topic immediately',
+      'Removes old log segments once they exceed retention.ms or retention.bytes, regardless of whether they were consumed',
+      'Keeps only the latest record per key',
+      'Deletes records after every consumer reads them',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does log compaction keep?',
+    options: [
+      'The first record ever written',
+      'The most recent record for each key, garbage-collecting older values per key',
+      'A random sample of records',
+      'Only records under 1 KB',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do you delete a key from a compacted topic?',
+    options: [
+      'Run a DELETE SQL statement',
+      'Write a tombstone — a record with that key and a null value',
+      'Lower retention.ms to zero',
+      'You cannot delete keys from a compacted topic',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which topic is the best fit for cleanup.policy=compact?',
+    options: [
+      'A clickstream where every event matters',
+      'A changelog/state topic where you want the latest value per key and a rebuildable snapshot',
+      'A short-lived metrics feed',
+      'A topic that should be deleted after one day',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/retention-and-compaction" questions={quizRetention} />
+
+<ProgressTracker client:visible id="topics-and-partitions/retention-and-compaction" />

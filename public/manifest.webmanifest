@@ -1,28 +1,28 @@
 {
-  "id": "/websocket/",
-  "name": "WebSocket Design — From Zero to Hero",
-  "short_name": "WebSocket Design",
-  "start_url": "/websocket/en/",
-  "scope": "/websocket/",
+  "id": "/kafka/",
+  "name": "Kafka Deep Dive",
+  "short_name": "Kafka Deep Dive",
+  "start_url": "/kafka/en/",
+  "scope": "/kafka/",
   "display": "standalone",
   "orientation": "any",
   "background_color": "#0d1117",
-  "theme_color": "#F97316",
+  "theme_color": "#00A88F",
   "icons": [
     {
-      "src": "/websocket/icon-192.png",
+      "src": "/kafka/icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/websocket/icon-512.png",
+      "src": "/kafka/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/websocket/icon-512.png",
+      "src": "/kafka/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

@@ -1,0 +1,134 @@
+---
+title: 'Running Kafka Locally'
+description: 'Spin up a single-broker Kafka 4.x cluster in KRaft mode with Docker or kafka-storage.sh, then create a topic, produce, and consume from the CLI.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Running Kafka 4.x locally means starting a **single broker in KRaft mode** — no ZooKeeper, no external dependencies — then talking to it entirely through `--bootstrap-server localhost:9092` to create a topic, produce records, and consume them.
+
+## The fastest path: one Docker container
+
+The official `apache/kafka` image ships a KRaft-ready broker that formats its own storage and starts as a combined broker plus controller. One command gives you a working cluster:
+
+```bash
+# Start a single-node Kafka 4.x broker in KRaft mode, port 9092 exposed
+docker run -d --name kafka -p 9092:9092 apache/kafka:latest
+```
+
+That is the whole cluster. There is nothing else to install — **no ZooKeeper process** exists in Kafka 4.x. The container comes with the CLI scripts baked in, so you can run admin commands inside it with `docker exec`, or install the Kafka tarball locally and point the scripts at `localhost:9092`.
+
+## The manual path: format storage, then start
+
+If you run the downloaded tarball instead of Docker, KRaft needs a one-time **storage format** step. You generate a cluster UUID and write it into the log directory before the first start:
+
+```bash
+# 1. Generate a unique cluster ID
+KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
+
+# 2. Format the log directory for KRaft using that ID and the KRaft config
+bin/kafka-storage.sh format --standalone \
+  -t "$KAFKA_CLUSTER_ID" \
+  -c config/server.properties
+
+# 3. Start the broker (it is also the controller in a single-node setup)
+bin/kafka-server-start.sh config/server.properties
+```
+
+The `random-uuid` plus `format` pair is the KRaft bootstrap ritual — it replaces the old ZooKeeper handshake. You only do it once per data directory.
+
+<Mermaid title="Local KRaft workflow: format, start, then produce and consume" code={localFlow} />
+
+export const localFlow = `flowchart LR
+  fmt["kafka-storage.sh format (KRaft)"] --> start["kafka-server-start.sh (broker + controller)"]
+  start --> topic["kafka-topics.sh --create"]
+  topic --> prod["kafka-console-producer.sh"]
+  topic --> cons["kafka-console-consumer.sh"]
+  prod -->|"records"| cons`;
+
+## Create a topic, produce, consume
+
+With the broker up, every command targets `--bootstrap-server` — the `--zookeeper` flag no longer exists. Create a topic first:
+
+```bash
+# Create a topic named "demo" with 1 partition (fine for local)
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic demo --partitions 1 --replication-factor 1
+```
+
+Then open a producer in one terminal and type messages, one per line:
+
+```bash
+# Produce: each line you type becomes a record
+kafka-console-producer.sh --bootstrap-server localhost:9092 --topic demo
+```
+
+And a consumer in another terminal to read them back from the start:
+
+```bash
+# Consume: --from-beginning replays every record in the topic
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic demo --from-beginning
+```
+
+<Callout title="Never type --zookeeper">
+If a command or tutorial tells you to pass `--zookeeper localhost:2181`, it predates Kafka 4.x. In KRaft-only Kafka the flag is **gone**. Every CLI tool — `kafka-topics.sh`, `kafka-console-producer.sh`, `kafka-consumer-groups.sh` — takes **`--bootstrap-server`** and nothing else for cluster addressing.
+</Callout>
+
+<Callout title="The one-line takeaway">
+Local Kafka 4.x is a **single KRaft broker** with **no ZooKeeper**: run `apache/kafka` in **Docker** for one-command startup, or format the log directory with **`kafka-storage.sh format`** and launch with **`kafka-server-start.sh`**. Then create, produce, and consume through **`kafka-topics.sh`**, **`kafka-console-producer.sh`**, and **`kafka-console-consumer.sh`** — always via **`--bootstrap-server localhost:9092`**.
+</Callout>
+
+export const quizLocal = [
+  {
+    q: 'What do you need to install alongside Kafka 4.x to run it locally?',
+    options: [
+      'ZooKeeper, started before the broker',
+      'Nothing extra — Kafka 4.x is KRaft-only and needs no ZooKeeper',
+      'A relational database for metadata',
+      'A separate controller cluster on another machine',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the purpose of `kafka-storage.sh format` in the manual startup flow?',
+    options: [
+      'It deletes all topics before every restart',
+      'It performs the one-time KRaft storage format, writing a cluster ID into the log directory before the first start',
+      'It connects the broker to ZooKeeper',
+      'It formats the disk partition table of the host',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which flag do Kafka 4.x CLI tools use to address the cluster?',
+    options: [
+      '`--zookeeper localhost:2181`',
+      '`--bootstrap-server localhost:9092`',
+      '`--controller localhost:9093`',
+      '`--metadata-url localhost:8080`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do you replay every record already in a topic with the console consumer?',
+    options: [
+      'Add `--from-beginning`',
+      'Add `--replay-all`',
+      'Restart the broker',
+      'You cannot read old records with the console consumer',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="operations-and-production/running-kafka-locally" questions={quizLocal} />
+
+<ProgressTracker client:visible id="operations-and-production/running-kafka-locally" />

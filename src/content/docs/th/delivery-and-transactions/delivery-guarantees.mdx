@@ -1,0 +1,94 @@
+---
+title: 'End-to-End Delivery Guarantees'
+description: 'ประกอบฝั่ง producer กับ consumer เข้าด้วยกัน acks idempotence และจังหวะ commit รวมกันเป็น guarantee แบบ end-to-end ยังไง'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+guarantee แบบ end-to-end แข็งแรงได้เท่ากับจุดที่อ่อนที่สุดของมันเท่านั้น ฝั่ง **producer** (`acks` และ idempotence) กับฝั่ง **consumer** (จังหวะ commit) ต่างก็มีส่วน และคุณต้องคิดถึงมัน **พร้อมกัน**
+
+## guarantee เดียวที่มีสองครึ่ง
+
+delivery semantics ไม่ใช่สวิตช์ตัวเดียว data ไหลจาก producer → log → consumer และแต่ละ hop มี failure mode ของตัวเอง
+
+- **Producer → log** ด้วย `acks=all` และ `enable.idempotence=true` record ถูกเขียนแบบทนทานและ retry ไม่สร้าง duplicate ใน partition ถ้าใช้ `acks=0` หรือ `acks=1` broker ล่มจังหวะไม่ดีก็ทำให้ write หายได้
+- **Log → consumer** commit **หลัง** ประมวลผลได้ at-least-once commit **ก่อน** ได้ at-most-once ตัว log เองไม่เคยทำ record ที่ commit แล้วหายภายใน retention
+
+รวมสองอย่างเข้าด้วยกันก็ได้พฤติกรรม end-to-end จริง ๆ
+
+| Producer | Consumer commit | End-to-end |
+| --- | --- | --- |
+| `acks=all` + idempotent | หลังประมวลผล | at-least-once (ไม่หาย อาจซ้ำ) |
+| `acks=1` | หลังประมวลผล | at-least-once แต่ broker ล่มแบบหายากยังทำ write หายได้ |
+| `acks=all` + idempotent | ก่อนประมวลผล | at-most-once (ไม่ซ้ำ อาจหาย) |
+| transactional producer | commit offset ใน transaction | exactly-once ภายใน Kafka |
+
+<Mermaid title="แต่ละ hop มีส่วนใน guarantee แบบ end-to-end" code={e2eDiagram} />
+
+export const e2eDiagram = `flowchart LR
+  prod["Producer: acks=all + idempotence"] -->|durable, no dupes| log["Partition log"]
+  log -->|committed records retained| cons["Consumer"]
+  cons -->|commit after processing| out["at-least-once end-to-end"]
+  out -->|idempotent sink or transactions| eos["effectively exactly-once"]`;
+
+## default ที่ควรออกแบบเผื่อไว้
+
+ระบบส่วนใหญ่รันแบบ **at-least-once end-to-end** คือ `acks=all` producer เป็น idempotent commit หลังประมวลผล แล้วทำให้ผลลัพธ์ปลายทาง **idempotent** เพื่อให้ duplicate ไม่เป็นอันตราย มันเรียบง่าย ทนทาน และเร็ว หยิบ **exactly-once** เต็มรูปแบบ (transactions) มาใช้ก็ต่อเมื่อ pipeline อยู่ภายใน Kafka และ duplicate ยอมรับไม่ได้จริง ๆ เพราะมันเพิ่มต้นทุนการ coordinate ส่วนที่เหลือของ module นี้จะค่อย ๆ สร้างเส้นทาง exactly-once นั้นขึ้นมา
+
+<Callout title="สรุปหนึ่งบรรทัด">
+guarantee แบบ end-to-end คือ **การรวมกัน** ของครึ่ง producer (`acks=all` + idempotence เพื่อ write ที่ไม่หายไม่ซ้ำ) กับครึ่ง consumer (จังหวะ commit สำหรับ at-most vs at-least-once) default ที่ทนทานคือ **at-least-once end-to-end บวกกับ sink ที่ idempotent** ส่วน **exactly-once** จริง ๆ มาจาก Kafka **transactions** และคุ้มค่ากับต้นทุนก็ต่อเมื่อ duplicate ยอมรับไม่ได้
+</Callout>
+
+export const quizGuarantees = [
+  {
+    q: 'ทำไมต้องคิดถึง guarantee ฝั่ง producer และ consumer พร้อมกัน',
+    options: [
+      'มันไม่เกี่ยวกันและมองข้ามได้',
+      'แต่ละ hop (producer ไป log, log ไป consumer) มี failure mode ของตัวเอง guarantee แบบ end-to-end แข็งแรงเท่าจุดที่อ่อนที่สุด',
+      'consumer เป็นตัวคุม producer',
+      'มีแต่ฝั่ง producer เท่านั้นที่สำคัญ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การรวมค่าแบบไหนให้ at-least-once ที่ทนทานและไม่ทำข้อมูลหาย',
+    options: [
+      '`acks=0` และ commit ก่อนประมวลผล',
+      '`acks=all` + producer แบบ idempotent และ commit หลังประมวลผล',
+      'ไม่มี acks และใช้ auto-commit',
+      'broker เดียวโดยไม่มี replication',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'สำหรับระบบส่วนใหญ่ default ที่สมเหตุสมผลควรออกแบบรอบอะไร',
+    options: [
+      'exactly-once ทุกที่ตลอดเวลา',
+      'at-least-once end-to-end บวก sink ปลายทางที่ idempotent เพื่อให้ duplicate ไม่เป็นอันตราย',
+      'at-most-once เพื่อให้เร็วที่สุด',
+      'ไม่มี delivery guarantee เลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'exactly-once เต็มรูปแบบ (transactions) คุ้มกับต้นทุนเมื่อไหร่',
+    options: [
+      'กับทุก pipeline ไม่ว่าจะจำเป็นหรือไม่',
+      'เมื่อ pipeline อยู่ภายใน Kafka และ duplicate ยอมรับไม่ได้จริง ๆ',
+      'เฉพาะตอนที่มี consumer ตัวเดียว',
+      'ไม่มีวันคุ้ม มันใช้ไม่ได้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="delivery-and-transactions/delivery-guarantees" questions={quizGuarantees} />
+
+<ProgressTracker client:visible id="delivery-and-transactions/delivery-guarantees" />

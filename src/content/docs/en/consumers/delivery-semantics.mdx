@@ -1,0 +1,90 @@
+---
+title: 'Delivery Semantics'
+description: 'At-most-once, at-least-once, and exactly-once from the consumer side — what each means, how commit placement decides it, and why idempotency matters.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+There are three delivery semantics — **at-most-once**, **at-least-once**, and **exactly-once** — and from the consumer\'s seat you choose between the first two mainly by **when you commit**, then reach the third with idempotent processing or transactions.
+
+## The three guarantees
+
+- **At-most-once** — every record is delivered zero or one times. Records may be **lost**, never duplicated. You get this by committing the offset **before** processing: if you crash after committing but before finishing, the record is skipped on restart.
+- **At-least-once** — every record is delivered one or more times. Records may be **duplicated**, never lost. You get this by committing **after** processing: a crash before the commit re-reads the batch. This is the practical default.
+- **Exactly-once** — every record affects the outcome once, with no loss and no duplicates. This needs more than commit placement.
+
+<Mermaid title="Commit placement selects the first two semantics" code={semanticsDiagram} />
+
+export const semanticsDiagram = `flowchart TB
+  poll["poll batch"] --> choice{"commit before or after processing?"}
+  choice -->|before| amo["at-most-once: crash then skip (loss)"]
+  choice -->|after| alo["at-least-once: crash then reprocess (duplicates)"]
+  alo --> idem["make processing idempotent to reach effectively exactly-once"]`;
+
+## Getting to exactly-once
+
+At-least-once plus **idempotent processing** is the most common route: design the side effect so that reprocessing the same record twice has the same result as once. Practical tactics:
+
+- **Upsert by a natural key** instead of blind insert, so a duplicate overwrites rather than duplicates.
+- **Dedup on a record id** the producer stamps, discarding ids you have already applied.
+- Make downstream operations **commutative/idempotent** (e.g. "set status = shipped", not "increment count").
+
+The stronger, framework-level route is Kafka **transactions** — atomically writing output records and committing input offsets together — which the next module covers in full. That gives exactly-once for **consume-transform-produce** pipelines that stay inside Kafka.
+
+<Callout title="The one-line takeaway">
+**At-most-once** (commit before processing → possible loss), **at-least-once** (commit after → possible duplicates), and **exactly-once** are the three semantics. Commit placement picks the first two; **at-least-once is the sensible default**. Reach effectively-exactly-once by making processing **idempotent** (upsert, dedup on id, commutative ops), or use Kafka **transactions** for consume-transform-produce inside Kafka.
+</Callout>
+
+export const quizSemantics = [
+  {
+    q: 'What characterizes at-most-once delivery?',
+    options: [
+      'Records may be duplicated but never lost',
+      'Records may be lost but never duplicated — you commit before processing',
+      'Records are always delivered exactly once',
+      'Records are never delivered',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do you typically achieve at-least-once?',
+    options: [
+      'Commit the offset before processing the record',
+      'Commit the offset after processing succeeds, so a crash re-reads the batch',
+      'Disable offset commits entirely',
+      'Use a single partition',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is a practical way to make at-least-once behave like exactly-once?',
+    options: [
+      'Process records twice on purpose',
+      'Make processing idempotent — upsert by key or dedup on a record id so reprocessing has no extra effect',
+      'Turn off the consumer group',
+      'Increase the poll timeout',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does the strongest, framework-level exactly-once path use in Kafka?',
+    options: [
+      'Auto-commit with a short interval',
+      'Transactions that atomically write output records and commit input offsets together',
+      'A larger replication factor',
+      'Reading from the beginning every time',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/delivery-semantics" questions={quizSemantics} />
+
+<ProgressTracker client:visible id="consumers/delivery-semantics" />

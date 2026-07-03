@@ -1,0 +1,112 @@
+---
+title: 'Acks กับ Durability'
+description: 'acks=0 acks=1 และ acks=all แลก latency กับ durability อย่างไร min.insync.replicas หนุนค่าที่แข็งที่สุดอย่างไร และ config ที่แนะนำสำหรับความทนทาน.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+ค่า `acks` เป็นตัวตัดสินว่า **ต้องมี replica กี่ตัวยืนยันก่อน Kafka จะถือว่า write นั้น durable** — เป็นการแลก latency กับการรับประกันว่า record จะรอดแม้ broker ล่ม.
+
+## สามระดับของ acks
+
+ทุก partition มี replica ที่เป็น **leader** หนึ่งตัว และ **follower** อีกศูนย์ตัวขึ้นไป ค่า `acks` ควบคุมว่าต้องมีกี่ตัว acknowledge การ write ก่อน producer จะถือว่า `send()` สำเร็จ.
+
+- **`acks=0`** — fire-and-forget producer ไม่รอ acknowledge ใด ๆ ถือว่าส่งแล้วทันทีที่ record ออกจาก client latency ต่ำสุด แต่ record หายเงียบ ๆ ได้ถ้า leader ล่ม.
+- **`acks=1`** — leader เท่านั้น leader เขียน record ลง log ของตัวเองแล้วตอบกลับ เร็ว แต่ถ้า leader crash **ก่อน** ที่ follower จะ replicate record นั้น record จะหาย.
+- **`acks=all`** (มีค่าเท่ากับ **`acks=-1`**) — ทุก **in-sync replica** ต้องยืนยัน record ปลอดภัยตราบใดที่ยังมี in-sync replica เหลืออยู่หนึ่งตัว durability สูงสุด latency สูงสุด.
+
+```properties
+# Fire-and-forget: fastest, weakest guarantee
+acks=0
+
+# Leader only: fast, but unreplicated writes can be lost on leader failure
+acks=1
+
+# All in-sync replicas must confirm: strongest durability
+acks=all
+```
+
+## acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย
+
+`acks=all` ลำพังหมายถึง "ทุก replica ที่ **in-sync** อยู่ตอนนั้น" ถ้าตอนนั้นมีแค่ leader ที่ in-sync คำว่า "all" ก็คือ leader ตัวเดียว — เท่ากับกลับไปเป็น `acks=1` ค่าฝั่ง broker คือ `min.insync.replicas` ปิดช่องนี้ มันตั้ง **จำนวนขั้นต่ำ** ของ in-sync replica ที่ต้องมีอยู่ถึงจะรับ write ได้เลย.
+
+ด้วย `min.insync.replicas=2` บน topic ที่มี replication factor 3 producer ที่ใช้ `acks=all` ต้องมี replica in-sync อย่างน้อย **สอง** ตัว ถ้าเหลือแค่ตัวเดียว broker จะ **ปฏิเสธ** การ write (error `NotEnoughReplicas`) แทนที่จะรับ record ที่อาจหายได้ การปฏิเสธนี่แหละคือจุดสำคัญ — เรายอมให้ fail ดัง ๆ ดีกว่าเสียข้อมูลเงียบ ๆ.
+
+```properties
+# Recommended durable producer configuration (pair with broker/topic min.insync.replicas=2)
+acks=all
+enable.idempotence=true
+# retries defaults high in modern Kafka; delivery.timeout.ms is the real deadline
+delivery.timeout.ms=120000
+```
+
+<Mermaid title="Durability climbs from acks=0 to acks=all with min.insync.replicas" code={acksDiagram} />
+
+export const acksDiagram = `flowchart LR
+  p["Producer send()"] --> a0["acks=0: no wait, lowest latency"]
+  p --> a1["acks=1: leader writes and replies"]
+  p --> aa["acks=all: all in-sync replicas confirm"]
+  aa --> misr["'min.insync.replicas=2' must be met or write is rejected"]
+  misr --> safe["Durable: survives a broker failure"]`;
+
+## Tradeoff แบบตรงไปตรงมา
+
+durability ไม่มีของฟรี ทุกระดับ `acks` ที่แข็งขึ้นเพิ่ม network round trip และรอเครื่องมากขึ้น latency จึงสูงขึ้นตามความแข็งของการรับประกัน เลือกตามต้นทุนของการเสีย record: metrics และ log มักอยู่กับ `acks=1` ได้ แต่ order, payment และอะไรที่สร้างใหม่ไม่ได้ควรใช้ `acks=all` คู่กับ `min.insync.replicas=2`.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**`acks`** ตั้งว่าต้องมี replica กี่ตัวยืนยันการ write: **`acks=0`** คือ fire-and-forget, **`acks=1`** คือ leader อย่างเดียว, และ **`acks=all`** รอทุก **in-sync replica** หนุน `acks=all` ด้วย **`min.insync.replicas=2`** เพื่อให้ broker ปฏิเสธ write ที่ทำ durable ไม่ได้ — แลก **latency** นิดหน่อยกับ record ที่รอดเมื่อ broker ล่ม.
+</Callout>
+
+export const quizAcks = [
+  {
+    q: 'acks=all รับประกันอะไรที่ต่างจาก acks=1',
+    options: [
+      'ไม่ต่างเลย เป็นชื่อเรียกแทนกัน',
+      'record ถูกยืนยันโดยทุก in-sync replica ไม่ใช่แค่ leader',
+      'มันปิด replication ทั้งหมด',
+      'มันเขียนลงทุก topic ใน cluster',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย',
+    options: [
+      'ถ้าไม่มีมัน record จะถูกเก็บแค่ในหน่วยความจำ',
+      'เพราะ acks=all หมายถึงทุก in-sync replica ตอนนั้น ถ้ามีแค่ leader ที่ in-sync มันจะทำตัวเหมือน acks=1',
+      'min.insync.replicas ควบคุมจำนวน partition',
+      'มันตั้งว่ามี consumer อ่าน topic ได้กี่ตัว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เมื่อ replication factor 3 และ min.insync.replicas=2 จะเกิดอะไรถ้ามี replica in-sync แค่ตัวเดียวตอนส่งแบบ acks=all',
+    options: [
+      'การ write สำเร็จเงียบ ๆ',
+      'broker ปฏิเสธการ write แทนที่จะรับ record ที่อาจหายได้',
+      'record ถูกเขียนลงไฟล์ชั่วคราว',
+      'producer สลับไปใช้ acks=0 อัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'tradeoff หลักเมื่อเพิ่มระดับ acks คืออะไร',
+    options: [
+      'durability สูงขึ้นแลกกับ latency ที่สูงขึ้น',
+      'durability ต่ำลงแต่ต้นทุนต่ำลง',
+      'partition มากขึ้นแต่ replica น้อยลง',
+      'consumer เร็วขึ้นแต่ producer ช้าลง',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="producers/acks-and-durability" questions={quizAcks} />
+
+<ProgressTracker client:visible id="producers/acks-and-durability" />

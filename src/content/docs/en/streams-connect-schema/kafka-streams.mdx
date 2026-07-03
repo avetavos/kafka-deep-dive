@@ -1,0 +1,126 @@
+---
+title: 'Kafka Streams'
+description: 'The Kafka Streams Java library for stream processing — KStream vs KTable, the stream-table duality, stateless vs stateful operations, state stores backed by changelog topics, and exactly-once processing.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Kafka Streams** is a Java library — not a separate cluster — that you embed in your own application to transform, aggregate, and join Kafka topics as continuous streams, with state and exactly-once guarantees handled for you.
+
+## KStream, KTable, and the duality
+
+Kafka Streams gives you two views of a topic:
+
+- **`KStream`** — an unbounded sequence of independent **events**. Every record is a new fact ("user clicked"). Nothing is overwritten.
+- **`KTable`** — a **changelog** interpreted as the latest value **per key**. Each record updates the row for its key, like `UPSERT`s into a table.
+
+This is the **stream-table duality**: a table is the snapshot you get by replaying a stream of updates, and a stream is the sequence of changes you get by watching a table. The same topic can be read either way depending on what you need — a running feed of events, or the current state per key.
+
+<Mermaid title="A stream of updates folds into a table; a table emits a stream of changes" code={dualityDiagram} />
+
+export const dualityDiagram = `flowchart LR
+  s["KStream (events)"] -->|"aggregate / reduce"| t["KTable (latest per key)"]
+  t -->|"toStream()"| s2["KStream (changes)"]`;
+
+## Stateless vs stateful operations
+
+Operations split into two families:
+
+- **Stateless** — each record is handled on its own: `map`, `filter`, `flatMap`, `branch`. No memory of past records is needed.
+- **Stateful** — the result depends on records seen so far: `aggregate`, `count`, `reduce`, `join`, and **windowing** (grouping records into time buckets). These need somewhere to keep the running result.
+
+That "somewhere" is a **state store** — a local key-value store (RocksDB by default) living inside your app instance. To survive a crash, every state store is backed by a **changelog topic** in Kafka: each update is also written to the changelog, so if the instance restarts elsewhere, Streams rebuilds the store by replaying it. Your local state is durable without you managing a database.
+
+## A word-count topology
+
+Here is the classic example — count how often each word appears across an input topic:
+
+```java
+StreamsBuilder builder = new StreamsBuilder();
+
+// Read the input topic as a stream of (key, line) events
+KStream<String, String> lines = builder.stream("text-input");
+
+KTable<String, Long> counts = lines
+    .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
+    .groupBy((key, word) -> word)     // re-key by the word itself
+    .count();                         // stateful: running total per word -> a KTable
+
+// Write the changelog of counts out to an output topic
+counts.toStream().to("word-counts");
+
+KafkaStreams streams = new KafkaStreams(builder.build(), props);
+streams.start();
+```
+
+The `count()` builds a `KTable` backed by a state store and its changelog; `toStream().to(...)` emits every updated count downstream.
+
+## Exactly-once and the streams protocol
+
+Stream processing that reads, updates state, and writes is easy to get *wrong* on failure — you can double-count. Kafka Streams makes this a one-line setting. With `processing.guarantee` set to `exactly_once_v2`, Streams wraps each read-process-write cycle (including the state-store changelog and consumer offsets) in a single Kafka transaction, so a retry never applies an update twice:
+
+```java
+// Turn on end-to-end exactly-once for the whole topology
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
+
+// Modern Kafka: use the dedicated broker-side rebalance protocol for Streams groups
+props.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, "streams");
+```
+
+<Callout title="The one-line takeaway">
+**Kafka Streams** is an **embedded Java library** for stream processing: a **`KStream`** is a feed of events, a **`KTable`** is the latest value per key, and the **stream-table duality** links them. **Stateless** ops need no memory; **stateful** ops (aggregate, join, windowing) use **state stores** backed by **changelog topics**, and `processing.guarantee=exactly_once_v2` makes read-process-write safe.
+</Callout>
+
+export const quizStreams = [
+  {
+    q: 'What is the difference between a KStream and a KTable?',
+    options: [
+      'A KStream is a database and a KTable is a file',
+      'A KStream is an unbounded sequence of events; a KTable is the latest value per key (a changelog)',
+      'They are identical',
+      'A KTable can only hold one record total',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a Kafka Streams state store survive an application crash?',
+    options: [
+      'It does not — state is lost on restart',
+      'Every update is also written to a changelog topic, so the store is rebuilt by replaying it',
+      'It is copied to every consumer manually',
+      'It is stored only in the JVM heap forever',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these is a STATEFUL operation?',
+    options: [
+      'map',
+      'filter',
+      'aggregate / count / join with windowing',
+      'flatMap',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What does processing.guarantee=exactly_once_v2 provide?',
+    options: [
+      'Faster throughput by dropping acknowledgements',
+      'It wraps read-process-write (including state and offsets) in a transaction so a retry never applies an update twice',
+      'It disables state stores',
+      'It turns Kafka Streams into a separate cluster',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="streams-connect-schema/kafka-streams" questions={quizStreams} />
+
+<ProgressTracker client:visible id="streams-connect-schema/kafka-streams" />

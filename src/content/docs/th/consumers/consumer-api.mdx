@@ -1,0 +1,107 @@
+---
+title: 'The Consumer API'
+description: 'อ่าน record ด้วย Kafka consumer ทั้ง subscribe, poll loop, deserializer และเหตุผลที่ poll เป็นตัวขับเคลื่อนทุกอย่างของ consumer.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+Kafka consumer จะ subscribe topic แล้ว **วนลูปเรียก `poll()`** — แต่ละ poll คืน record มาเป็น batch จาก partition ที่ถูก assign ให้ และ poll ตัวเดียวกันนี้เองที่คอยทำให้ consumer ยังมีชีวิตอยู่ใน group.
+
+## subscribe ก่อน แล้วค่อย poll
+
+คุณตั้งค่า consumer ด้วย `bootstrap.servers`, `group.id` และ **deserializer** (ตัวสะท้อนกลับของ serializer ฝั่ง producer) จากนั้น `subscribe()` ไปยัง topic ที่ต้องการ แล้วขับ **poll loop**:
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("group.id", "order-processor");          // consumer group membership
+props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+    consumer.subscribe(List.of("orders"));
+    while (true) {
+        // Wait up to 1s for records, then process whatever arrived
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+        for (ConsumerRecord<String, String> record : records) {
+            System.out.printf("p=%d off=%d key=%s val=%s%n",
+                record.partition(), record.offset(), record.key(), record.value());
+        }
+    }
+}
+```
+
+## ทำไม loop ถึงสำคัญ
+
+`poll()` ทำมากกว่าแค่ดึงข้อมูล ในการเรียกแต่ละครั้ง consumer ยังส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ของตัวเองด้วย ถ้าคุณหยุด poll — เช่นเพราะประมวลผล batch นานเกินไป — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **poll ต่อเนื่อง และคุมเวลา process ต่อ batch ให้จำกัด**
+
+<Mermaid title="The consumer poll loop" code={pollDiagram} />
+
+export const pollDiagram = `flowchart LR
+  sub["subscribe(topics)"] --> poll["poll(timeout)"]
+  poll --> recs["ConsumerRecords batch"]
+  recs --> proc["process each record"]
+  proc --> poll
+  poll -->|also| hb["send heartbeats + coordinate group"]`;
+
+## แต่ละ record พก coordinate ของตัวเองมา
+
+`ConsumerRecord` ทุกตัวเปิดเผย `topic()`, `partition()`, `offset()`, `key()`, `value()`, `timestamp()` และ headers ออกมา coordinate เหล่านี้คือสิ่งที่คุณใช้ commit ความคืบหน้า และใช้คิดเรื่องลำดับ — consumer จะเห็น record **เรียงตาม offset ภายในแต่ละ partition** แม้ว่า record จาก partition ต่างกันอาจสลับกันข้าม poll batch ได้.
+
+<Callout title="สรุปหนึ่งบรรทัด">
+consumer จะ **`subscribe()`** ไปยัง topic แล้วขับ **`poll()` loop** โดย `poll()` คืน batch กลับมา **พร้อมกับ** ทำงานเบื้องหลัง — heartbeat, group coordination, ดึง assignment — ดังนั้นถ้าหยุด poll หรือ block นานเกินไป group จะ **rebalance** ย้าย partition ของคุณออกไป record มาถึง **เรียงตาม offset ภายใน partition** โดยแต่ละตัวติดป้าย topic, partition และ offset.
+</Callout>
+
+export const quizConsumerApi = [
+  {
+    q: '`poll()` ทำอะไรอีกนอกจากคืน record?',
+    options: [
+      'ไม่ทำอะไรอีก — แค่ดึงข้อมูลอย่างเดียว',
+      'มันยังส่ง heartbeat, ประสาน group membership และดึง partition assignment ด้วย',
+      'มัน commit offset ลงฐานข้อมูล',
+      'มันสร้าง partition ใหม่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ถ้า consumer หยุดเรียก `poll()` นานเกินไปจะเกิดอะไรขึ้น?',
+    options: [
+      'Kafka จะเร่งความเร็วในการส่ง',
+      'group coordinator จะถือว่ามันตายแล้ว และ rebalance ย้าย partition ไปให้ consumer ตัวอื่น',
+      'consumer จะ scale up อัตโนมัติ',
+      'ไม่มีอะไรเกิดขึ้น การ poll เป็นทางเลือก',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'deserializer มีไว้ทำอะไร?',
+    options: [
+      'บีบอัด record ก่อนส่ง',
+      'แปลง raw bytes ของ key/value ในแต่ละ record กลับเป็น object ที่มี type บนฝั่ง consumer',
+      'assign partition',
+      'commit offset',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'consumer เห็น record เรียงตามลำดับแบบไหน?',
+    options: [
+      'สุ่มลำดับทั่วทั้ง topic',
+      'เรียงตาม offset ภายในแต่ละ partition แม้ partition ต่าง ๆ อาจสลับกันข้าม batch',
+      'ตัวใหม่สุดก่อนเสมอ',
+      'เรียงตาม key',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/consumer-api" questions={quizConsumerApi} />
+
+<ProgressTracker client:visible id="consumers/consumer-api" />
