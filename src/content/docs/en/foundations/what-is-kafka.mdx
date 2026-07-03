@@ -1,0 +1,100 @@
+---
+title: 'What Is Kafka'
+description: 'Kafka as a distributed event streaming platform — the publish/subscribe log, how it differs from a message queue, and the problems it solves.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kafka is a **distributed, append-only log** that decouples the systems producing data from the systems consuming it — producers write events once, and any number of independent consumers read them, in order, at their own pace.
+
+## Not a queue, a log
+
+A traditional message queue **deletes** a message once a consumer acknowledges it. There is one logical reader, and the message is gone after delivery. Kafka is different: it is a **log**. When a producer writes a record, Kafka appends it to a partition and keeps it for a configured retention period. Reading a record does **not** remove it. Every consumer tracks its own position (an **offset**) in the log, so two teams can read the same stream for completely different purposes without interfering.
+
+That single design choice is why Kafka is used for so many things at once:
+
+- **Messaging** — decouple services with a durable buffer between them.
+- **Event sourcing** — the log *is* the source of truth; state is a projection of it.
+- **Stream processing** — transform and join streams as they arrive.
+- **Data integration** — one pipeline feeds databases, search indexes, and warehouses.
+
+<Mermaid title="Producers write once; independent consumers read at their own offsets" code={pubsubDiagram} />
+
+export const pubsubDiagram = `flowchart LR
+  p1["Producer: orders service"] --> log["Topic (append-only log)"]
+  p2["Producer: payments service"] --> log
+  log --> c1["Consumer group: fraud detection"]
+  log --> c2["Consumer group: analytics"]
+  log --> c3["Consumer group: email notifications"]`;
+
+## Why not just use a database?
+
+You *could* poll a database table for new rows, but you would be rebuilding Kafka badly: no built-in ordering guarantees per key, no efficient fan-out to many readers, no back-pressure, no replay from an arbitrary point, and no horizontal scaling of throughput. Kafka is purpose-built for **high-throughput, ordered, replayable event streams** — sequential disk writes, zero-copy reads, and partitioning that scales writes and reads across a cluster.
+
+## The core vocabulary
+
+You will meet these terms constantly, so anchor them now:
+
+- **Broker** — a Kafka server. A **cluster** is several brokers.
+- **Topic** — a named stream of records (e.g. `orders`). Logically, one log.
+- **Partition** — a topic is split into partitions; each partition is the actual ordered log.
+- **Offset** — a record's position within a partition. Consumers track offsets to know what they have read.
+- **Producer / Consumer** — clients that write to and read from topics.
+
+<Callout title="The one-line takeaway">
+Kafka is a **log, not a queue**: records are appended and retained, not deleted on read, so **many independent consumers** can read the same stream at their own **offset**. That decoupling is what makes one platform serve messaging, event sourcing, stream processing, and data integration at once.
+</Callout>
+
+export const quizWhat = [
+  {
+    q: 'How does Kafka differ from a traditional message queue?',
+    options: [
+      'It deletes each message after one consumer reads it',
+      'It is an append-only log — records are retained, not removed on read, and each consumer tracks its own offset',
+      'It only supports a single consumer',
+      'It stores data only in memory',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does an offset represent?',
+    options: [
+      'The size of a message in bytes',
+      'A consumer\'s position within a partition — which records it has read',
+      'The number of brokers in the cluster',
+      'A network port',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why can two teams read the same Kafka topic without interfering?',
+    options: [
+      'Kafka duplicates the topic for each team',
+      'Reading does not consume the record; each consumer group tracks its own offset independently',
+      'Only one team is allowed at a time',
+      'The topic is copied into a database first',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is NOT a typical Kafka use case?',
+    options: [
+      'Decoupling services with a durable buffer (messaging)',
+      'Stream processing and data integration',
+      'Event sourcing where the log is the source of truth',
+      'Serving as a transactional relational database with SQL joins as primary store',
+    ],
+    answer: 3,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-kafka" questions={quizWhat} />
+
+<ProgressTracker client:visible id="foundations/what-is-kafka" />

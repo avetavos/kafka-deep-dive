@@ -1,0 +1,102 @@
+---
+title: 'Replication & ISR'
+description: 'How Kafka keeps data durable — replication factor, leader and follower replicas, the in-sync replica set, min.insync.replicas, and safe leader election.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kafka survives broker failure by keeping each partition on several brokers — one **leader** and several **followers** — and it tracks which copies are fully caught up in the **in-sync replica (ISR)** set, so a failed leader can be replaced without losing acknowledged data.
+
+## Leaders and followers
+
+Each partition has a **replication factor**: the number of copies Kafka keeps. With `replication-factor 3`, the partition lives on three brokers. One is the **leader** — it handles all reads and writes for that partition. The others are **followers**; they do nothing but continuously fetch from the leader to stay identical.
+
+```bash
+# 3 copies of every partition, spread across 3 brokers
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic payments --partitions 6 --replication-factor 3
+```
+
+If the leader's broker dies, one of the followers is promoted to leader and the partition keeps serving. Clients rediscover the new leader through the bootstrap server — no data lost, brief interruption only.
+
+## The in-sync replica set
+
+Not every follower is always current — one might be slow or briefly disconnected. Kafka tracks the **ISR**: the set of replicas (the leader plus followers) that are fully caught up to the leader's log. Only ISR members are eligible to become leader, because only they have all the acknowledged data.
+
+Two configs turn the ISR into a durability contract:
+
+- **`acks=all`** (producer side) — the write is acknowledged only after **all ISR members** have it.
+- **`min.insync.replicas`** (topic/broker side) — the **minimum ISR size** for a write to be accepted. With `min.insync.replicas=2`, if the ISR shrinks to 1, `acks=all` writes are **rejected** rather than risking a single copy.
+
+<Mermaid title="Leader replicates to followers; ISR gates durable writes" code={isrDiagram} />
+
+export const isrDiagram = `flowchart TB
+  prod["Producer (acks=all)"] --> leader["Leader replica"]
+  leader -->|replicate| f1["Follower (in ISR)"]
+  leader -->|replicate| f2["Follower (in ISR)"]
+  leader -.->|lagging, dropped from ISR| f3["Follower (out of ISR)"]
+  isr["Write acked once all ISR have it; min.insync.replicas enforces ISR size"]`;
+
+## Durability over availability
+
+The classic durability recipe is `replication-factor=3`, `min.insync.replicas=2`, `acks=all`. That tolerates one broker failure while still requiring two copies of every acknowledged write — you never depend on a single disk.
+
+What if the ISR drops to zero and a stale, out-of-sync replica is the only survivor? Electing it would bring the partition back online but **lose** the records it never received. Kafka's default, **`unclean.leader.election.enable=false`**, refuses that trade: it keeps the partition offline until an in-sync replica returns, choosing **durability over availability**. You can flip it to prioritize availability, but only with eyes open about the data-loss risk.
+
+<Callout title="The one-line takeaway">
+Kafka replicates each partition to a **leader** plus **followers**; the **ISR** is the set of replicas fully caught up. **`acks=all`** waits for all ISR members and **`min.insync.replicas`** enforces a minimum ISR size, so the safe recipe is **RF=3, min.insync.replicas=2, acks=all**. By default Kafka disables **unclean leader election**, choosing **durability over availability** — it will not promote a stale replica and lose acknowledged data.
+</Callout>
+
+export const quizIsr = [
+  {
+    q: 'What is the ISR (in-sync replica set)?',
+    options: [
+      'All brokers in the cluster',
+      'The set of replicas fully caught up to the leader, eligible to become leader without data loss',
+      'The list of consumers reading a partition',
+      'The offsets a producer has written',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does min.insync.replicas control?',
+    options: [
+      'How many partitions a topic has',
+      'The minimum ISR size required for an acks=all write to be accepted',
+      'The number of consumer groups allowed',
+      'The retention period',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which combination is the standard durable-write recipe?',
+    options: [
+      'replication-factor=1, acks=0',
+      'replication-factor=3, min.insync.replicas=2, acks=all',
+      'replication-factor=2, acks=0, min.insync.replicas=1',
+      'replication-factor=1, min.insync.replicas=3',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is unclean.leader.election.enable false by default?',
+    options: [
+      'To make the cluster faster',
+      'To avoid promoting a stale, out-of-sync replica, which would lose acknowledged data — durability over availability',
+      'Because leader election is not supported in KRaft',
+      'To reduce the number of partitions',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/replication-and-isr" questions={quizIsr} />
+
+<ProgressTracker client:visible id="topics-and-partitions/replication-and-isr" />

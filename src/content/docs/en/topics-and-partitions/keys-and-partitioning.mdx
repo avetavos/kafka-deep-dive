@@ -1,0 +1,102 @@
+---
+title: 'Keys & Partitioning'
+description: 'How message keys map records to partitions, why the same key gives per-key ordering, the sticky partitioner for null keys, and the add-partitions caveat.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+The **key** on a record decides its partition — the default partitioner hashes the key so that **the same key always lands on the same partition**, which is exactly how you get ordering guarantees per entity (per user, per order, per account).
+
+## Key in, partition out
+
+Every `ProducerRecord` has an optional key. The producer's partitioner turns that key into a partition number:
+
+```java
+// Same key "user-42" → same partition, every time → ordered per user
+producer.send(new ProducerRecord<>("orders", "user-42", "placed order #918"));
+producer.send(new ProducerRecord<>("orders", "user-42", "cancelled order #918"));
+```
+
+For a **non-null key**, the default partitioner computes roughly `hash(key) % numberOfPartitions`. Deterministic hashing means every record for `user-42` goes to the same partition, so all of that user's events stay in one totally-ordered log. Different keys spread across partitions, balancing load.
+
+## Null keys and the sticky partitioner
+
+If the key is `null`, you do not care which partition a record lands on — only about even spreading. Kafka uses the **sticky partitioner**: it sends a batch of null-key records to **one** partition until that batch is full or `linger.ms` elapses, then switches to another. Sticking to one partition per batch produces larger, more efficient batches (fewer, bigger requests) while still spreading evenly over time.
+
+<Mermaid title="Keyed records hash to a fixed partition; null keys batch stickily" code={keyDiagram} />
+
+export const keyDiagram = `flowchart TB
+  k1["key = user-42"] -->|hash % N| p1["partition 1 (always)"]
+  k2["key = user-99"] -->|hash % N| p2["partition 2 (always)"]
+  k3["key = null"] -->|sticky batch| p3["one partition per batch, then rotate"]`;
+
+## The add-partitions caveat
+
+Because the mapping is `hash(key) % numberOfPartitions`, **changing the partition count changes where keys land**. Add a partition to a live topic and `user-42` may hash to a new partition — its future events go somewhere different from its past ones, breaking the per-key ordering you relied on.
+
+Practical consequences:
+
+- Provision enough partitions **up front** for keyed topics where ordering matters.
+- If you must grow, understand that historical per-key ordering is preserved only within each old partition, not across the boundary.
+
+## Co-partitioning for joins
+
+When you want to **join** two streams by the same key (say `orders` and `payments`, both keyed by `orderId`), give both topics the **same partition count** and the **same partitioner**. Then `orderId=918` lands on partition 3 in *both* topics, and a single consumer or stream task sees both sides locally — no cross-partition shuffle. This is **co-partitioning**, and Kafka Streams requires it for key-based joins.
+
+<Callout title="The one-line takeaway">
+A record's **key** picks its partition via `hash(key) % partitions`, so the **same key always lands on the same partition** — the mechanism behind per-entity ordering. **Null keys** use the **sticky partitioner** to build efficient batches while spreading evenly. Beware: **adding partitions re-maps keys**, so provision up front. Give related topics the **same partition count** to **co-partition** them for joins.
+</Callout>
+
+export const quizKeys = [
+  {
+    q: 'What determines which partition a keyed record goes to?',
+    options: [
+      'A random choice each time',
+      'The default partitioner hashes the key: hash(key) % number of partitions',
+      'The record timestamp',
+      'The consumer group id',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does using a key like a user id give per-user ordering?',
+    options: [
+      'Keys are stored in a database',
+      'The same key always hashes to the same partition, so all of that user\'s events stay in one ordered log',
+      'Kafka sorts records by key at read time',
+      'It does not; keys have no effect on ordering',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does the sticky partitioner do for null-key records?',
+    options: [
+      'Sends each record to a random partition',
+      'Sends a whole batch to one partition until it fills, then rotates — for efficient batching with even spread over time',
+      'Rejects records without a key',
+      'Always uses partition 0',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is adding partitions to a keyed topic risky?',
+    options: [
+      'It deletes existing data',
+      'hash(key) % partitions changes, so a key may map to a new partition, breaking per-key ordering going forward',
+      'It requires stopping the whole cluster',
+      'It has no effect on keyed records',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/keys-and-partitioning" questions={quizKeys} />
+
+<ProgressTracker client:visible id="topics-and-partitions/keys-and-partitioning" />

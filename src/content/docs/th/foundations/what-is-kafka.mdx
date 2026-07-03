@@ -1,0 +1,100 @@
+---
+title: 'Kafka คืออะไร'
+description: 'Kafka ในฐานะ distributed event streaming platform ตัว log แบบ publish/subscribe มันต่างจาก message queue ยังไง และแก้ปัญหาอะไร'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Kafka คือ **log แบบ distributed, append-only** ที่แยกระบบฝั่งที่ผลิตข้อมูลออกจากระบบฝั่งที่บริโภคข้อมูล producer เขียน event ครั้งเดียว แล้ว consumer อิสระกี่ตัวก็ได้อ่าน event นั้นตามลำดับ ตามจังหวะของแต่ละตัวเอง
+
+## ไม่ใช่ queue แต่เป็น log
+
+message queue แบบเดิม **ลบ** message ทิ้งทันทีที่ consumer ack แล้ว มันมี reader เชิงตรรกะแค่ตัวเดียว และ message หายไปหลังส่งเสร็จ Kafka ต่างออกไป มันเป็น **log** เมื่อ producer เขียน record เข้ามา Kafka จะ append มันเข้า partition แล้วเก็บไว้ตาม retention period ที่ตั้งไว้ การอ่าน record **ไม่ได้** ทำให้ record หายไป consumer แต่ละตัว track ตำแหน่งของตัวเอง (คือ **offset**) ใน log ดังนั้นสองทีมอ่าน stream เดียวกันเพื่อจุดประสงค์คนละอย่างได้เลยโดยไม่กวนกัน
+
+การตัดสินใจออกแบบข้อเดียวนี้แหละ คือเหตุผลที่ Kafka ถูกใช้ทำหลายอย่างพร้อมกัน
+
+- **Messaging** แยก service ออกจากกันด้วย buffer ที่ทนทานคั่นกลาง
+- **Event sourcing** ตัว log *คือ* source of truth ส่วน state เป็นแค่ projection ของมัน
+- **Stream processing** transform และ join stream ตอนที่ข้อมูลไหลเข้ามา
+- **Data integration** pipeline เดียวป้อนข้อมูลให้ database, search index และ warehouse
+
+<Mermaid title="producer เขียนครั้งเดียว consumer อิสระอ่านที่ offset ของตัวเอง" code={pubsubDiagram} />
+
+export const pubsubDiagram = `flowchart LR
+  p1["Producer: orders service"] --> log["Topic (append-only log)"]
+  p2["Producer: payments service"] --> log
+  log --> c1["Consumer group: fraud detection"]
+  log --> c2["Consumer group: analytics"]
+  log --> c3["Consumer group: email notifications"]`;
+
+## ทำไมไม่ใช้ database ไปเลย
+
+คุณ *อาจจะ* poll ตาราง database เพื่อหา row ใหม่ก็ได้ แต่นั่นคือการสร้าง Kafka ขึ้นมาใหม่แบบห่วย ๆ ไม่มี ordering guarantee ต่อ key ในตัว, ไม่มี fan-out ไปหา reader หลายตัวอย่างมีประสิทธิภาพ, ไม่มี back-pressure, replay จากจุดใดก็ได้ไม่ได้ และ scale throughput ตามแนวนอนไม่ได้ Kafka ถูกออกแบบมาเพื่อ **event stream ที่ throughput สูง, มีลำดับ และ replay ได้** โดยเฉพาะ ทั้งการเขียนดิสก์แบบ sequential, การอ่านแบบ zero-copy และ partitioning ที่ scale การอ่านเขียนกระจายทั้ง cluster
+
+## ศัพท์หลักที่ต้องรู้
+
+คุณจะเจอศัพท์พวกนี้ตลอด เลยต้องปักหมุดไว้ตั้งแต่ตอนนี้
+
+- **Broker** เซิร์ฟเวอร์ Kafka หนึ่งตัว ส่วน **cluster** คือ broker หลายตัวรวมกัน
+- **Topic** stream ของ record ที่มีชื่อ (เช่น `orders`) เชิงตรรกะคือ log หนึ่งอัน
+- **Partition** topic ถูกแบ่งเป็น partition แต่ละ partition คือ log ที่มีลำดับจริง ๆ
+- **Offset** ตำแหน่งของ record ภายใน partition consumer track offset เพื่อรู้ว่าตัวเองอ่านถึงไหนแล้ว
+- **Producer / Consumer** client ที่เขียนเข้าและอ่านออกจาก topic
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kafka คือ **log ไม่ใช่ queue** record ถูก append แล้วเก็บไว้ ไม่ได้ลบทิ้งตอนอ่าน ดังนั้น **consumer อิสระหลายตัว** อ่าน stream เดียวกันที่ **offset** ของตัวเองได้ การแยกส่วนแบบนี้คือสิ่งที่ทำให้ platform เดียวรองรับทั้ง messaging, event sourcing, stream processing และ data integration พร้อมกัน
+</Callout>
+
+export const quizWhat = [
+  {
+    q: 'Kafka ต่างจาก message queue แบบเดิมยังไง',
+    options: [
+      'มันลบ message ทิ้งหลัง consumer ตัวหนึ่งอ่านเสร็จ',
+      'มันเป็น log แบบ append-only record ถูกเก็บไว้ ไม่ได้ลบตอนอ่าน และ consumer แต่ละตัว track offset ของตัวเอง',
+      'มันรองรับ consumer ได้แค่ตัวเดียว',
+      'มันเก็บข้อมูลไว้ใน memory เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'offset แทนอะไร',
+    options: [
+      'ขนาดของ message เป็น byte',
+      'ตำแหน่งของ consumer ภายใน partition ว่าอ่าน record ถึงไหนแล้ว',
+      'จำนวน broker ใน cluster',
+      'network port',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมสองทีมอ่าน Kafka topic เดียวกันได้โดยไม่กวนกัน',
+    options: [
+      'Kafka copy topic ให้แต่ละทีม',
+      'การอ่านไม่ได้กิน record ทิ้ง consumer group แต่ละตัว track offset ของตัวเองแยกกัน',
+      'อนุญาตให้อ่านได้ทีละทีมเท่านั้น',
+      'topic ถูก copy เข้า database ก่อน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อไหน NOT ใช่ use case ทั่วไปของ Kafka',
+    options: [
+      'แยก service ด้วย buffer ที่ทนทาน (messaging)',
+      'stream processing และ data integration',
+      'event sourcing ที่ log เป็น source of truth',
+      'ใช้เป็น relational database แบบ transactional โดยมี SQL join เป็น store หลัก',
+    ],
+    answer: 3,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-kafka" questions={quizWhat} />
+
+<ProgressTracker client:visible id="foundations/what-is-kafka" />

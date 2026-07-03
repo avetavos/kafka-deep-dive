@@ -1,0 +1,98 @@
+---
+title: 'KRaft & the Cluster'
+description: 'How Kafka 4.x coordinates itself with KRaft after ZooKeeper removal — the controller quorum, metadata as a log, and what changed for developers.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A Kafka cluster needs somewhere to store cluster metadata — which broker leads which partition, what topics exist, who is in the ISR — and in **Kafka 4.x** that job is done by **KRaft**, a built-in Raft-based controller quorum, with **ZooKeeper fully removed**.
+
+## Why this changed
+
+For most of Kafka's history, an external **ZooKeeper** ensemble stored cluster metadata. It was a separate system to deploy, secure, tune, and reason about — and it became a scalability bottleneck as clusters grew to many partitions. **KRaft** (Kafka Raft) moves metadata management **inside** Kafka itself. As of **Kafka 4.0, KRaft is the only mode** — ZooKeeper mode was removed entirely, and the `--zookeeper` CLI flag is gone.
+
+<Callout title="If you learned Kafka a few years ago">
+Older tutorials start ZooKeeper first and pass `--zookeeper host:2181` to admin commands. That is **obsolete** in Kafka 4.x. There is no ZooKeeper to start, and every command now takes `--bootstrap-server host:9092`. If you see `--zookeeper` in a guide, it predates KRaft.
+</Callout>
+
+## Metadata is itself a log
+
+KRaft applies Kafka's own philosophy to cluster coordination: it stores metadata as a **replicated log**. A set of brokers act as **controllers** forming a **quorum**; one is the elected leader. Every metadata change — create a topic, elect a new partition leader, update the ISR — is an event appended to the internal **metadata log** and replicated to the other controllers via the Raft protocol.
+
+The payoff is consistency and speed: brokers catch up on metadata the same way consumers catch up on data — by reading a log from an offset. Leader failover and metadata propagation are far faster than the ZooKeeper-era watch model.
+
+<Mermaid title="KRaft: a controller quorum replicating a metadata log" code={kraftDiagram} />
+
+export const kraftDiagram = `flowchart TB
+  subgraph quorum["Controller quorum (KRaft)"]
+    lead["Active controller (leader)"] -->|replicate metadata log| f1["Controller (follower)"]
+    lead -->|replicate metadata log| f2["Controller (follower)"]
+  end
+  lead -->|metadata updates| brk["Brokers (data plane)"]
+  brk --> cli["Clients discover leaders via bootstrap-server"]`;
+
+## What it means for you as a developer
+
+Day to day, KRaft is mostly invisible from the client side — you still connect with `--bootstrap-server`, produce, and consume exactly the same way. What changes is the mental model and the operations:
+
+- **One system, not two.** No ZooKeeper to deploy or monitor. Brokers and controllers are Kafka processes; small clusters can even combine both roles.
+- **Faster recovery.** Controller failover and metadata propagation are quicker, so partition leadership settles faster after a broker dies.
+- **Modern defaults.** Kafka 4.x also ships the **KIP-848** next-generation consumer rebalance protocol as generally available and strengthens transactions (**KIP-890**) — both covered later in this course.
+
+<Callout title="The one-line takeaway">
+**Kafka 4.x is KRaft-only** — ZooKeeper is gone. Cluster metadata now lives in a **replicated Raft log** managed by a **controller quorum** inside Kafka, giving faster failover and one system to operate instead of two. For developers the API is unchanged: connect with **`--bootstrap-server`**, and treat `--zookeeper` as a sign of outdated docs.
+</Callout>
+
+export const quizKraft = [
+  {
+    q: 'What replaced ZooKeeper for cluster metadata in Kafka 4.x?',
+    options: [
+      'A relational database',
+      'KRaft — a built-in Raft-based controller quorum inside Kafka',
+      'Redis',
+      'Nothing; Kafka 4.x still requires ZooKeeper',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does KRaft store cluster metadata?',
+    options: [
+      'In a JSON file on one broker',
+      'As a replicated log, appended and replicated across the controller quorum via Raft',
+      'Only in memory, lost on restart',
+      'In each client',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'You see a tutorial using `--zookeeper localhost:2181`. What does that tell you?',
+    options: [
+      'It is the current, recommended Kafka 4.x syntax',
+      'It predates KRaft — the flag is removed in Kafka 4.x; use `--bootstrap-server` instead',
+      'You must install ZooKeeper to run Kafka 4.x',
+      'The topic will be read-only',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'From a developer\'s perspective, what changes when using KRaft?',
+    options: [
+      'The producer and consumer APIs are completely rewritten',
+      'Very little at the client level — you still use `--bootstrap-server`; the change is operational (no ZooKeeper) with faster failover',
+      'You must manage the Raft log manually',
+      'Consumers can no longer track offsets',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/kraft-and-the-cluster" questions={quizKraft} />
+
+<ProgressTracker client:visible id="foundations/kraft-and-the-cluster" />

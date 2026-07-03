@@ -1,0 +1,32 @@
+---
+title: 'Kafka Deep Dive'
+description: 'คอร์ส deep dive สาย developer สำหรับ Apache Kafka 4.x ตั้งแต่ log, topic กับ partition, producer, consumer, delivery semantics, transaction ไปจนถึงการรัน Kafka บน production'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+Apache **Kafka** คือ distributed event streaming platform เป็น log ที่ทนทานและ replay ได้ ให้ producer หลายตัวเขียนเข้ามา และ consumer หลายตัวอ่านออกไป โดยต่างคนต่างอ่านตามจังหวะของตัวเอง คอร์สนี้เขียน **สำหรับ developer** คนที่ต้องเขียน producer กับ consumer เอง ต้องเข้าใจ delivery guarantee และต้องทำให้ Kafka ทำงานถูกต้องบน production
+
+คอร์สนี้อิงกับ **Kafka 4.x** ซึ่งรันด้วย **KRaft mode** อย่างเดียว โดย ZooKeeper ถูกถอดออกไปหมดแล้ว ตัวอย่าง CLI ทุกอันใช้ `--bootstrap-server` และตัวอย่าง client ใช้ Java `kafka-clients` API ตัวจริง ซึ่งเป็น reference มาตรฐานที่ client ภาษาอื่นล้วนอ้างอิงตาม
+
+## คอร์สนี้ครอบคลุมอะไรบ้าง
+
+| Module | สิ่งที่จะได้เรียน |
+| --- | --- |
+| **Foundations & the Log** | Kafka คืออะไร, log แบบ append-only, broker/topic/partition/offset และ KRaft |
+| **Topics, Partitions & Replication** | การทำ partition กับ ordering, key, replication กับ ISR, retention กับ log compaction |
+| **Producing Messages** | producer API, `acks` กับ durability, idempotent producer, batching กับ compression |
+| **Consuming & Consumer Groups** | poll loop, consumer group กับ rebalancing (KIP-848), offset commit, delivery semantics |
+| **Delivery Semantics & Transactions** | guarantee แบบ end-to-end, transaction, exactly-once processing, การจัดการ error |
+| **Streams, Connect & Schema Registry** | Schema Registry, Kafka Connect, Kafka Streams และการเลือก processing layer |
+| **Operations & Production** | รัน Kafka บนเครื่อง, monitoring กับ consumer lag, tuning และ security |
+
+## อ่านคอร์สนี้ยังไง
+
+แต่ละบทเปิดด้วยไอเดียในหนึ่งประโยค แล้วโชว์โค้ด client กับ CLI ของจริง มีไดอะแกรมของชิ้นส่วนที่เกี่ยวข้อง และปิดท้ายด้วยสรุปหนึ่งบรรทัดพร้อม quiz สั้น ๆ อ่านไล่จากบนลงล่าง เพราะ module หลัง ๆ จะถือว่าคุณรู้ศัพท์อย่าง log, partition และ offset จากบทแรก ๆ เหล่านี้แล้ว
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kafka คือ **log ที่ distributed, durable และ replay ได้** producer append record เข้าไป ส่วน consumer อ่านตามจังหวะตัวเองด้วยการ track **offset** คอร์สนี้สอน Kafka **4.x (KRaft-only)** จากมุมของ developer ทั้ง API, guarantee และพฤติกรรมบน production โดยเริ่มจากตัว log เอง
+</Callout>

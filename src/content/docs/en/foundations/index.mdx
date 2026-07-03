@@ -1,0 +1,32 @@
+---
+title: 'Kafka Deep Dive'
+description: 'A developer-focused deep dive into Apache Kafka 4.x — the log, topics and partitions, producers, consumers, delivery semantics, transactions, and running Kafka in production.'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+Apache **Kafka** is a distributed event streaming platform: a durable, replayable log that many producers write to and many consumers read from, independently and at their own pace. This course is written **for developers** — people who write producers and consumers, reason about delivery guarantees, and have to make Kafka behave correctly in production.
+
+It targets **Kafka 4.x**, which runs exclusively in **KRaft mode** — ZooKeeper has been fully removed. Every CLI example uses `--bootstrap-server`, and the client examples use the official Java `kafka-clients` API, the canonical reference every other client mirrors.
+
+## What this course covers
+
+| Module | You will learn |
+| --- | --- |
+| **Foundations & the Log** | What Kafka is, the append-only log abstraction, brokers/topics/partitions/offsets, and KRaft |
+| **Topics, Partitions & Replication** | Partitioning and ordering, keys, replication and ISR, retention and log compaction |
+| **Producing Messages** | The producer API, `acks` and durability, the idempotent producer, batching and compression |
+| **Consuming & Consumer Groups** | The poll loop, consumer groups and rebalancing (KIP-848), offset commits, delivery semantics |
+| **Delivery Semantics & Transactions** | End-to-end guarantees, transactions, exactly-once processing, error handling |
+| **Streams, Connect & Schema Registry** | Schema Registry, Kafka Connect, Kafka Streams, and choosing a processing layer |
+| **Operations & Production** | Running Kafka locally, monitoring and consumer lag, tuning, and security |
+
+## How to read it
+
+Each lesson opens with the idea in one sentence, shows real client and CLI code, has a diagram of the moving parts, and ends with a one-line takeaway plus a short quiz. Work top to bottom — later modules assume the log, partition, and offset vocabulary from these first lessons.
+
+<Callout title="The one-line takeaway">
+Kafka is a **distributed, durable, replayable log**. Producers append records; consumers read them at their own pace by tracking an **offset**. This course teaches Kafka **4.x (KRaft-only)** from a developer's seat — the API, the guarantees, and the production behavior — starting from the log itself.
+</Callout>

@@ -1,0 +1,107 @@
+---
+title: 'The Log Abstraction'
+description: 'The append-only commit log at the heart of Kafka — sequential offsets, why appends are fast, and how replay works.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Everything Kafka does rests on one data structure — an **append-only, totally-ordered log** where each record gets a monotonically increasing **offset**, and reads are just a scan starting from an offset.
+
+## What a log actually is
+
+A Kafka log is not a text file of debug lines. It is an ordered, immutable sequence of records. New records are **appended to the end**; existing records are never modified in place. Each record is assigned the next integer offset:
+
+```text
+offset:   0      1      2      3      4      5   →  (append here)
+record: [ev0]  [ev1]  [ev2]  [ev3]  [ev4]  [ev5]
+                        ▲
+              a consumer reading from offset 2
+```
+
+Because writes only ever go to the end, Kafka turns message storage into **sequential disk I/O**, which is dramatically faster than the random I/O a mutable store needs. There is no in-place update, no page to find and rewrite — just append and advance.
+
+## Reads are position-based, not destructive
+
+A consumer reads by saying "give me records starting at offset N." Kafka streams them in order. The consumer's offset is a **cursor it controls**, not something the broker mutates on delivery. This is the whole trick:
+
+- Move the cursor **backward** to **replay** — reprocess yesterday's events after fixing a bug.
+- Move it **forward** to skip.
+- Keep two cursors (two consumer groups) reading the same log at different speeds.
+
+```bash
+# Read a topic from the very beginning — replaying all retained history
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic orders --from-beginning
+```
+
+<Mermaid title="Append at the tail; each consumer holds its own read cursor" code={logDiagram} />
+
+export const logDiagram = `flowchart LR
+  prod["Producer"] -->|append| tail["log tail (next offset)"]
+  subgraph log["Partition log: offsets 0..N"]
+    tail
+  end
+  log --> curA["Group A cursor at offset 40"]
+  log --> curB["Group B cursor at offset 12 (replaying)"]`;
+
+## Ordering is per-log
+
+A single log gives you a **total order**: offset 4 always comes after offset 3. This ordering guarantee is the foundation for correctness — but it holds **within one partition**, not across a whole topic. The next module unpacks that distinction, because it shapes how you design keys and scale throughput. For now, hold the core idea: the log is ordered, append-only, and read by position.
+
+<Callout title="The one-line takeaway">
+Kafka's core primitive is an **append-only log**: records are appended to the tail and assigned an increasing **offset**, giving fast **sequential** writes. Reads are **position-based** — the consumer owns its cursor — which is exactly what makes **replay** and independent multi-consumer reads possible. A single log is **totally ordered by offset**.
+</Callout>
+
+export const quizLog = [
+  {
+    q: 'Why are Kafka writes fast?',
+    options: [
+      'Records are written to random disk locations in parallel',
+      'Writes only append to the end of the log — sequential disk I/O, no in-place updates',
+      'Everything is kept in RAM and never persisted',
+      'Kafka compresses each record with a CPU-heavy algorithm',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What happens to a record when a consumer reads it?',
+    options: [
+      'It is deleted from the log',
+      'Nothing — the record stays; the consumer just advances its own offset cursor',
+      'It is moved to an archive partition',
+      'Its offset is reset to zero',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does replay work in Kafka?',
+    options: [
+      'You ask the broker to resend deleted messages',
+      'A consumer moves its offset backward and re-reads records that are still retained in the log',
+      'You must restore from a database backup',
+      'Replay is not possible in Kafka',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What ordering guarantee does a single Kafka log provide?',
+    options: [
+      'Total ordering across an entire topic regardless of partitions',
+      'A total order by offset within that one log (partition)',
+      'No ordering guarantees at all',
+      'Ordering only by record size',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/the-log-abstraction" questions={quizLog} />
+
+<ProgressTracker client:visible id="foundations/the-log-abstraction" />

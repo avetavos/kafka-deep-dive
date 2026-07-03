@@ -1,0 +1,107 @@
+---
+title: 'The Log Abstraction'
+description: 'commit log แบบ append-only ที่เป็นหัวใจของ Kafka offset ที่เรียงตามลำดับ ทำไม append ถึงเร็ว และ replay ทำงานยังไง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+ทุกอย่างที่ Kafka ทำวางอยู่บน data structure เดียว คือ **log แบบ append-only ที่มีลำดับสมบูรณ์** ซึ่ง record แต่ละตัวได้ **offset** ที่เพิ่มขึ้นเรื่อย ๆ และการอ่านก็แค่ scan เริ่มจาก offset จุดหนึ่ง
+
+## จริง ๆ แล้ว log คืออะไร
+
+log ของ Kafka ไม่ใช่ไฟล์ text ที่มีบรรทัด debug มันคือ sequence ของ record ที่เรียงลำดับและแก้ไม่ได้ record ใหม่ถูก **append ไปท้าย** record เดิมไม่เคยถูกแก้ตรงที่เดิม record แต่ละตัวได้ offset จำนวนเต็มตัวถัดไป
+
+```text
+offset:   0      1      2      3      4      5   →  (append here)
+record: [ev0]  [ev1]  [ev2]  [ev3]  [ev4]  [ev5]
+                        ▲
+              a consumer reading from offset 2
+```
+
+เพราะการเขียนไปลงท้ายเสมอ Kafka เลยเปลี่ยนการเก็บ message ให้กลายเป็น **sequential disk I/O** ซึ่งเร็วกว่า random I/O ที่ store แบบแก้ค่าได้ต้องใช้อย่างมาก ไม่มีการ update ตรงที่เดิม ไม่ต้องหา page มาเขียนทับ มีแค่ append แล้วเลื่อนไปข้างหน้า
+
+## การอ่านอิงตำแหน่ง ไม่ทำลายข้อมูล
+
+consumer อ่านด้วยการบอกว่า "ขอ record เริ่มจาก offset N" แล้ว Kafka ก็ stream ให้ตามลำดับ offset ของ consumer คือ **cursor ที่มันคุมเอง** ไม่ใช่สิ่งที่ broker ไปแก้ตอนส่ง นี่แหละคือกลไกทั้งหมด
+
+- เลื่อน cursor **ถอยหลัง** เพื่อ **replay** ประมวลผล event ของเมื่อวานใหม่หลังแก้ bug เสร็จ
+- เลื่อน **ไปข้างหน้า** เพื่อข้าม
+- มี cursor สองอัน (consumer group สองตัว) อ่าน log เดียวกันด้วยความเร็วต่างกัน
+
+```bash
+# Read a topic from the very beginning — replaying all retained history
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic orders --from-beginning
+```
+
+<Mermaid title="append ที่ท้าย consumer แต่ละตัวถือ cursor อ่านของตัวเอง" code={logDiagram} />
+
+export const logDiagram = `flowchart LR
+  prod["Producer"] -->|append| tail["log tail (next offset)"]
+  subgraph log["Partition log: offsets 0..N"]
+    tail
+  end
+  log --> curA["Group A cursor at offset 40"]
+  log --> curB["Group B cursor at offset 12 (replaying)"]`;
+
+## ลำดับเป็นแบบต่อ log
+
+log อันเดียวให้ **ลำดับสมบูรณ์** คือ offset 4 มาหลัง offset 3 เสมอ guarantee เรื่องลำดับนี้เป็นรากฐานของความถูกต้อง แต่มันเป็นจริง **ภายใน partition เดียว** ไม่ใช่ทั้ง topic module ถัดไปจะแกะความต่างตรงนี้ให้ เพราะมันกำหนดวิธีที่คุณออกแบบ key และ scale throughput ตอนนี้ขอแค่จำไอเดียหลักไว้ log มีลำดับ, append-only และอ่านตามตำแหน่ง
+
+<Callout title="สรุปหนึ่งบรรทัด">
+primitive หลักของ Kafka คือ **log แบบ append-only** record ถูก append ไปท้ายและได้ **offset** ที่เพิ่มขึ้น ทำให้เขียนแบบ **sequential** ได้เร็ว การอ่าน **อิงตำแหน่ง** โดย consumer เป็นเจ้าของ cursor เอง ซึ่งนี่แหละคือสิ่งที่ทำให้ **replay** และการอ่านหลาย consumer แบบอิสระเป็นไปได้ log อันเดียว **มีลำดับสมบูรณ์ตาม offset**
+</Callout>
+
+export const quizLog = [
+  {
+    q: 'ทำไมการเขียนของ Kafka ถึงเร็ว',
+    options: [
+      'record ถูกเขียนไปตำแหน่งดิสก์แบบสุ่มพร้อมกันหลายจุด',
+      'การเขียน append ไปท้าย log เท่านั้น เป็น sequential disk I/O ไม่มีการ update ตรงที่เดิม',
+      'ทุกอย่างเก็บใน RAM และไม่เคย persist',
+      'Kafka บีบอัด record แต่ละตัวด้วย algorithm ที่กิน CPU หนัก',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เกิดอะไรขึ้นกับ record เมื่อ consumer อ่านมัน',
+    options: [
+      'มันถูกลบออกจาก log',
+      'ไม่มีอะไรเกิดขึ้น record ยังอยู่ consumer แค่เลื่อน offset cursor ของตัวเอง',
+      'มันถูกย้ายไป archive partition',
+      'offset ของมันถูก reset เป็นศูนย์',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'replay ใน Kafka ทำงานยังไง',
+    options: [
+      'คุณขอให้ broker ส่ง message ที่ลบไปแล้วกลับมา',
+      'consumer เลื่อน offset ถอยหลังแล้วอ่าน record ที่ยังถูก retain อยู่ใน log ซ้ำ',
+      'คุณต้อง restore จาก backup ของ database',
+      'replay ทำใน Kafka ไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'log อันเดียวของ Kafka ให้ ordering guarantee แบบไหน',
+    options: [
+      'ลำดับสมบูรณ์ทั้ง topic ไม่ว่าจะมีกี่ partition',
+      'ลำดับสมบูรณ์ตาม offset ภายใน log (partition) นั้นตัวเดียว',
+      'ไม่มี ordering guarantee เลย',
+      'เรียงตามขนาด record เท่านั้น',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/the-log-abstraction" questions={quizLog} />
+
+<ProgressTracker client:visible id="foundations/the-log-abstraction" />

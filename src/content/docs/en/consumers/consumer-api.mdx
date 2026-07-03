@@ -1,0 +1,107 @@
+---
+title: 'The Consumer API'
+description: 'Reading records with the Kafka consumer — subscribe, the poll loop, deserializers, and why polling drives everything the consumer does.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A Kafka consumer subscribes to topics and then **loops on `poll()`** — each poll returns a batch of records from the partitions assigned to it, and that same poll call is what keeps the consumer alive in its group.
+
+## Subscribe, then poll
+
+You configure a consumer with `bootstrap.servers`, a `group.id`, and **deserializers** (the mirror of the producer's serializers). Then you `subscribe()` to one or more topics and drive a **poll loop**:
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("group.id", "order-processor");          // consumer group membership
+props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+    consumer.subscribe(List.of("orders"));
+    while (true) {
+        // Wait up to 1s for records, then process whatever arrived
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+        for (ConsumerRecord<String, String> record : records) {
+            System.out.printf("p=%d off=%d key=%s val=%s%n",
+                record.partition(), record.offset(), record.key(), record.value());
+        }
+    }
+}
+```
+
+## Why the loop matters
+
+`poll()` does far more than fetch data. On each call the consumer also sends **heartbeats**, participates in group coordination, and fetches its partition assignments. If you stop polling — say, because processing a batch takes too long — the group coordinator assumes the consumer is dead and triggers a **rebalance**, reassigning its partitions elsewhere. The rule: **keep polling, and keep per-batch processing bounded.**
+
+<Mermaid title="The consumer poll loop" code={pollDiagram} />
+
+export const pollDiagram = `flowchart LR
+  sub["subscribe(topics)"] --> poll["poll(timeout)"]
+  poll --> recs["ConsumerRecords batch"]
+  recs --> proc["process each record"]
+  proc --> poll
+  poll -->|also| hb["send heartbeats + coordinate group"]`;
+
+## Each record carries its coordinates
+
+Every `ConsumerRecord` exposes its `topic()`, `partition()`, `offset()`, `key()`, `value()`, `timestamp()`, and headers. Those coordinates are what you use to commit progress and to reason about ordering — the consumer sees records **in offset order within each partition**, though records from different partitions may interleave across poll batches.
+
+<Callout title="The one-line takeaway">
+A consumer **`subscribe()`s** to topics and drives a **`poll()` loop**. `poll()` returns a batch **and** does the invisible work — heartbeats, group coordination, fetching assignments — so if you stop polling or block too long, the group **rebalances** your partitions away. Records arrive in **offset order within a partition**, each tagged with topic, partition, and offset.
+</Callout>
+
+export const quizConsumerApi = [
+  {
+    q: 'What does `poll()` do besides returning records?',
+    options: [
+      'Nothing else — it only fetches data',
+      'It also sends heartbeats, coordinates group membership, and fetches partition assignments',
+      'It commits offsets to a database',
+      'It creates new partitions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What happens if a consumer stops calling `poll()` for too long?',
+    options: [
+      'Kafka speeds up delivery',
+      'The group coordinator assumes it is dead and rebalances its partitions to other consumers',
+      'The consumer automatically scales up',
+      'Nothing; polling is optional',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is a deserializer for?',
+    options: [
+      'Compressing records before sending',
+      'Converting the raw bytes of a record\'s key/value back into typed objects on the consumer',
+      'Assigning partitions',
+      'Committing offsets',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In what order does a consumer see records?',
+    options: [
+      'Random order across the whole topic',
+      'In offset order within each partition, though partitions may interleave across batches',
+      'Newest first, always',
+      'Sorted by key',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="consumers/consumer-api" questions={quizConsumerApi} />
+
+<ProgressTracker client:visible id="consumers/consumer-api" />

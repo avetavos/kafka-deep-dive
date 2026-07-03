@@ -1,0 +1,113 @@
+---
+title: 'Brokers, Topics & Partitions'
+description: 'The anatomy of a Kafka cluster — brokers, topics split into partitions, offsets, and how partitioning scales a topic across the cluster.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **topic** is a logical stream that Kafka physically splits into **partitions** — each partition is one ordered log — and those partitions are spread across the **brokers** in the cluster, which is how one topic scales beyond a single machine.
+
+## Brokers and the cluster
+
+A **broker** is a single Kafka server process. Together, several brokers form a **cluster**. Each broker stores some of the data and handles reads and writes for the partitions it owns. Clients connect to any broker via a **bootstrap server** address; from there they discover the full cluster and which broker leads each partition.
+
+```bash
+# Create a topic with 3 partitions and 3 replicas across the cluster
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic orders --partitions 3 --replication-factor 3
+```
+
+## Topics are split into partitions
+
+A topic like `orders` is not one giant log — it is divided into a fixed number of **partitions** (`orders-0`, `orders-1`, `orders-2`). Each partition is an independent append-only log with its own offset sequence. This is the unit of both **parallelism** and **ordering**:
+
+- **Parallelism** — different partitions live on different brokers, so writes and reads spread across machines. More partitions means more throughput.
+- **Ordering** — Kafka guarantees order **within** a partition, but **not across** partitions. Offset 5 of `orders-0` has no defined order relative to offset 5 of `orders-1`.
+
+<Mermaid title="A topic spread as partitions across brokers" code={clusterDiagram} />
+
+export const clusterDiagram = `flowchart TB
+  subgraph b1["Broker 1"]
+    p0["orders-0 (leader)"]
+  end
+  subgraph b2["Broker 2"]
+    p1["orders-1 (leader)"]
+  end
+  subgraph b3["Broker 3"]
+    p2["orders-2 (leader)"]
+  end
+  topic["Topic: orders (3 partitions)"] --> p0
+  topic --> p1
+  topic --> p2`;
+
+## Locating a record: topic, partition, offset
+
+Any record in Kafka is addressed by three coordinates:
+
+- **topic** — which stream (`orders`)
+- **partition** — which log within that stream (`orders-2`)
+- **offset** — its position in that log (`offset 91`)
+
+That triple is the record's permanent address. A consumer's committed position is exactly this: "for `orders-2`, I have processed through offset 91."
+
+## Choosing a partition count
+
+Partition count is your main throughput dial, but it is not free. Each partition is files on disk and a unit of work for consumers and the controller. Too few and you cannot parallelize; too many and you pay overhead in metadata, open files, and rebalance time. A common approach: estimate target throughput, size partitions to it, and leave headroom — you can **add** partitions later, but doing so changes how keyed records map to partitions (a caveat the next module explains).
+
+<Callout title="The one-line takeaway">
+A **broker** is one Kafka server; a **cluster** is several. A **topic** is split into **partitions**, and each partition is a separate ordered log stored on some broker. Partitions are the unit of **parallelism** (spread across brokers for throughput) and of **ordering** (guaranteed within a partition, not across). Every record is addressed by **topic + partition + offset**.
+</Callout>
+
+export const quizAnatomy = [
+  {
+    q: 'What is the relationship between a topic and partitions?',
+    options: [
+      'A topic and a partition are the same thing',
+      'A topic is split into partitions; each partition is an independent ordered log',
+      'A partition contains many topics',
+      'Partitions only exist for replication, not for a single topic',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Where does Kafka guarantee record ordering?',
+    options: [
+      'Across the whole topic',
+      'Within a single partition — not across partitions of the same topic',
+      'Across the entire cluster',
+      'Kafka never guarantees ordering',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why increase the number of partitions for a topic?',
+    options: [
+      'To reduce disk usage',
+      'To increase parallelism and throughput — partitions spread reads/writes across brokers and consumers',
+      'To guarantee total ordering across the topic',
+      'It has no effect on performance',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How is a specific record uniquely located in Kafka?',
+    options: [
+      'By its timestamp alone',
+      'By the triple of topic, partition, and offset',
+      'By a global auto-increment ID across all topics',
+      'By the broker hostname',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/brokers-topics-partitions" questions={quizAnatomy} />
+
+<ProgressTracker client:visible id="foundations/brokers-topics-partitions" />

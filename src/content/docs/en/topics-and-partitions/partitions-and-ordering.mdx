@@ -1,0 +1,113 @@
+---
+title: 'Partitions & Ordering'
+description: 'Why the partition is Kafka unit of both parallelism and ordering, per-partition total order, and the tradeoff between throughput and global order.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+The **partition** is Kafka's unit of both **parallelism** and **ordering**: more partitions mean more throughput, but Kafka only guarantees order **within** a partition — never across the whole topic.
+
+## One guarantee, one scope
+
+Kafka gives you a strong ordering guarantee, but it is scoped to a single partition. Within `orders-0`, offset 5 always follows offset 4, forever. Across partitions there is **no** defined order: offset 5 of `orders-0` and offset 5 of `orders-1` could have been written in either real-time order, and consumers may read them in either order.
+
+```text
+orders-0:  [a0][a1][a2][a3]      ← totally ordered
+orders-1:  [b0][b1][b2]          ← totally ordered
+                                  ← a2 vs b1: NO defined order
+```
+
+This is not a limitation to work around so much as the price of horizontal scale. A single totally-ordered log cannot be written faster than one machine can append. Splitting into partitions lets many machines append in parallel — you trade global order for throughput.
+
+## Partitions bound consumer parallelism
+
+Within a consumer group, **a partition is read by exactly one consumer at a time**. That makes the partition count the ceiling on how many consumers can work in parallel:
+
+- 6 partitions, 3 consumers → each reads 2 partitions.
+- 6 partitions, 6 consumers → each reads 1 (maximum parallelism).
+- 6 partitions, 8 consumers → 6 work, **2 sit idle** with nothing to assign.
+
+If you want to scale consumption later, you must have provisioned enough partitions up front — consumers cannot subdivide a single partition.
+
+<Mermaid title="Partition count caps how many consumers can work in parallel" code={parallelDiagram} />
+
+export const parallelDiagram = `flowchart LR
+  subgraph topic["Topic: orders (4 partitions)"]
+    p0["orders-0"]
+    p1["orders-1"]
+    p2["orders-2"]
+    p3["orders-3"]
+  end
+  p0 --> c1["Consumer 1"]
+  p1 --> c1
+  p2 --> c2["Consumer 2"]
+  p3 --> c3["Consumer 3"]
+  idle["Consumer 4 (idle: no partition left)"]`;
+
+## The design tradeoff
+
+Choosing a partition count is choosing a point on a curve:
+
+- **More partitions** → higher throughput and more consumer parallelism, but more open files, more metadata, and longer rebalances.
+- **Fewer partitions** → simpler and cheaper, but a lower throughput ceiling.
+- **Ordering need** → if a set of events must stay strictly ordered relative to each other, they must land on the **same partition** (the next lesson shows how keys do this).
+
+The practical rule: partition for your **target throughput plus headroom**, and make sure related events that need ordering share a partition.
+
+<Callout title="The one-line takeaway">
+A **partition** is Kafka's unit of **parallelism and ordering**. Order is guaranteed **within** a partition, never across the topic — that is the price of scaling writes across machines. Within a consumer group **one partition is read by one consumer**, so the partition count **caps consumer parallelism**. Provision partitions for target throughput, and keep events that must stay ordered on the same partition.
+</Callout>
+
+export const quizOrdering = [
+  {
+    q: 'What ordering does Kafka guarantee?',
+    options: [
+      'Total ordering across an entire topic',
+      'Total ordering within a single partition, but none across partitions',
+      'Ordering by message size',
+      'No ordering at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A topic has 4 partitions and a consumer group has 6 consumers. What happens?',
+    options: [
+      'Each consumer reads part of a partition',
+      '4 consumers each read one partition; 2 consumers sit idle',
+      'The topic automatically grows to 6 partitions',
+      'The group fails to start',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does Kafka not guarantee ordering across partitions?',
+    options: [
+      'It is a bug being fixed',
+      'Splitting into independent partitions is what lets many machines write in parallel — global order would defeat that',
+      'Because consumers are single-threaded',
+      'Ordering across partitions requires ZooKeeper',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'You need a set of related events to stay strictly ordered. What must be true?',
+    options: [
+      'They must be in different partitions',
+      'They must land on the same partition',
+      'The topic must have exactly one consumer group',
+      'They must be produced with acks=0',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="topics-and-partitions/partitions-and-ordering" questions={quizOrdering} />
+
+<ProgressTracker client:visible id="topics-and-partitions/partitions-and-ordering" />
