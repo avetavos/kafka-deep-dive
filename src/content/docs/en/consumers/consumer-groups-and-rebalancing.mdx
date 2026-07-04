@@ -1,6 +1,6 @@
 ---
 title: 'Consumer Groups & Rebalancing'
-description: 'How consumer groups share partitions, what a rebalance is, and the new KIP-848 consumer rebalance protocol that is generally available in Kafka 4.x.'
+description: 'How consumer groups share partitions, what a rebalance is, and the new KIP-848 consumer rebalance protocol that is generally available in Kafka 4.x for the Java client.'
 sidebar:
   order: 2
 ---
@@ -16,7 +16,7 @@ A **consumer group** is a set of consumers that share a topic's partitions betwe
 
 ## Groups divide the work
 
-Every consumer declares a `group.id`. Kafka gives each **partition** to exactly **one** consumer within a group, so a topic with 6 partitions can be processed by up to 6 consumers in parallel. Add a 7th consumer and it sits idle — partitions, not consumers, are the ceiling on parallelism.
+Every consumer declares a `groupId`. Kafka gives each **partition** to exactly **one** consumer within a group, so a topic with 6 partitions can be processed by up to 6 consumers in parallel. Add a 7th consumer and it sits idle — partitions, not consumers, are the ceiling on parallelism.
 
 Different groups are independent: `analytics` and `billing` each get their own full copy of the stream, tracking their own offsets. Within one group, the partitions are divided.
 
@@ -47,25 +47,27 @@ export const groupDiagram = `flowchart TB
 
 ## Rebalancing
 
-When a consumer joins, leaves, or dies — or partitions are added — the group must **rebalance**: redistribute partitions among the current members. The classic protocol did this with a **stop-the-world** step: every consumer stopped processing, gave up its partitions, and waited for a new assignment. On large groups that pause hurt.
+When a consumer joins, leaves, or dies — or partitions are added — the group must **rebalance**: redistribute partitions among the current members. The classic protocol does this with a **stop-the-world** step: every consumer stops processing, gives up its partitions, and waits for a new assignment. On large groups that pause hurts.
 
-## KIP-848: the new rebalance protocol
+## KIP-848: the new rebalance protocol (Java client)
 
-Kafka 4.0 ships the **next-generation consumer rebalance protocol (KIP-848)** as **generally available**. It moves assignment logic to the broker-side **group coordinator** and makes rebalances **incremental** — only the partitions that actually move are revoked, and the rest keep processing. The result is shorter, less disruptive rebalances, especially for large groups.
+Kafka 4.0 ships the **next-generation consumer rebalance protocol (KIP-848)** as **generally available** for the **Java client**. It moves assignment logic to the broker-side **group coordinator** and makes rebalances **incremental** — only the partitions that actually move are revoked, and the rest keep processing. The result is shorter, less disruptive rebalances, especially for large groups.
 
 ```properties
-# Opt into the new consumer group protocol (KIP-848), GA in Kafka 4.0
+# Java-client opt-in: the new consumer group protocol (KIP-848), GA in Kafka 4.0
 group.protocol=consumer
 # The classic (older) protocol is still available:
 # group.protocol=classic
 ```
 
+**KafkaJS consumers — the ones this course's examples use — currently speak the classic group protocol only; there is no `group.protocol` setting to flip.** That's not a lost benefit, though: KIP-848's redesign lives mostly on the **broker-side coordinator**, so a KRaft 4.x cluster still benefits from the new coordinator's efficiency even when talking to classic-protocol consumers like KafkaJS's. Support for the new protocol in JavaScript clients (e.g. Confluent's `@confluentinc/kafka-javascript`) will arrive as it lands upstream.
+
 <Callout title="If you learned Kafka a few years ago">
-The old advice was "avoid rebalances, they stop the world." With KIP-848 (`group.protocol=consumer`, GA in Kafka 4.0) rebalances are **incremental and broker-driven** — untouched partitions keep flowing. Once activated, a group can only be downgraded to Kafka 3.4.1 or newer.
+The old advice was "avoid rebalances, they stop the world." For **Java-client** consumers, KIP-848 (`group.protocol=consumer`, GA in Kafka 4.0) makes rebalances **incremental and broker-driven** — untouched partitions keep flowing. Once activated, a group can only be downgraded to Kafka 3.4.1 or newer. **KafkaJS consumers still use the classic protocol today**, so this specific improvement does not yet apply to the examples in this course.
 </Callout>
 
 <Callout title="The one-line takeaway">
-A **consumer group** splits a topic\'s partitions among its members — one partition per consumer, so partition count caps parallelism — while separate groups each read the whole stream. Membership changes trigger a **rebalance**; Kafka 4.0 makes this far smoother with the **KIP-848** protocol (`group.protocol=consumer`), which is broker-driven and **incremental** instead of stop-the-world.
+A **consumer group** splits a topic\'s partitions among its members — one partition per consumer, so partition count caps parallelism — while separate groups each read the whole stream. Membership changes trigger a **rebalance**; Kafka 4.0's **KIP-848** protocol makes this far smoother for **Java-client** consumers (`group.protocol=consumer`, broker-driven and **incremental** instead of stop-the-world) — **KafkaJS consumers still run the classic protocol** as of today.
 </Callout>
 
 export const quizGroups = [
@@ -90,12 +92,12 @@ export const quizGroups = [
     answer: 1,
   },
   {
-    q: 'What improved about rebalancing in Kafka 4.0 with KIP-848?',
+    q: 'What improved about rebalancing in Kafka 4.0 with KIP-848, and does it apply to KafkaJS consumers today?',
     options: [
-      'Rebalances were removed entirely',
-      'Rebalances became incremental and broker-driven — only moved partitions are revoked, instead of stop-the-world',
-      'Consumers now share partitions',
-      'Offsets are no longer tracked',
+      'Rebalances were removed entirely, for every client',
+      'Rebalances became incremental and broker-driven for Java-client consumers; KafkaJS consumers still use the classic protocol',
+      'Consumers now share partitions, in every client',
+      'Offsets are no longer tracked, in every client',
     ],
     answer: 1,
   },

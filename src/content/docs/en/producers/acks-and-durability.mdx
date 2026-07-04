@@ -1,6 +1,6 @@
 ---
 title: 'Acks and Durability'
-description: 'How acks=0, acks=1, and acks=all trade latency for durability, how min.insync.replicas backs the strongest setting, and the recommended durable producer config.'
+description: 'How acks=0, acks=1, and acks=all trade latency for durability, how min.insync.replicas backs the strongest setting, and the recommended durable producer setup in KafkaJS.'
 sidebar:
   order: 2
 ---
@@ -16,7 +16,7 @@ The `acks` setting decides **how many replicas must confirm a write before Kafka
 
 ## The three levels of acks
 
-Every partition has one **leader** replica and zero or more **follower** replicas. The `acks` config controls how many of them must acknowledge a write before the producer considers `send()` successful.
+Every partition has one **leader** replica and zero or more **follower** replicas. The `acks` setting controls how many of them must acknowledge a write before the producer considers `send()` successful. These three values — `0`, `1`, and `all` — are the canonical names used across every Kafka client and the official docs:
 
 - **`acks=0`** — fire-and-forget. The producer does not wait for any acknowledgement; it counts the record as sent the moment it leaves the client. Lowest latency, but a record can be lost silently if the leader is down.
 - **`acks=1`** — leader only. The leader writes the record to its own log and replies. Fast, but if the leader crashes **before** a follower has replicated that record, the record is lost.
@@ -33,18 +33,28 @@ acks=1
 acks=all
 ```
 
+In **KafkaJS**, `acks` is not a producer-level property — it is a **per-send option** you pass to `send()`, using the same three values:
+
+```typescript
+// -1 = all (the default), 1 = leader only, 0 = fire-and-forget
+await producer.send({ topic: 'orders', acks: -1, messages })
+```
+
 ## acks=all needs min.insync.replicas to mean anything
 
 `acks=all` alone says "all replicas that are currently **in sync**." If only the leader is in sync at that moment, "all" is just the leader — and you are effectively back to `acks=1`. The broker-side `min.insync.replicas` closes this gap: it sets the **minimum** number of in-sync replicas that must be available for the write to be accepted at all.
 
 With `min.insync.replicas=2` on a topic with replication factor 3, a producer using `acks=all` needs at least **two** replicas in sync. If only one is available, the broker **rejects** the write (a `NotEnoughReplicas` error) rather than accepting a record that could vanish. That rejection is the point — you would rather fail loudly than lose data quietly.
 
-```properties
-# Recommended durable producer configuration (pair with broker/topic min.insync.replicas=2)
-acks=all
-enable.idempotence=true
-# retries defaults high in modern Kafka; delivery.timeout.ms is the real deadline
-delivery.timeout.ms=120000
+Putting this together, a durable **KafkaJS** producer pairs the per-send `acks` option (or an idempotent producer, which implies `acks: -1` internally — the next lesson covers this) with a `min.insync.replicas=2` topic:
+
+```typescript
+const producer = kafka.producer({ idempotent: true }) // implies acks: -1 internally
+
+await producer.send({
+  topic: 'orders',        // a topic configured with min.insync.replicas=2 (broker/topic setting)
+  messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }],
+})
 ```
 
 <Mermaid title="Durability climbs from acks=0 to acks=all with min.insync.replicas" code={acksDiagram} />
@@ -61,7 +71,7 @@ export const acksDiagram = `flowchart LR
 There is no free durability. Each stronger `acks` level adds a network round trip and waits on more machines, so latency rises as the guarantee strengthens. Pick by the cost of losing a record: metrics and logs can often live with `acks=1`, but orders, payments, and anything you cannot recreate should use `acks=all` with `min.insync.replicas=2`.
 
 <Callout title="The one-line takeaway">
-**`acks`** sets how many replicas must confirm a write: **`acks=0`** is fire-and-forget, **`acks=1`** is leader-only, and **`acks=all`** waits for every **in-sync replica**. Back `acks=all` with **`min.insync.replicas=2`** so the broker rejects a write it cannot make durable — trading a little **latency** for records that survive a broker failure.
+**`acks`** sets how many replicas must confirm a write: **`acks=0`** is fire-and-forget, **`acks=1`** is leader-only, and **`acks=all`** waits for every **in-sync replica**. In KafkaJS this is a **per-send option** (`producer.send({ acks: -1, ... })`). Back it with **`min.insync.replicas=2`** so the broker rejects a write it cannot make durable — trading a little **latency** for records that survive a broker failure.
 </Callout>
 
 export const quizAcks = [

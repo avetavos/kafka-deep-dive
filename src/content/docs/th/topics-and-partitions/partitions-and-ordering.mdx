@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## การันตีเดียว scope เดียว
 
-Kafka ให้การันตีลำดับที่แข็งแรง แต่ scope อยู่แค่ partition เดียว ภายใน `orders-0` offset 5 มาหลัง offset 4 เสมอตลอดไป ส่วนข้าม partition **ไม่มี** ลำดับที่แน่นอน: offset 5 ของ `orders-0` กับ offset 5 ของ `orders-1` อาจถูกเขียนก่อนหลังกันแบบไหนก็ได้ และ consumer อาจอ่านสลับลำดับกันได้.
+Kafka ให้การันตีลำดับที่แข็งแรง แต่ scope อยู่แค่ partition เดียว ภายใน `orders-0` offset 5 มาหลัง offset 4 เสมอตลอดไป ส่วนข้าม partition **ไม่มี** ลำดับที่แน่นอน: offset 5 ของ `orders-0` กับ offset 5 ของ `orders-1` อาจถูกเขียนก่อนหลังกันแบบไหนก็ได้ และ consumer อาจอ่านสลับลำดับกันได้
 
 ```text
 orders-0:  [a0][a1][a2][a3]      ← totally ordered
@@ -34,7 +34,7 @@ orders-1:  [b0][b1][b2]          ← totally ordered
 - 6 partition, 6 consumer → แต่ละตัวอ่าน 1 (parallelism สูงสุด).
 - 6 partition, 8 consumer → 6 ตัวทำงาน อีก **2 ตัวว่าง** เพราะไม่มี partition ให้ assign.
 
-ถ้าอยาก scale การ consume ทีหลัง ต้องเตรียม partition ให้พอตั้งแต่แรก — consumer แบ่งย่อย partition เดียวไม่ได้.
+ถ้าอยาก scale การ consume ทีหลัง ต้องเตรียม partition ให้พอตั้งแต่แรก — consumer แบ่งย่อย partition เดียวไม่ได้
 
 <Mermaid title="จำนวน partition คุมว่ามี consumer ทำงานพร้อมกันได้กี่ตัว" code={parallelDiagram} />
 
@@ -55,14 +55,14 @@ export const parallelDiagram = `flowchart LR
 
 การเลือกจำนวน partition คือการเลือกจุดบนเส้นโค้ง:
 
-- **Partition เยอะ** → throughput สูงและ consumer parallelism มากขึ้น แต่ open files เยอะ metadata เยอะ และ rebalance นานขึ้น.
-- **Partition น้อย** → เรียบง่ายและถูกกว่า แต่เพดาน throughput ต่ำ.
+- **Partition เยอะ** → throughput สูงและ consumer parallelism มากขึ้น แต่ open files เยอะ metadata เยอะ และ rebalance นานขึ้น
+- **Partition น้อย** → เรียบง่ายและถูกกว่า แต่เพดาน throughput ต่ำ
 - **ความต้องการ ordering** → ถ้า event ชุดหนึ่งต้องเรียงลำดับกันเป๊ะ ต้องลงที่ **partition เดียวกัน** (บทถัดไปอธิบายว่า key ทำแบบนี้ยังไง).
 
-กฎที่ใช้ได้จริง: ตั้ง partition ตาม **throughput เป้าหมายบวก headroom** และให้ event ที่ต้องเรียงลำดับกันอยู่ partition เดียวกัน.
+กฎที่ใช้ได้จริง: ตั้ง partition ตาม **throughput เป้าหมายบวก headroom** และให้ event ที่ต้องเรียงลำดับกันอยู่ partition เดียวกัน
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Partition** คือหน่วยของ **parallelism และ ordering** ลำดับการันตี **ภายใน** partition ไม่ใช่ข้าม topic — นั่นคือราคาของการ scale การเขียนข้ามเครื่อง ภายใน consumer group **partition หนึ่งอ่านโดย consumer เดียว** จำนวน partition จึง **คุมเพดาน parallelism ของ consumer** เตรียม partition ตาม throughput เป้าหมาย และเก็บ event ที่ต้องเรียงลำดับไว้ partition เดียวกัน.
+**Partition** คือหน่วยของ **parallelism และ ordering** ลำดับการันตี **ภายใน** partition ไม่ใช่ข้าม topic — นั่นคือราคาของการ scale การเขียนข้ามเครื่อง ภายใน consumer group **partition หนึ่งอ่านโดย consumer เดียว** จำนวน partition จึง **คุมเพดาน parallelism ของ consumer** เตรียม partition ตาม throughput เป้าหมาย และเก็บ event ที่ต้องเรียงลำดับไว้ partition เดียวกัน
 </Callout>
 
 export const quizOrdering = [

@@ -1,6 +1,6 @@
 ---
 title: 'Batching and Compression'
-description: 'How linger.ms and batch.size trade latency for throughput, the compression codecs, buffer.memory back-pressure, and delivery.timeout.ms as the total send deadline.'
+description: 'How linger.ms and batch.size trade latency for throughput, compressing batches with KafkaJS, buffer.memory back-pressure, and delivery.timeout.ms as the canonical send deadline.'
 sidebar:
   order: 4
 ---
@@ -12,11 +12,11 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-The producer **groups records into batches** and optionally **compresses** them, so a little extra waiting (`linger.ms`) and bigger batches (`batch.size`) buy dramatically higher **throughput** — as long as writes stay inside `delivery.timeout.ms`.
+A producer **groups records into batches** and optionally **compresses** them, so a little extra waiting and bigger batches buy dramatically higher **throughput** — a concept every Kafka client implements, even where the exact knobs differ.
 
 ## linger.ms and batch.size trade latency for throughput
 
-The producer does not send each record on its own. It accumulates records per partition into a **batch** and sends the batch as one request. Two settings shape that batch:
+A producer does not send each record on its own. It accumulates records per partition into a **batch** and sends the batch as one request. Two canonical settings shape that batch — these are the **Java-client / librdkafka config names** you will meet in the official docs and most other clients:
 
 - **`batch.size`** — the maximum size in **bytes** of a single batch. A batch ships when it fills up to this size (or when `linger.ms` elapses).
 - **`linger.ms`** — how long the producer will **wait** for more records before sending a not-yet-full batch. It defaults to `0` (send as soon as possible). Raising it to, say, `10` lets more records accumulate, producing fuller batches.
@@ -29,9 +29,11 @@ linger.ms=10
 batch.size=65536
 ```
 
-## compression.type shrinks batches on the wire
+**KafkaJS has no `linger.ms` or `batch.size` knobs.** It batches the messages you pass to a single `send()` call internally and transmits them together — you control batching by how you group messages into `send()` calls (e.g. buffering records yourself and sending them in one array), not by a linger timer.
 
-Compression is applied **per batch**, so bigger batches compress better. The `compression.type` config picks the codec, each a different point on the speed-versus-ratio curve:
+## Compressing batches
+
+Compression is applied **per batch**, so bigger batches compress better. Every client picks a codec along the same speed-versus-ratio curve:
 
 - **`lz4`** — very fast, good ratio; a common default choice.
 - **`zstd`** — excellent ratio, still fast; great when network or storage is the bottleneck.
@@ -39,16 +41,25 @@ Compression is applied **per batch**, so bigger batches compress better. The `co
 - **`gzip`** — best ratio, but the most CPU-heavy and slowest.
 - **`none`** — no compression (the default).
 
-```properties
-# Compress each batch; lz4 and zstd are the usual picks for throughput
-compression.type=lz4
+In the Java client this is the `compression.type` property. In **KafkaJS**, compression is a **per-send option** using `CompressionTypes`:
+
+```typescript
+import { Kafka, CompressionTypes } from 'kafkajs'
+
+// KafkaJS ships GZIP natively; snappy/lz4/zstd need an extra codec
+// package registered via CompressionCodecs before you can use them.
+await producer.send({
+  topic: 'orders',
+  compression: CompressionTypes.GZIP,
+  messages,
+})
 ```
 
 ## buffer.memory, back-pressure, and the delivery deadline
 
-Because `send()` is asynchronous, records sit in an in-memory buffer before the I/O thread transmits them. `buffer.memory` caps the total size of that buffer. When it fills — because the app produces faster than the network can drain — `send()` **blocks** (up to `max.block.ms`), applying **back-pressure** so a fast producer cannot exhaust memory.
+Because `send()` is asynchronous, records sit in an in-memory buffer before the I/O layer transmits them. In the Java client, `buffer.memory` caps the total size of that buffer; when it fills, `send()` **blocks** (up to `max.block.ms`), applying **back-pressure** so a fast producer cannot exhaust memory. **KafkaJS exposes no equivalent buffer setting** — it does not pre-buffer records ahead of `send()` the way the Java client does, so there is no `buffer.memory`/`max.block.ms` pair to tune.
 
-Two timeouts bound the whole journey. `delivery.timeout.ms` (default **120000**) is the **total deadline** from the moment `send()` returns until the record is acknowledged — it covers batching delay, network sends, **and all retries**. It should be **>= `request.timeout.ms` + `linger.ms`**. If a record cannot be delivered within it, the send fails permanently.
+The Java client also bounds the whole journey with a deadline: `delivery.timeout.ms` (default **120000**) is the **total deadline** from the moment `send()` returns until the record is acknowledged — it covers batching delay, network sends, **and all retries**. It should be **>= `request.timeout.ms` + `linger.ms`**. If a record cannot be delivered within it, the send fails permanently.
 
 ```properties
 # 32 MiB send buffer; when full, send() applies back-pressure and blocks
@@ -57,6 +68,8 @@ buffer.memory=33554432
 delivery.timeout.ms=120000
 request.timeout.ms=30000
 ```
+
+**KafkaJS achieves the same end goal — bounding how long a send may keep retrying — differently**: via the client-wide `retry` policy (`retries`, `initialRetryTime`, `maxRetryTime`), covered in [Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/). There is no single deadline property; retries simply stop once the policy's retry count is exhausted.
 
 <Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
 
@@ -69,15 +82,15 @@ export const batchDiagram = `flowchart LR
 
 ## Tuning for throughput
 
-To push throughput up, raise `linger.ms` a little (5-20 ms), enlarge `batch.size`, and turn on `lz4` or `zstd` compression — the three work together, since more waiting makes fuller batches and fuller batches compress better. Keep `buffer.memory` comfortable so back-pressure does not stall you, and make sure `delivery.timeout.ms` is generous enough to absorb retries during a broker hiccup.
+In the Java client, push throughput up by raising `linger.ms` a little (5-20 ms), enlarging `batch.size`, and turning on `lz4` or `zstd` compression — the three work together, since more waiting makes fuller batches and fuller batches compress better. Keep `buffer.memory` comfortable so back-pressure does not stall you, and make sure `delivery.timeout.ms` is generous enough to absorb retries during a broker hiccup. In **KafkaJS**, since there are no batching knobs to tune, focus your throughput work on: sending larger arrays of messages per `send()` call, choosing `compression: CompressionTypes.GZIP` (or a registered LZ4/ZSTD codec), and sizing the `retry` policy generously enough to ride out broker hiccups.
 
 <Callout title="The one-line takeaway">
-The producer batches records: **`linger.ms`** and **`batch.size`** trade a little **latency** for much higher **throughput**, and **`compression.type`** (**lz4**, **zstd**, snappy, gzip) shrinks each batch. **`buffer.memory`** applies **back-pressure** when full, and **`delivery.timeout.ms`** (default **120000**) is the total send deadline covering all retries.
+The Java client batches records with **`linger.ms`** and **`batch.size`** (a little **latency** for much higher **throughput**), compresses each batch with **`compression.type`**, applies **back-pressure** via **`buffer.memory`**, and bounds the whole send with **`delivery.timeout.ms`** (default **120000**). **KafkaJS has no linger/batch-size/buffer knobs** — it batches per `send()` call automatically, compresses via the **`compression`** option on `send()`, and bounds retries with its client-wide **`retry`** policy instead of a single deadline.
 </Callout>
 
 export const quizBatching = [
   {
-    q: 'What do linger.ms and batch.size trade off?',
+    q: 'What do linger.ms and batch.size trade off in the Java client?',
     options: [
       'Durability for security',
       'A little latency for higher throughput via fuller batches',
@@ -97,22 +110,22 @@ export const quizBatching = [
     answer: 2,
   },
   {
-    q: 'What happens when buffer.memory fills up?',
+    q: 'How does KafkaJS handle producer-side batching, compared to the Java client?',
     options: [
-      'Records are dropped silently',
-      'send() blocks, applying back-pressure so the producer cannot exhaust memory',
-      'The producer switches to acks=0',
-      'The broker deletes old records',
+      'It exposes the same linger.ms and batch.size properties',
+      'It has no linger/batch-size knobs — it batches the messages in one send() call internally, with no linger timer',
+      'It refuses to batch records at all',
+      'It requires a separate batching library',
     ],
     answer: 1,
   },
   {
-    q: 'What does delivery.timeout.ms (default 120000) bound?',
+    q: 'What does delivery.timeout.ms (default 120000) bound in the Java client, and how does KafkaJS achieve the same goal?',
     options: [
-      'Only the time to serialize a record',
-      'The total deadline from send() to acknowledgement, covering batching and all retries',
-      'How long a consumer may lag',
-      'The retention period of the topic',
+      'Only the time to serialize a record; KafkaJS has an identical property',
+      'The total deadline from send() to acknowledgement, covering batching and all retries; KafkaJS bounds retries instead via its client-wide retry policy',
+      'How long a consumer may lag; KafkaJS has no equivalent concept',
+      'The retention period of the topic; KafkaJS sets this per producer',
     ],
     answer: 1,
   },

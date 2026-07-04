@@ -1,6 +1,6 @@
 ---
 title: 'The Idempotent Producer'
-description: 'How enable.idempotence stops retries from creating duplicates using a producer id, epoch, and sequence numbers, its config requirements, and why it is not the same as transactions.'
+description: 'How idempotence stops retries from creating duplicates using a producer id, epoch, and sequence numbers, why it is the default in the Java client but an explicit opt-in in KafkaJS, and why it is not the same as transactions.'
 sidebar:
   order: 3
 ---
@@ -18,17 +18,28 @@ An **idempotent producer** tags every record with a producer id, epoch, and per-
 
 Without idempotence, a retry can silently duplicate a record. The producer sends a record, the broker writes it, but the acknowledgement is lost on the way back. The producer times out, retries, and the broker writes the **same record a second time**. You now have two copies and no way to tell them apart.
 
-`enable.idempotence=true` — the **default** in modern Kafka — fixes this. The broker assigns each producer a **producer id (PID)** and an **epoch**, and the producer stamps every record with a **monotonically increasing sequence number** per partition. When a record arrives, the broker checks the sequence number: if it has already seen it for that PID and partition, it **acknowledges but does not write** the record again.
+Idempotence fixes this: the broker assigns each producer a **producer id (PID)** and an **epoch**, and the producer stamps every record with a **monotonically increasing sequence number** per partition. When a record arrives, the broker checks the sequence number: if it has already seen it for that PID and partition, it **acknowledges but does not write** the record again.
+
+<Callout title="On by default — but only in the Java client">
+`enable.idempotence=true` is the **default in the Java client** (since Kafka 3.0). **KafkaJS defaults the other way — `idempotent: false`** — so you must opt in explicitly. Do not assume a KafkaJS producer is idempotent unless you set it yourself.
+</Callout>
 
 ```properties
-# Idempotence is on by default in modern Kafka; shown explicitly here
+# The Java client: idempotence is on by default; shown explicitly here
 enable.idempotence=true
-# These are implied/required by idempotence:
+# acks=all is required and applied automatically once idempotence is on
 acks=all
 # retries must be > 0 (defaults high) so the producer actually retries
 retries=2147483647
 # ordering is preserved only if in-flight requests per connection stays <= 5
 max.in.flight.requests.per.connection=5
+```
+
+**KafkaJS** requires an explicit opt-in on the producer. It then enforces the equivalent requirements internally — you do not set `acks` or in-flight limits separately:
+
+```typescript
+// idempotent: true implies acks: -1 (all) internally, and caps in-flight requests
+const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 5 })
 ```
 
 ## What it requires, and what it guarantees
@@ -38,6 +49,8 @@ Idempotence is not free-standing — it needs a specific configuration to hold i
 - **`acks=all`** — the record must be confirmed by all in-sync replicas.
 - **`retries > 0`** — retries are what create duplicates in the first place; without them there is nothing to dedupe.
 - **`max.in.flight.requests.per.connection <= 5`** — up to five in-flight batches are allowed while **still preserving ordering**, because the broker tracks sequence numbers and rejects anything out of order.
+
+These are protocol-level requirements, not just Java-client trivia: in KafkaJS, passing `idempotent: true` makes the client apply the equivalent guarantees internally, which is why you do not configure `acks` yourself on an idempotent KafkaJS producer.
 
 When those hold, you get **exactly-once delivery per partition on retries**: no matter how many times a record is retried, it is written **once**. The **epoch** is what makes this safe across producer restarts and network partitions — a newer epoch **fences** an older, possibly zombie, producer instance so stale writes are refused.
 
@@ -54,10 +67,10 @@ export const idempotentDiagram = `flowchart LR
 
 This is a common mix-up. Idempotence guarantees a record is written **once per partition** despite retries — but that is the **only** thing it does. It does **not** make a multi-record, multi-partition write atomic, and it does **not** tie a producer write to a consumer offset commit.
 
-That stronger guarantee — atomic writes across partitions and true exactly-once processing — is what **transactions** provide, built **on top of** the idempotent producer. The Delivery Semantics and Transactions module covers `transactional.id`, `beginTransaction()`, and `commitTransaction()`. For now, hold the boundary: idempotence removes retry duplicates; transactions add atomicity.
+That stronger guarantee — atomic writes across partitions and true exactly-once processing — is what **transactions** provide, built **on top of** the idempotent producer. The Delivery Semantics and Transactions module covers `transactionalId`, `producer.transaction()`, and `txn.commit()`. For now, hold the boundary: idempotence removes retry duplicates; transactions add atomicity.
 
 <Callout title="The one-line takeaway">
-**`enable.idempotence=true`** (the default) stamps records with a **producer id**, **epoch**, and **sequence number** so the broker discards retry **duplicates**, giving **exactly-once per partition**. It requires **`acks=all`**, **`retries > 0`**, and **`max.in.flight.requests.per.connection <= 5`** — and it is **not** the same as full **transactions**.
+An idempotent producer stamps records with a **producer id**, **epoch**, and **sequence number** so the broker discards retry **duplicates**, giving **exactly-once per partition**. It requires **`acks=all`**, **`retries > 0`**, and **`max.in.flight.requests.per.connection <= 5`**. It is the **default in the Java client**, but in **KafkaJS you must opt in** with `idempotent: true` — and it is **not** the same as full **transactions**.
 </Callout>
 
 export const quizIdempotent = [
@@ -82,12 +95,12 @@ export const quizIdempotent = [
     answer: 1,
   },
   {
-    q: 'Which settings does enable.idempotence require to hold its guarantee?',
+    q: 'Is idempotence enabled by default in KafkaJS?',
     options: [
-      'acks=0 and retries=0',
-      'acks=all, retries > 0, and max.in.flight.requests.per.connection <= 5',
-      'A dedicated transactional.id and beginTransaction()',
-      'compression.type=zstd and a large batch.size',
+      'Yes, exactly like the Java client',
+      'No — KafkaJS defaults to idempotent: false; you must opt in explicitly on the producer',
+      'Only when a transactionalId is set',
+      'Only on the consumer side',
     ],
     answer: 1,
   },

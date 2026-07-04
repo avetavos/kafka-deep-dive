@@ -1,6 +1,6 @@
 ---
 title: 'Batching กับ Compression'
-description: 'linger.ms และ batch.size แลก latency กับ throughput อย่างไร codec ของ compression buffer.memory กับ back-pressure และ delivery.timeout.ms ในฐานะเส้นตายรวมของการส่ง.'
+description: 'linger.ms และ batch.size แลก latency กับ throughput อย่างไร การ compress batch ด้วย KafkaJS buffer.memory กับ back-pressure และ delivery.timeout.ms ในฐานะเส้นตายมาตรฐานของการส่ง'
 sidebar:
   order: 4
 ---
@@ -12,16 +12,16 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-producer **รวม record เป็น batch** และ **compress** ตามต้องการ ดังนั้นการรอเพิ่มอีกนิด (`linger.ms`) กับ batch ที่ใหญ่ขึ้น (`batch.size`) จึงซื้อ **throughput** ที่สูงขึ้นมาก — ตราบใดที่ write ยังอยู่ในกรอบ `delivery.timeout.ms`.
+producer **รวม record เป็น batch** และ **compress** ตามต้องการ ดังนั้นการรอเพิ่มอีกนิดกับ batch ที่ใหญ่ขึ้นจึงซื้อ **throughput** ที่สูงขึ้นมาก — เป็นแนวคิดที่ทุก client ของ Kafka ทำ แม้ปุ่มปรับจริงจะต่างกัน
 
 ## linger.ms กับ batch.size แลก latency กับ throughput
 
-producer ไม่ได้ส่งทีละ record มันสะสม record ต่อ partition เข้าเป็น **batch** แล้วส่ง batch เป็น request เดียว มีสองค่าที่กำหนดรูปร่างของ batch:
+producer ไม่ได้ส่งทีละ record มันสะสม record ต่อ partition เข้าเป็น **batch** แล้วส่ง batch เป็น request เดียว มีสองค่ามาตรฐานที่กำหนดรูปร่างของ batch — นี่คือ **ชื่อ config ของ Java client / librdkafka** ที่คุณจะเจอใน official docs และ client ส่วนใหญ่:
 
-- **`batch.size`** — ขนาดสูงสุดเป็น **byte** ของ batch เดียว batch จะถูกส่งเมื่อเต็มถึงขนาดนี้ (หรือเมื่อ `linger.ms` หมดเวลา).
-- **`linger.ms`** — producer จะ **รอ** record เพิ่มนานแค่ไหนก่อนส่ง batch ที่ยังไม่เต็ม ค่า default คือ `0` (ส่งให้เร็วที่สุด) เพิ่มเป็น เช่น `10` จะให้ record สะสมได้มากขึ้น เกิด batch ที่เต็มกว่า.
+- **`batch.size`** — ขนาดสูงสุดเป็น **byte** ของ batch เดียว batch จะถูกส่งเมื่อเต็มถึงขนาดนี้ (หรือเมื่อ `linger.ms` หมดเวลา)
+- **`linger.ms`** — producer จะ **รอ** record เพิ่มนานแค่ไหนก่อนส่ง batch ที่ยังไม่เต็ม ค่า default คือ `0` (ส่งให้เร็วที่สุด) เพิ่มเป็น เช่น `10` จะให้ record สะสมได้มากขึ้น เกิด batch ที่เต็มกว่า
 
-batch ที่ใหญ่ขึ้นหมายถึง request น้อยลง compress ได้ดีขึ้น และ throughput สูงขึ้น — แลกกับ latency ที่เพิ่มไม่กี่ millisecond ต่อ record นี่คือคันโยกหลัก.
+batch ที่ใหญ่ขึ้นหมายถึง request น้อยลง compress ได้ดีขึ้น และ throughput สูงขึ้น — แลกกับ latency ที่เพิ่มไม่กี่ millisecond ต่อ record นี่คือคันโยกหลัก
 
 ```properties
 # Wait up to 10 ms to fill a batch, and allow bigger batches for throughput
@@ -29,26 +29,37 @@ linger.ms=10
 batch.size=65536
 ```
 
-## compression.type ย่อ batch บนสาย
+**KafkaJS ไม่มีปุ่ม `linger.ms` หรือ `batch.size`** มันรวม message ที่คุณส่งใน `send()` ครั้งเดียวเข้าด้วยกันเองแล้วส่งพร้อมกัน — คุณคุม batching ด้วยวิธีจัดกลุ่ม message เข้า `send()` แต่ละครั้ง (เช่น buffer record เองแล้วส่งเป็น array เดียว) ไม่ใช่ด้วย linger timer
 
-compression ถูกทำ **ต่อ batch** ดังนั้น batch ที่ใหญ่กว่าจึง compress ได้ดีกว่า ค่า `compression.type` เลือก codec แต่ละตัวอยู่คนละจุดบนเส้นความเร็วต่ออัตราการย่อ:
+## Compress batch
 
-- **`lz4`** — เร็วมาก อัตราย่อดี เป็นตัวเลือก default ที่นิยม.
-- **`zstd`** — อัตราย่อเยี่ยม ยังเร็วอยู่ เหมาะเมื่อ network หรือ storage เป็นคอขวด.
-- **`snappy`** — เร็ว อัตราย่อพอประมาณ.
-- **`gzip`** — อัตราย่อดีสุด แต่กิน CPU มากสุดและช้าสุด.
-- **`none`** — ไม่ compress (ค่า default).
+compression ถูกทำ **ต่อ batch** ดังนั้น batch ที่ใหญ่กว่าจึง compress ได้ดีกว่า ทุก client เลือก codec บนเส้นความเร็วต่ออัตราการย่อเดียวกัน:
 
-```properties
-# Compress each batch; lz4 and zstd are the usual picks for throughput
-compression.type=lz4
+- **`lz4`** — เร็วมาก อัตราย่อดี เป็นตัวเลือก default ที่นิยม
+- **`zstd`** — อัตราย่อเยี่ยม ยังเร็วอยู่ เหมาะเมื่อ network หรือ storage เป็นคอขวด
+- **`snappy`** — เร็ว อัตราย่อพอประมาณ
+- **`gzip`** — อัตราย่อดีสุด แต่กิน CPU มากสุดและช้าสุด
+- **`none`** — ไม่ compress (ค่า default)
+
+ใน Java client นี่คือ property `compression.type` ใน **KafkaJS** compression เป็น **option ต่อการ send** ที่ใช้ `CompressionTypes`:
+
+```typescript
+import { Kafka, CompressionTypes } from 'kafkajs'
+
+// KafkaJS ships GZIP natively; snappy/lz4/zstd need an extra codec
+// package registered via CompressionCodecs before you can use them.
+await producer.send({
+  topic: 'orders',
+  compression: CompressionTypes.GZIP,
+  messages,
+})
 ```
 
 ## buffer.memory, back-pressure และเส้นตายของการส่ง
 
-เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O thread จะส่งออก `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อมันเต็ม — เพราะแอปผลิตเร็วกว่าที่ network จะระบายทัน — `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด.
+เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O layer จะส่งออก ใน Java client `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อมันเต็ม `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด **KafkaJS ไม่มี setting buffer แบบนี้ให้ปรับ** มันไม่ได้ pre-buffer record ก่อน `send()` แบบที่ Java client ทำ จึงไม่มีคู่ `buffer.memory`/`max.block.ms` ให้จูน
 
-มีสอง timeout ที่คุมทั้งเส้นทาง `delivery.timeout.ms` (ค่า default **120000**) คือ **เส้นตายรวม** ตั้งแต่ตอน `send()` คืนค่าจนถึงตอน record ถูก acknowledge — ครอบคลุมทั้ง delay ของ batching, การส่งผ่าน network **และ retry ทั้งหมด** ควรตั้งให้ **>= `request.timeout.ms` + `linger.ms`** ถ้าส่ง record ไม่สำเร็จภายในเวลานี้ การ send จะ fail ถาวร.
+Java client ยังคุมทั้งเส้นทางด้วยเส้นตาย: `delivery.timeout.ms` (ค่า default **120000**) คือ **เส้นตายรวม** ตั้งแต่ตอน `send()` คืนค่าจนถึงตอน record ถูก acknowledge — ครอบคลุมทั้ง delay ของ batching, การส่งผ่าน network **และ retry ทั้งหมด** ควรตั้งให้ **>= `request.timeout.ms` + `linger.ms`** ถ้าส่ง record ไม่สำเร็จภายในเวลานี้ การ send จะ fail ถาวร
 
 ```properties
 # 32 MiB send buffer; when full, send() applies back-pressure and blocks
@@ -57,6 +68,8 @@ buffer.memory=33554432
 delivery.timeout.ms=120000
 request.timeout.ms=30000
 ```
+
+**KafkaJS บรรลุเป้าหมายเดียวกัน — จำกัดว่า send จะ retry ได้นานแค่ไหน — ด้วยวิธีต่างออกไป**: ผ่าน **`retry`** policy ระดับ client (`retries`, `initialRetryTime`, `maxRetryTime`) ซึ่งอยู่ใน [Error Handling & Retries](/kafka/th/delivery-and-transactions/error-handling-retries/) ไม่มี deadline เดี่ยว ๆ retry จะหยุดเองเมื่อจำนวนครั้งใน policy หมด
 
 <Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
 
@@ -69,15 +82,15 @@ export const batchDiagram = `flowchart LR
 
 ## จูนเพื่อ throughput
 
-ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด.
+ใน Java client ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด ใน **KafkaJS** เพราะไม่มีปุ่ม batching ให้จูน ให้เน้นงาน throughput ที่: ส่ง message array ที่ใหญ่ขึ้นต่อการ `send()` หนึ่งครั้ง เลือก `compression: CompressionTypes.GZIP` (หรือ codec LZ4/ZSTD ที่ลงทะเบียนไว้) และตั้ง `retry` policy ให้กว้างพอจะทนต่อ broker สะดุด
 
 <Callout title="สรุปหนึ่งบรรทัด">
-producer รวม record เป็น batch: **`linger.ms`** และ **`batch.size`** แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก และ **`compression.type`** (**lz4**, **zstd**, snappy, gzip) ย่อแต่ละ batch **`buffer.memory`** ใส่ **back-pressure** เมื่อเต็ม และ **`delivery.timeout.ms`** (ค่า default **120000**) คือเส้นตายรวมของการส่งที่ครอบคลุม retry ทั้งหมด.
+Java client รวม record เป็น batch ด้วย **`linger.ms`** และ **`batch.size`** (แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก) compress แต่ละ batch ด้วย **`compression.type`** ใส่ **back-pressure** ผ่าน **`buffer.memory`** และคุมทั้งการส่งด้วย **`delivery.timeout.ms`** (ค่า default **120000**) **KafkaJS ไม่มีปุ่ม linger/batch-size/buffer** มันรวม batch เองต่อการ `send()` แต่ละครั้ง compress ผ่าน option **`compression`** บน `send()` และคุม retry ด้วย **`retry`** policy ระดับ client แทนเส้นตายเดี่ยว ๆ
 </Callout>
 
 export const quizBatching = [
   {
-    q: 'linger.ms และ batch.size แลกอะไรกับอะไร',
+    q: 'linger.ms และ batch.size ใน Java client แลกอะไรกับอะไร',
     options: [
       'durability แลกกับ security',
       'latency นิดหน่อยแลกกับ throughput ที่สูงขึ้นผ่าน batch ที่เต็มกว่า',
@@ -97,22 +110,22 @@ export const quizBatching = [
     answer: 2,
   },
   {
-    q: 'เกิดอะไรขึ้นเมื่อ buffer.memory เต็ม',
+    q: 'KafkaJS จัดการ batching ฝั่ง producer ยังไง เทียบกับ Java client',
     options: [
-      'record ถูกทิ้งเงียบ ๆ',
-      'send() block ใส่ back-pressure เพื่อไม่ให้ producer ใช้หน่วยความจำจนหมด',
-      'producer สลับไปใช้ acks=0',
-      'broker ลบ record เก่า',
+      'มัน expose property linger.ms และ batch.size แบบเดียวกัน',
+      'มันไม่มีปุ่ม linger/batch-size — มันรวม message ใน send() ครั้งเดียวเองภายใน ไม่มี linger timer',
+      'มันไม่ batch record เลย',
+      'ต้องใช้ library แยกสำหรับ batching',
     ],
     answer: 1,
   },
   {
-    q: 'delivery.timeout.ms (ค่า default 120000) คุมอะไร',
+    q: 'delivery.timeout.ms (ค่า default 120000) ใน Java client คุมอะไร และ KafkaJS บรรลุเป้าหมายเดียวกันยังไง',
     options: [
-      'แค่เวลาในการ serialize record',
-      'เส้นตายรวมตั้งแต่ send() จนถึง acknowledge ครอบคลุม batching และ retry ทั้งหมด',
-      'consumer lag ได้นานแค่ไหน',
-      'ระยะเวลา retention ของ topic',
+      'แค่เวลาในการ serialize record; KafkaJS มี property เดียวกันเป๊ะ',
+      'เส้นตายรวมตั้งแต่ send() จนถึง acknowledge ครอบคลุม batching และ retry ทั้งหมด; KafkaJS คุม retry ผ่าน retry policy ระดับ client แทน',
+      'consumer lag ได้นานแค่ไหน; KafkaJS ไม่มีแนวคิดนี้เลย',
+      'ระยะเวลา retention ของ topic; KafkaJS ตั้งค่านี้ต่อ producer',
     ],
     answer: 1,
   },

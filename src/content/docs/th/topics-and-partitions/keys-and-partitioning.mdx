@@ -29,11 +29,11 @@ await producer.send({
 })
 ```
 
-สำหรับ key ที่ **ไม่ null** default partitioner คำนวณประมาณ `hash(key) % numberOfPartitions` การ hash แบบ deterministic ทำให้ทุก record ของ `user-42` ไป partition เดียวกัน event ของ user นั้นจึงอยู่ใน log เดียวที่ ordered ทั้งหมด ส่วน key ต่างกันก็กระจายไปคนละ partition ช่วยบาลานซ์โหลด.
+สำหรับ key ที่ **ไม่ null** default partitioner คำนวณประมาณ `hash(key) % numberOfPartitions` การ hash แบบ deterministic ทำให้ทุก record ของ `user-42` ไป partition เดียวกัน event ของ user นั้นจึงอยู่ใน log เดียวที่ ordered ทั้งหมด ส่วน key ต่างกันก็กระจายไปคนละ partition ช่วยบาลานซ์โหลด
 
 ## Null key กับ sticky partitioner
 
-ถ้า key เป็น `null` แปลว่าคุณไม่สนว่า record ลง partition ไหน สนแค่ให้กระจายเท่ากัน Kafka ใช้ **sticky partitioner**: ส่ง batch ของ record null-key ไป **partition เดียว** จน batch เต็มหรือ `linger.ms` หมด แล้วค่อยเปลี่ยน partition การ stick กับ partition เดียวต่อ batch ทำให้ได้ batch ใหญ่และมีประสิทธิภาพกว่า (request น้อยลงแต่ใหญ่ขึ้น) และยังกระจายเท่ากันเมื่อเวลาผ่านไป.
+ถ้า key เป็น `null` แปลว่าคุณไม่สนว่า record ลง partition ไหน สนแค่ให้กระจายเท่ากัน Kafka ใช้ **sticky partitioner**: ส่ง batch ของ record null-key ไป **partition เดียว** จน batch เต็มหรือ `linger.ms` หมด แล้วค่อยเปลี่ยน partition การ stick กับ partition เดียวต่อ batch ทำให้ได้ batch ใหญ่และมีประสิทธิภาพกว่า (request น้อยลงแต่ใหญ่ขึ้น) และยังกระจายเท่ากันเมื่อเวลาผ่านไป
 
 <Mermaid title="record ที่มี key hash ไป partition คงที่ ส่วน null key batch แบบ sticky" code={keyDiagram} />
 
@@ -44,12 +44,12 @@ export const keyDiagram = `flowchart TB
 
 ## ข้อควรระวังเรื่องเพิ่ม partition
 
-เพราะ mapping คือ `hash(key) % numberOfPartitions` การ **เปลี่ยนจำนวน partition ทำให้ key ลง partition เปลี่ยน** เพิ่ม partition ให้ topic ที่ใช้งานอยู่ แล้ว `user-42` อาจ hash ไป partition ใหม่ — event ในอนาคตของมันไปคนละที่กับของเดิม ทำลาย ordering ต่อ key ที่คุณพึ่งพาอยู่.
+เพราะ mapping คือ `hash(key) % numberOfPartitions` การ **เปลี่ยนจำนวน partition ทำให้ key ลง partition เปลี่ยน** เพิ่ม partition ให้ topic ที่ใช้งานอยู่ แล้ว `user-42` อาจ hash ไป partition ใหม่ — event ในอนาคตของมันไปคนละที่กับของเดิม ทำลาย ordering ต่อ key ที่คุณพึ่งพาอยู่
 
 ผลในทางปฏิบัติ:
 
-- เตรียม partition ให้พอ **ตั้งแต่แรก** สำหรับ topic ที่ใช้ key และ ordering สำคัญ.
-- ถ้าจำเป็นต้องขยาย ต้องเข้าใจว่า ordering ต่อ key ของเดิมถูกรักษาไว้แค่ภายในแต่ละ partition เก่า ไม่ข้ามเส้นแบ่ง.
+- เตรียม partition ให้พอ **ตั้งแต่แรก** สำหรับ topic ที่ใช้ key และ ordering สำคัญ
+- ถ้าจำเป็นต้องขยาย ต้องเข้าใจว่า ordering ต่อ key ของเดิมถูกรักษาไว้แค่ภายในแต่ละ partition เก่า ไม่ข้ามเส้นแบ่ง
 
 ## Co-partitioning สำหรับ join
 

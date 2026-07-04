@@ -37,7 +37,7 @@ before compaction:  (a,1)(b,1)(a,2)(c,1)(b,2)(a,3)
 after compaction:   (c,1)(b,2)(a,3)     ← latest value per key survives
 ```
 
-แบบนี้เปลี่ยน topic ให้เป็น **snapshot ของ state ปัจจุบันตาม key** ที่ durable และ replay ได้ — เหมาะกับ changelog, config และ state store ที่ Kafka Streams เก็บ consumer ใหม่เอี่ยมอ่านทั้ง compacted topic แล้วสร้าง state ล่าสุดของทุก key ขึ้นมาใหม่ได้.
+แบบนี้เปลี่ยน topic ให้เป็น **snapshot ของ state ปัจจุบันตาม key** ที่ durable และ replay ได้ — เหมาะกับ changelog, config และ state store ที่ Kafka Streams เก็บ consumer ใหม่เอี่ยมอ่านทั้ง compacted topic แล้วสร้าง state ล่าสุดของทุก key ขึ้นมาใหม่ได้
 
 <Mermaid title="delete ทิ้ง segment เก่า ส่วน compact เก็บค่าล่าสุดต่อ key" code={retentionDiagram} />
 
@@ -49,7 +49,7 @@ export const retentionDiagram = `flowchart TB
 
 ## Tombstone: ลบ key
 
-ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บมันไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น.
+ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บมันไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น
 
 ```typescript
 // Tombstone: null value tells a compacted topic to forget this key
@@ -59,7 +59,7 @@ await producer.send({
 })
 ```
 
-รวม policy ได้ด้วย `cleanup.policy=compact,delete` เพื่อ compact ตาม key **และ** ยังทยอยลบข้อมูลที่เก่ามากออกไป.
+รวม policy ได้ด้วย `cleanup.policy=compact,delete` เพื่อ compact ตาม key **และ** ยังทยอยลบข้อมูลที่เก่ามากออกไป
 
 ## เลือก policy
 
