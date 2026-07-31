@@ -60,11 +60,11 @@ KafkaStreams streams = new KafkaStreams(builder.build(), props);
 streams.start();
 ```
 
-`count()` สร้าง `KTable` ที่หนุนด้วย state store และ changelog ของมัน ส่วน `toStream().to(...)` ส่งค่านับที่อัปเดตแล้วทุกครั้งต่อไปยัง downstream
+`count()` สร้าง `KTable` ที่หนุนด้วย state store และ changelog ของตัวเอง ส่วน `toStream().to(...)` ส่งค่านับที่อัปเดตแล้วทุกครั้งต่อไปยัง downstream
 
 ## exactly-once และ streams protocol
 
-stream processing ที่อ่าน อัปเดต state แล้วเขียน เป็นเรื่องที่ทำ *ผิด* ได้ง่ายเมื่อเกิด failure — คุณอาจนับซ้ำ Kafka Streams ทำให้มันเป็นแค่การตั้งค่าบรรทัดเดียว เมื่อตั้ง `processing.guarantee` เป็น `exactly_once_v2` Streams จะห่อรอบ read-process-write แต่ละรอบ (รวมถึง changelog ของ state store และ consumer offset) ไว้ใน transaction เดียวของ Kafka การ retry จึงไม่ apply update ซ้ำสองครั้ง:
+stream processing ที่อ่าน อัปเดต state แล้วเขียน เป็นเรื่องที่ทำ *ผิด* ได้ง่ายเมื่อเกิด failure — คุณอาจนับซ้ำ Kafka Streams ย่อเรื่องนี้ให้เหลือแค่การตั้งค่าบรรทัดเดียว เมื่อตั้ง `processing.guarantee` เป็น `exactly_once_v2` Streams จะห่อรอบ read-process-write แต่ละรอบ (รวมถึง changelog ของ state store และ consumer offset) ไว้ใน transaction เดียวของ Kafka การ retry จึงไม่ apply update ซ้ำสองครั้ง:
 
 ```java
 // Turn on end-to-end exactly-once for the whole topology
@@ -92,10 +92,10 @@ export const quizStreams = [
   {
     q: 'state store ของ Kafka Streams รอดจากการ crash ของแอปได้อย่างไร',
     options: [
-      'มันไม่รอด — state หายไปเมื่อ restart',
+      'ไม่รอด — state หายไปเมื่อ restart',
       'ทุก update ถูกเขียนลง changelog topic ด้วย จึงสร้าง store ขึ้นใหม่ได้ด้วยการเล่นซ้ำ',
-      'มันถูกก๊อปไปยังทุก consumer ด้วยมือ',
-      'มันถูกเก็บไว้ใน JVM heap ตลอดกาลเท่านั้น',
+      'ถูกก๊อปไปยังทุก consumer ด้วยมือ',
+      'ถูกเก็บไว้ใน JVM heap ตลอดกาลเท่านั้น',
     ],
     answer: 1,
   },
@@ -113,9 +113,9 @@ export const quizStreams = [
     q: 'processing.guarantee=exactly_once_v2 ให้อะไร',
     options: [
       'throughput เร็วขึ้นด้วยการทิ้ง acknowledgement',
-      'มันห่อ read-process-write (รวมถึง state และ offset) ไว้ใน transaction การ retry จึงไม่ apply update ซ้ำสองครั้ง',
-      'มันปิด state store',
-      'มันเปลี่ยน Kafka Streams ให้เป็น cluster แยกต่างหาก',
+      'ห่อ read-process-write (รวมถึง state และ offset) ไว้ใน transaction การ retry จึงไม่ apply update ซ้ำสองครั้ง',
+      'ปิด state store',
+      'เปลี่ยน Kafka Streams ให้เป็น cluster แยกต่างหาก',
     ],
     answer: 1,
   },

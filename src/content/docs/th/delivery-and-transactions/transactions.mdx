@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ตั้งค่า transactional producer
 
-transaction ต่อยอดจาก idempotent producer คุณเพิ่ม **`transactionalId`** ซึ่งเป็น id ที่เสถียรและให้ Kafka fence ตัว zombie ของ producer เชิงตรรกะเดียวกันออกไป พร้อมกับ `idempotent: true` และ `maxInFlightRequests: 1` การ connect producer จะลงทะเบียน transactional id ให้เอง — ต่างจาก client ฝั่ง Java ตรงที่ KafkaJS ไม่มี `initTransactions()` แยกต่างหาก
+transaction ต่อยอดจาก idempotent producer คุณเพิ่ม **`transactionalId`** ที่เป็น id ที่เสถียรและให้ Kafka fence ตัว zombie ของ producer เชิงตรรกะเดียวกันออกไป พร้อมกับ `idempotent: true` และ `maxInFlightRequests: 1` การ connect producer จะลงทะเบียน transactional id ให้เอง — ต่างจาก client ฝั่ง Java ตรงที่ KafkaJS ไม่มี `initTransactions()` แยกต่างหาก
 
 ```typescript
 import { Kafka } from 'kafkajs'
@@ -50,7 +50,7 @@ try {
 
 ## consumer ต้องอ่านแบบ committed
 
-transaction มีความหมายก็ต่อเมื่อฝั่งอ่านเมิน data ที่ abort และที่ยัง in-flight ตั้ง consumer เป็น **`readUncommitted: false`** — คือ **read_committed** และเป็นค่า default ของ KafkaJS — เพื่อให้มันไม่เห็น record จาก transaction ที่ abort หรือที่ยังเปิดอยู่
+transaction มีความหมายก็ต่อเมื่อฝั่งอ่านเมิน data ที่ abort และที่ยัง in-flight ตั้ง consumer เป็น **`readUncommitted: false`** — คือ **read_committed** และเป็นค่า default ของ KafkaJS — เพื่อให้ consumer ไม่เห็น record จาก transaction ที่ abort หรือที่ยังเปิดอยู่
 
 ```typescript
 const consumer = kafka.consumer({
@@ -91,10 +91,10 @@ export const quizTransactions = [
   {
     q: 'บทบาทของ `transactionalId` คืออะไร',
     options: [
-      'มันตั้งชื่อ topic',
+      'ตั้งชื่อ topic',
       'id ที่เสถียรของ producer เชิงตรรกะ ที่ให้ Kafka fence ตัว zombie ออกไป',
-      'มันตั้งจำนวน partition',
-      'มันคือ consumer group id',
+      'ตั้งจำนวน partition',
+      'เป็น consumer group id',
     ],
     answer: 1,
   },

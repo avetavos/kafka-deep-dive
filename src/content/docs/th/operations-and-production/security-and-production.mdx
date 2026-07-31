@@ -34,7 +34,7 @@ ssl.truststore.location=/etc/kafka/broker.truststore.jks
 
 ## authorization ด้วย ACL
 
-authentication พิสูจน์ identity ส่วน **authorization** ตัดสินว่า identity นั้นทำอะไรได้ authorizer ของ Kafka เช็ค **ACL** กฎอย่าง "user `analytics` Read topic `orders` ได้" คุณจัดการมันด้วย `kafka-acls.sh` โดยใช้ `--bootstrap-server` เสมอ
+authentication พิสูจน์ identity ส่วน **authorization** ตัดสินว่า identity นั้นทำอะไรได้ authorizer ของ Kafka เช็ค **ACL** กฎอย่าง "user `analytics` Read topic `orders` ได้" คุณจัดการ ACL ด้วย `kafka-acls.sh` โดยใช้ `--bootstrap-server` เสมอ
 
 ```bash
 # Allow user "analytics" to consume from topic "orders"

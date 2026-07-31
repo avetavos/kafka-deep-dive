@@ -30,7 +30,7 @@ Retention บังคับที่ระดับ **segment** ทั้งก
 
 ## Compaction: เก็บค่าล่าสุดต่อ key
 
-ตั้ง `cleanup.policy=compact` แล้ว Kafka เปลี่ยนกลยุทธ์ทั้งหมด แทนที่จะทิ้งข้อมูลเก่าตามอายุ มันเก็บ **record ล่าสุดของแต่ละ key** และค่อยๆ garbage-collect ค่าเก่าของ key นั้น:
+ตั้ง `cleanup.policy=compact` แล้ว Kafka เปลี่ยนกลยุทธ์ทั้งหมด แทนที่จะทิ้งข้อมูลเก่าตามอายุ Kafka จะเก็บ **record ล่าสุดของแต่ละ key** และค่อยๆ garbage-collect ค่าเก่าของ key นั้น:
 
 ```text
 before compaction:  (a,1)(b,1)(a,2)(c,1)(b,2)(a,3)
@@ -49,7 +49,7 @@ export const retentionDiagram = `flowchart TB
 
 ## Tombstone: ลบ key
 
-ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บมันไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น
+ภายใต้ compaction จะลบ key ทั้งอันยังไง? เขียน **tombstone** — record ที่มี key และ **value เป็น null** compaction มองว่า "key นี้หายไปแล้ว" เก็บ tombstone ไว้นานพอให้ consumer ทุกตัวเห็นการลบ แล้วค่อยลบทั้ง tombstone และ history ของ key นั้น
 
 ```typescript
 // Tombstone: null value tells a compacted topic to forget this key
@@ -67,7 +67,7 @@ await producer.send({
 - **`compact`** — **ค่าล่าสุดของ key** คือประเด็น อยากได้ snapshot ที่สร้างใหม่ได้ เหมาะกับ state, changelog, config topic.
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**`cleanup.policy`** ของ topic เลือก lifecycle ของมัน **`delete`** ทยอยลบ record ตาม **`retention.ms`** / **`retention.bytes`** โดยไม่สนการ consume — เหมาะกับ event stream **`compact`** เก็บ **ค่าล่าสุดต่อ key** เปลี่ยน topic เป็น state snapshot ที่สร้างใหม่ได้ — เหมาะกับ changelog และ config ส่วน **tombstone** (value null) ลบ key ภายใต้ compaction.
+**`cleanup.policy`** ของ topic เลือก lifecycle ของตัวเอง **`delete`** ทยอยลบ record ตาม **`retention.ms`** / **`retention.bytes`** โดยไม่สนการ consume — เหมาะกับ event stream **`compact`** เก็บ **ค่าล่าสุดต่อ key** เปลี่ยน topic เป็น state snapshot ที่สร้างใหม่ได้ — เหมาะกับ changelog และ config ส่วน **tombstone** (value null) ลบ key ภายใต้ compaction.
 </Callout>
 
 export const quizRetention = [

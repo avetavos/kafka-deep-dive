@@ -42,7 +42,7 @@ await producer.send({ topic: 'orders', acks: -1, messages })
 
 ## acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย
 
-`acks=all` ลำพังหมายถึง "ทุก replica ที่ **in-sync** อยู่ตอนนั้น" ถ้าตอนนั้นมีแค่ leader ที่ in-sync คำว่า "all" ก็คือ leader ตัวเดียว — เท่ากับกลับไปเป็น `acks=1` ค่าฝั่ง broker คือ `min.insync.replicas` ปิดช่องนี้ มันตั้ง **จำนวนขั้นต่ำ** ของ in-sync replica ที่ต้องมีอยู่ถึงจะรับ write ได้เลย
+`acks=all` ลำพังหมายถึง "ทุก replica ที่ **in-sync** อยู่ตอนนั้น" ถ้าตอนนั้นมีแค่ leader ที่ in-sync คำว่า "all" ก็คือ leader ตัวเดียว — เท่ากับกลับไปเป็น `acks=1` ค่าฝั่ง broker `min.insync.replicas` ปิดช่องนี้ โดยตั้ง **จำนวนขั้นต่ำ** ของ in-sync replica ที่ต้องมีอยู่ถึงจะรับ write ได้เลย
 
 ด้วย `min.insync.replicas=2` บน topic ที่มี replication factor 3 producer ที่ใช้ `acks=all` ต้องมี replica in-sync อย่างน้อย **สอง** ตัว ถ้าเหลือแค่ตัวเดียว broker จะ **ปฏิเสธ** การ write (error `NotEnoughReplicas`) แทนที่จะรับ record ที่อาจหายได้ การปฏิเสธนี่แหละคือจุดสำคัญ — เรายอมให้ fail ดัง ๆ ดีกว่าเสียข้อมูลเงียบ ๆ
 
@@ -71,7 +71,7 @@ export const acksDiagram = `flowchart LR
 durability ไม่มีของฟรี ทุกระดับ `acks` ที่แข็งขึ้นเพิ่ม network round trip และรอเครื่องมากขึ้น latency จึงสูงขึ้นตามความแข็งของการรับประกัน เลือกตามต้นทุนของการเสีย record: metrics และ log มักอยู่กับ `acks=1` ได้ แต่ order, payment และอะไรที่สร้างใหม่ไม่ได้ควรใช้ `acks=all` คู่กับ `min.insync.replicas=2`
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**`acks`** ตั้งว่าต้องมี replica กี่ตัวยืนยันการ write: **`acks=0`** คือ fire-and-forget, **`acks=1`** คือ leader อย่างเดียว, และ **`acks=all`** รอทุก **in-sync replica** ใน KafkaJS มันคือ **option ต่อการ send** (`producer.send({ acks: -1, ... })`) หนุนด้วย **`min.insync.replicas=2`** เพื่อให้ broker ปฏิเสธ write ที่ทำ durable ไม่ได้ — แลก **latency** นิดหน่อยกับ record ที่รอดเมื่อ broker ล่ม
+**`acks`** ตั้งว่าต้องมี replica กี่ตัวยืนยันการ write: **`acks=0`** คือ fire-and-forget, **`acks=1`** คือ leader อย่างเดียว, และ **`acks=all`** รอทุก **in-sync replica** ใน KafkaJS `acks` เป็น **option ต่อการ send** (`producer.send({ acks: -1, ... })`) หนุนด้วย **`min.insync.replicas=2`** เพื่อให้ broker ปฏิเสธ write ที่ทำ durable ไม่ได้ — แลก **latency** นิดหน่อยกับ record ที่รอดเมื่อ broker ล่ม
 </Callout>
 
 export const quizAcks = [
@@ -80,18 +80,18 @@ export const quizAcks = [
     options: [
       'ไม่ต่างเลย เป็นชื่อเรียกแทนกัน',
       'record ถูกยืนยันโดยทุก in-sync replica ไม่ใช่แค่ leader',
-      'มันปิด replication ทั้งหมด',
-      'มันเขียนลงทุก topic ใน cluster',
+      'ปิด replication ทั้งหมด',
+      'เขียนลงทุก topic ใน cluster',
     ],
     answer: 1,
   },
   {
     q: 'ทำไม acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย',
     options: [
-      'ถ้าไม่มีมัน record จะถูกเก็บแค่ในหน่วยความจำ',
-      'เพราะ acks=all หมายถึงทุก in-sync replica ตอนนั้น ถ้ามีแค่ leader ที่ in-sync มันจะทำตัวเหมือน acks=1',
+      'ถ้าไม่มีค่านี้ record จะถูกเก็บแค่ในหน่วยความจำ',
+      'เพราะ acks=all หมายถึงทุก in-sync replica ตอนนั้น ถ้ามีแค่ leader ที่ in-sync จะทำตัวเหมือน acks=1',
       'min.insync.replicas ควบคุมจำนวน partition',
-      'มันตั้งว่ามี consumer อ่าน topic ได้กี่ตัว',
+      'ตั้งว่ามี consumer อ่าน topic ได้กี่ตัว',
     ],
     answer: 1,
   },

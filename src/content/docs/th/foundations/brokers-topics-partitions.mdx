@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## broker กับ cluster
 
-**broker** คือ process เซิร์ฟเวอร์ Kafka หนึ่งตัว หลาย broker รวมกันเป็น **cluster** broker แต่ละตัวเก็บข้อมูลบางส่วนและจัดการการอ่านเขียนของ partition ที่ตัวเองเป็นเจ้าของ client เชื่อมต่อไปที่ broker ตัวไหนก็ได้ผ่าน address ของ **bootstrap server** จากตรงนั้นมันจะ discover cluster ทั้งหมดและรู้ว่า broker ตัวไหน lead partition ไหน
+**broker** คือ process เซิร์ฟเวอร์ Kafka หนึ่งตัว หลาย broker รวมกันเป็น **cluster** broker แต่ละตัวเก็บข้อมูลบางส่วนและจัดการการอ่านเขียนของ partition ที่ตัวเองเป็นเจ้าของ client เชื่อมต่อไปที่ broker ตัวไหนก็ได้ผ่าน address ของ **bootstrap server** จากตรงนั้น client จะ discover cluster ทั้งหมดและรู้ว่า broker ตัวไหน lead partition ไหน
 
 ```bash
 # Create a topic with 3 partitions and 3 replicas across the cluster
@@ -59,7 +59,7 @@ record ใด ๆ ใน Kafka ถูกระบุด้วยพิกัด�
 
 ## เลือกจำนวน partition
 
-จำนวน partition คือปุ่มปรับ throughput หลักของคุณ แต่มันไม่ฟรี partition แต่ละอันคือไฟล์บนดิสก์และเป็นหน่วยงานสำหรับ consumer กับ controller น้อยไปก็ parallelize ไม่ได้ เยอะไปก็จ่าย overhead ทั้ง metadata, open file และเวลา rebalance วิธีที่นิยมคือ ประเมิน throughput เป้าหมาย, ตั้ง partition ให้พอดีกับมัน แล้วเผื่อ headroom ไว้ คุณ **เพิ่ม** partition ทีหลังได้ แต่การทำแบบนั้นเปลี่ยนวิธีที่ record แบบมี key map ไป partition (ข้อควรระวังที่ module ถัดไปจะอธิบาย)
+จำนวน partition คือปุ่มปรับ throughput หลักของคุณ แต่ไม่ฟรี partition แต่ละอันคือไฟล์บนดิสก์และเป็นหน่วยงานสำหรับ consumer กับ controller น้อยไปก็ parallelize ไม่ได้ เยอะไปก็จ่าย overhead ทั้ง metadata, open file และเวลา rebalance วิธีที่นิยมคือ ประเมิน throughput เป้าหมาย, ตั้งจำนวน partition ให้พอดีกับเป้าหมายนั้น แล้วเผื่อ headroom ไว้ คุณ **เพิ่ม** partition ทีหลังได้ แต่การทำแบบนั้นเปลี่ยนวิธีที่ record แบบมี key map ไป partition (ข้อควรระวังที่ module ถัดไปจะอธิบาย)
 
 <Callout title="สรุปหนึ่งบรรทัด">
 **broker** คือ Kafka หนึ่งตัว **cluster** คือหลายตัว **topic** ถูกแบ่งเป็น **partition** แต่ละ partition คือ log ที่มีลำดับแยกกันเก็บบน broker ตัวใดตัวหนึ่ง partition เป็นหน่วยของ **parallelism** (กระจายข้าม broker เพื่อ throughput) และของ **ordering** (การันตีภายใน partition ไม่ข้าม) record ทุกตัวถูกระบุด้วย **topic + partition + offset**
@@ -92,14 +92,14 @@ export const quizAnatomy = [
       'เพื่อลดการใช้ดิสก์',
       'เพื่อเพิ่ม parallelism และ throughput partition กระจายการอ่านเขียนข้าม broker และ consumer',
       'เพื่อการันตีลำดับสมบูรณ์ทั้ง topic',
-      'มันไม่มีผลต่อ performance',
+      'ไม่มีผลต่อ performance',
     ],
     answer: 1,
   },
   {
     q: 'ระบุตำแหน่ง record เฉพาะตัวใน Kafka ยังไง',
     options: [
-      'ด้วย timestamp ของมันอย่างเดียว',
+      'ด้วย timestamp ของตัวเองอย่างเดียว',
       'ด้วยสามอย่างคือ topic, partition และ offset',
       'ด้วย global auto-increment ID ข้ามทุก topic',
       'ด้วย hostname ของ broker',

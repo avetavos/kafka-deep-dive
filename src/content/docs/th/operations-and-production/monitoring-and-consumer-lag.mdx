@@ -20,7 +20,7 @@ producer append record เรื่อย ๆ เลื่อน **log-end-offse
 
 > lag = log-end-offset − committed offset
 
-lag ใกล้ศูนย์แปลว่า consumer ตามทัน lag ที่โตขึ้นเรื่อย ๆ แปลว่า consumer ตามไม่ทัน record เข้ามาเร็วกว่าที่ประมวลผลได้ และ latency แบบ end-to-end กำลังไต่ขึ้น อ่านมันตรง ๆ ด้วย consumer-groups tool
+lag ใกล้ศูนย์แปลว่า consumer ตามทัน lag ที่โตขึ้นเรื่อย ๆ แปลว่า consumer ตามไม่ทัน record เข้ามาเร็วกว่าที่ประมวลผลได้ และ latency แบบ end-to-end กำลังไต่ขึ้น อ่านค่า lag ตรง ๆ ด้วย consumer-groups tool
 
 ```bash
 # Describe a consumer group: shows CURRENT-OFFSET, LOG-END-OFFSET, and LAG per partition
@@ -28,7 +28,7 @@ kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
   --describe --group order-processor
 ```
 
-output มีคอลัมน์ `LAG` ต่อ partition จับตาที่ **แนวโน้ม** ของมัน ไม่ใช่ค่าครั้งเดียว แบนหรือลดลงคือสุขภาพดี ไต่ขึ้นเรื่อย ๆ คือสัญญาณเตือนแรกสุดว่า consumer โหลดเกิน ค้าง หรือ crash
+output มีคอลัมน์ `LAG` ต่อ partition จับตาที่ **แนวโน้ม** ของตัวเอง ไม่ใช่ค่าครั้งเดียว แบนหรือลดลงคือสุขภาพดี ไต่ขึ้นเรื่อย ๆ คือสัญญาณเตือนแรกสุดว่า consumer โหลดเกิน ค้าง หรือ crash
 
 <Mermaid title="consumer lag คือช่องว่างระหว่าง offset ใหม่สุดกับที่ประมวลผลแล้ว" code={lagFlow} />
 
@@ -53,7 +53,7 @@ broker ของ Kafka publish metric ผ่าน **JMX** ซึ่ง tool อ
 JMX_PORT=9999
 ```
 
-<Callout title="metric บอกว่าอะไร lag บอกว่ามันสำคัญไหม">
+<Callout title="metric บอกว่าอะไร lag บอกว่าสำคัญไหม">
 metric ฝั่ง broker อย่าง under-replicated partition เตือนเรื่อง **สุขภาพ cluster** ส่วน consumer lag เตือนเรื่อง **สุขภาพ application ของคุณ** ว่าข้อมูลที่ service พึ่งพาถูกประมวลผลทันเวลาไหม ตั้ง alert ทั้งคู่ แต่ถ้าดูได้ dashboard เดียว ให้ดู **lag ต่อ consumer group**
 </Callout>
 

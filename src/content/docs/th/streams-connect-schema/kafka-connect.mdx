@@ -16,12 +16,12 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## source และ sink connector
 
-งาน "เกี่ยวกับ Kafka" จำนวนมากไม่ใช่ business logic เลย — มันคืองานท่อ: อ่าน row จาก Postgres เข้า topic หรือเขียน topic ลง Elasticsearch การเขียนท่อพวกนี้เองหมายถึงต้องแก้ปัญหา offset tracking, retry และ parallelism ซ้ำทุกครั้ง Connect แพ็กมันเป็น **connector** ที่ใช้ซ้ำได้:
+งาน "เกี่ยวกับ Kafka" จำนวนมากไม่ใช่ business logic เลย — แต่เป็นงานท่อ: อ่าน row จาก Postgres เข้า topic หรือเขียน topic ลง Elasticsearch การเขียนท่อพวกนี้เองหมายถึงต้องแก้ปัญหา offset tracking, retry และ parallelism ซ้ำทุกครั้ง Connect แพ็กงานพวกนี้เป็น **connector** ที่ใช้ซ้ำได้:
 
 - **source connector** — ระบบภายนอก → Kafka (database, ไฟล์, stream แบบ change-data-capture)
 - **sink connector** — Kafka → ระบบภายนอก (database, search index, data warehouse, object storage)
 
-เพราะ connector เป็นแค่ config จึงมีให้ใช้อยู่แล้วเป็นร้อย ๆ ตัว คุณแทบไม่ต้องเขียนเอง แค่ตั้งค่ามันเท่านั้น
+เพราะ connector เป็นแค่ config จึงมีให้ใช้อยู่แล้วเป็นร้อย ๆ ตัว คุณแทบไม่ต้องเขียนเอง แค่ตั้งค่าเท่านั้น
 
 ```json
 // A JDBC source connector: poll a Postgres table into a topic
@@ -44,7 +44,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 มีสามชิ้นส่วนที่ทำงานร่วมกัน:
 
 - **worker** — process JVM ที่รัน connector หนึ่ง worker หรือมากกว่ารวมกันเป็น Connect cluster
-- **task** — หน่วยของ parallelism connector แบ่งงานเป็น task ได้ถึง `tasks.max` ตัว แล้ว worker กระจายมันไปทั่ว cluster (เช่น หนึ่ง task ต่อหนึ่ง table หรือต่อช่วง partition)
+- **task** — หน่วยของ parallelism connector แบ่งงานเป็น task ได้ถึง `tasks.max` ตัว แล้ว worker กระจาย task ไปทั่ว cluster (เช่น หนึ่ง task ต่อหนึ่ง table หรือต่อช่วง partition)
 - **converter** — แปลงระหว่างรูปแบบ record ภายในของ Connect กับ bytes บน topic ตรงนี้เองที่ Schema Registry เสียบเข้ามา: `AvroConverter` serialize พร้อม schema id ส่วน `JsonConverter` เขียนเป็น JSON ธรรมดา
 
 <Mermaid title="Connect moves data between external systems and Kafka" code={connectDiagram} />
@@ -60,7 +60,7 @@ export const connectDiagram = `flowchart LR
 Connect รันได้สองโหมด:
 
 - **standalone** — worker เดียว config อยู่ในไฟล์ local ง่าย ไม่มี fault tolerance เหมาะกับ demo บนเครื่องหรืองาน ingest ไฟล์ครั้งเดียวจบ
-- **distributed** — หลาย worker ทำงานประสานกันเหมือน consumer group โดยเก็บ config ของ connector และ offset ไว้ **ใน topic ของ Kafka** ถ้า worker ตัวหนึ่งตาย task ของมันจะ rebalance ไปยังตัวที่รอด นี่คือสิ่งที่คุณรันบน production และจัดการผ่าน REST API:
+- **distributed** — หลาย worker ทำงานประสานกันเหมือน consumer group โดยเก็บ config ของ connector และ offset ไว้ **ใน topic ของ Kafka** ถ้า worker ตัวหนึ่งตาย task ของตัวเองจะ rebalance ไปยังตัวที่รอด นี่คือสิ่งที่คุณรันบน production และจัดการผ่าน REST API:
 
 ```bash
 # Deploy the connector above to a distributed Connect cluster
@@ -83,7 +83,7 @@ export const quizConnect = [
     options: [
       'source เขียน Kafka ไปยังระบบภายนอก ส่วน sink อ่านเข้ามา',
       'source ดึงข้อมูลจากระบบภายนอกเข้า Kafka ส่วน sink ส่งข้อมูลจาก Kafka ไปยังระบบภายนอก',
-      'มันคือสิ่งเดียวกันแค่คนละชื่อ',
+      'เป็นสิ่งเดียวกันแค่คนละชื่อ',
       'source ใช้กับไฟล์เท่านั้น sink ใช้กับ database เท่านั้น',
     ],
     answer: 1,
@@ -103,8 +103,8 @@ export const quizConnect = [
     options: [
       'เป็นโหมดเดียวที่รองรับ connector',
       'หลาย worker ประสานงานและ rebalance task เมื่อเกิด failure โดยเก็บ config และ offset ไว้ใน Kafka',
-      'มันเก็บทุกอย่างไว้ในไฟล์ local เพื่อความเร็ว',
-      'มันตัดความจำเป็นของ converter ออกไป',
+      'เก็บทุกอย่างไว้ในไฟล์ local เพื่อความเร็ว',
+      'ตัดความจำเป็นของ converter ออกไป',
     ],
     answer: 1,
   },

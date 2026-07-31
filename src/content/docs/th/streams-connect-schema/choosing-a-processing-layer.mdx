@@ -62,7 +62,7 @@ export const quizChoosing = [
     q: 'ทีมหนึ่งต้องก๊อป table ของ Postgres เข้า topic ของ Kafka โดยไม่มีการ transform เครื่องมือที่ดีที่สุดคือ',
     options: [
       'Kafka Streams',
-      'Kafka Connect — มันย้ายข้อมูลด้วยการตั้งค่าโดยไม่ต้องเขียนโค้ด',
+      'Kafka Connect — ย้ายข้อมูลด้วยการตั้งค่าโดยไม่ต้องเขียนโค้ด',
       'plain consumer ที่เขียนขึ้นเองตั้งแต่ต้น',
       'external Flink cluster',
     ],
@@ -81,10 +81,10 @@ export const quizChoosing = [
   {
     q: 'ทำไมถึงเลือก plain consumer แทน Kafka Streams',
     options: [
-      'มัน scale ได้ดีกว่าเสมอ',
+      'scale ได้ดีกว่าเสมอ',
       'คุณต้องใช้ภาษาอื่น หรือต้องคุม offset, retry และ loop เต็มที่',
-      'มันจัดการ state แบบ exactly-once ให้อัตโนมัติ',
-      'มันไม่ต้องเขียนโค้ดเลย',
+      'จัดการ state แบบ exactly-once ให้อัตโนมัติ',
+      'ไม่ต้องเขียนโค้ดเลย',
     ],
     answer: 1,
   },

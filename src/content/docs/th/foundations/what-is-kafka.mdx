@@ -1,6 +1,6 @@
 ---
 title: 'Kafka คืออะไร'
-description: 'Kafka ในฐานะ distributed event streaming platform ตัว log แบบ publish/subscribe มันต่างจาก message queue ยังไง และแก้ปัญหาอะไร'
+description: 'Kafka ในฐานะ distributed event streaming platform ตัว log แบบ publish/subscribe ต่างจาก message queue ยังไง และแก้ปัญหาอะไร'
 sidebar:
   order: 2
 ---
@@ -16,12 +16,12 @@ Kafka คือ **log แบบ distributed, append-only** ที่แยกร
 
 ## ไม่ใช่ queue แต่เป็น log
 
-message queue แบบเดิม **ลบ** message ทิ้งทันทีที่ consumer ack แล้ว มันมี reader เชิงตรรกะแค่ตัวเดียว และ message หายไปหลังส่งเสร็จ Kafka ต่างออกไป มันเป็น **log** เมื่อ producer เขียน record เข้ามา Kafka จะ append มันเข้า partition แล้วเก็บไว้ตาม retention period ที่ตั้งไว้ การอ่าน record **ไม่ได้** ทำให้ record หายไป consumer แต่ละตัว track ตำแหน่งของตัวเอง (คือ **offset**) ใน log ดังนั้นสองทีมอ่าน stream เดียวกันเพื่อจุดประสงค์คนละอย่างได้เลยโดยไม่กวนกัน
+message queue แบบเดิม **ลบ** message ทิ้งทันทีที่ consumer ack แล้ว มี reader เชิงตรรกะแค่ตัวเดียว และ message หายไปหลังส่งเสร็จ Kafka ต่างออกไป เป็น **log** เมื่อ producer เขียน record เข้ามา Kafka จะ append record นั้นเข้า partition แล้วเก็บไว้ตาม retention period ที่ตั้งไว้ การอ่าน record **ไม่ได้** ทำให้ record หายไป consumer แต่ละตัว track ตำแหน่งของตัวเอง (คือ **offset**) ใน log ดังนั้นสองทีมอ่าน stream เดียวกันเพื่อจุดประสงค์คนละอย่างได้เลยโดยไม่กวนกัน
 
 การตัดสินใจออกแบบข้อเดียวนี้แหละ คือเหตุผลที่ Kafka ถูกใช้ทำหลายอย่างพร้อมกัน
 
 - **Messaging** แยก service ออกจากกันด้วย buffer ที่ทนทานคั่นกลาง
-- **Event sourcing** ตัว log *คือ* source of truth ส่วน state เป็นแค่ projection ของมัน
+- **Event sourcing** ตัว log *คือ* source of truth ส่วน state เป็นแค่ projection ของตัวเอง
 - **Stream processing** transform และ join stream ตอนที่ข้อมูลไหลเข้ามา
 - **Data integration** pipeline เดียวป้อนข้อมูลให้ database, search index และ warehouse
 
@@ -56,10 +56,10 @@ export const quizWhat = [
   {
     q: 'Kafka ต่างจาก message queue แบบเดิมยังไง',
     options: [
-      'มันลบ message ทิ้งหลัง consumer ตัวหนึ่งอ่านเสร็จ',
-      'มันเป็น log แบบ append-only record ถูกเก็บไว้ ไม่ได้ลบตอนอ่าน และ consumer แต่ละตัว track offset ของตัวเอง',
-      'มันรองรับ consumer ได้แค่ตัวเดียว',
-      'มันเก็บข้อมูลไว้ใน memory เท่านั้น',
+      'ลบ message ทิ้งหลัง consumer ตัวหนึ่งอ่านเสร็จ',
+      'เป็น log แบบ append-only record ถูกเก็บไว้ ไม่ได้ลบตอนอ่าน และ consumer แต่ละตัว track offset ของตัวเอง',
+      'รองรับ consumer ได้แค่ตัวเดียว',
+      'เก็บข้อมูลไว้ใน memory เท่านั้น',
     ],
     answer: 1,
   },

@@ -48,7 +48,7 @@ export const isrDiagram = `flowchart TB
 
 สูตรความ durable แบบคลาสสิกคือ `replication-factor=3`, `min.insync.replicas=2`, `acks=all` ทน broker ล่มได้ 1 ตัว โดยยังบังคับให้ทุก write ที่ ack แล้วมี 2 copy — คุณไม่พึ่ง disk เดียว
 
-ถ้า ISR เหลือศูนย์และ replica ที่ค้าง ไม่ sync เป็นตัวรอดตัวเดียวล่ะ? การเลือกมันขึ้นมาจะทำให้ partition กลับ online แต่ **เสีย** record ที่มันไม่เคยได้รับ default ของ Kafka คือ **`unclean.leader.election.enable=false`** ปฏิเสธการแลกนี้: มันเก็บ partition ไว้ offline จนกว่า replica ที่ in-sync จะกลับมา โดยเลือก **durability มาก่อน availability** คุณเปลี่ยนให้ availability มาก่อนได้ แต่ต้องเข้าใจความเสี่ยงเรื่องเสียข้อมูล
+ถ้า ISR เหลือศูนย์และ replica ที่ค้าง ไม่ sync เป็นตัวรอดตัวเดียวล่ะ? การเลือก replica ตัวนั้นขึ้นมาจะทำให้ partition กลับ online แต่ **เสีย** record ที่ไม่เคยได้รับ default ของ Kafka คือ **`unclean.leader.election.enable=false`** ปฏิเสธการแลกนี้ โดยเก็บ partition ไว้ offline จนกว่า replica ที่ in-sync จะกลับมา โดยเลือก **durability มาก่อน availability** คุณเปลี่ยนให้ availability มาก่อนได้ แต่ต้องเข้าใจความเสี่ยงเรื่องเสียข้อมูล
 
 <Callout title="สรุปหนึ่งบรรทัด">
 Kafka replicate แต่ละ partition ไป **leader** บวก **follower** ส่วน **ISR** คือเซ็ตของ replica ที่ตามทันครบ **`acks=all`** รอ ISR ทุกตัว และ **`min.insync.replicas`** บังคับขนาด ISR ขั้นต่ำ สูตรปลอดภัยคือ **RF=3, min.insync.replicas=2, acks=all** โดย default Kafka ปิด **unclean leader election** เลือก **durability มาก่อน availability** — ไม่เลื่อน replica ที่ค้างขึ้นมาแล้วเสียข้อมูลที่ ack ไปแล้ว

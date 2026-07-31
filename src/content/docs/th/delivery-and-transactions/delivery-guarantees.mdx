@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-guarantee แบบ end-to-end แข็งแรงได้เท่ากับจุดที่อ่อนที่สุดของมันเท่านั้น ฝั่ง **producer** (`acks` และ idempotence) กับฝั่ง **consumer** (จังหวะ commit) ต่างก็มีส่วน และคุณต้องคิดถึงมัน **พร้อมกัน**
+guarantee แบบ end-to-end แข็งแรงได้เท่ากับจุดที่อ่อนที่สุดของตัวเองเท่านั้น ฝั่ง **producer** (`acks` และ idempotence) กับฝั่ง **consumer** (จังหวะ commit) ต่างก็มีส่วน และคุณต้องคิดถึงทั้งสองฝั่ง **พร้อมกัน**
 
 ## guarantee เดียวที่มีสองครึ่ง
 
@@ -40,7 +40,7 @@ export const e2eDiagram = `flowchart LR
 
 ## default ที่ควรออกแบบเผื่อไว้
 
-ระบบส่วนใหญ่รันแบบ **at-least-once end-to-end** คือ `acks=all` producer เป็น idempotent commit หลังประมวลผล แล้วทำให้ผลลัพธ์ปลายทาง **idempotent** เพื่อให้ duplicate ไม่เป็นอันตราย มันเรียบง่าย ทนทาน และเร็ว หยิบ **exactly-once** เต็มรูปแบบ (transactions) มาใช้ก็ต่อเมื่อ pipeline อยู่ภายใน Kafka และ duplicate ยอมรับไม่ได้จริง ๆ เพราะมันเพิ่มต้นทุนการ coordinate ส่วนที่เหลือของ module นี้จะค่อย ๆ สร้างเส้นทาง exactly-once นั้นขึ้นมา
+ระบบส่วนใหญ่รันแบบ **at-least-once end-to-end** คือ `acks=all` producer เป็น idempotent commit หลังประมวลผล แล้วทำให้ผลลัพธ์ปลายทาง **idempotent** เพื่อให้ duplicate ไม่เป็นอันตราย วิธีนี้เรียบง่าย ทนทาน และเร็ว หยิบ **exactly-once** เต็มรูปแบบ (transactions) มาใช้ก็ต่อเมื่อ pipeline อยู่ภายใน Kafka และ duplicate ยอมรับไม่ได้จริง ๆ เพราะเพิ่มต้นทุนการ coordinate ส่วนที่เหลือของ module นี้จะค่อย ๆ สร้างเส้นทาง exactly-once นั้นขึ้นมา
 
 <Callout title="สรุปหนึ่งบรรทัด">
 guarantee แบบ end-to-end คือ **การรวมกัน** ของครึ่ง producer (`acks=all` + idempotence เพื่อ write ที่ไม่หายไม่ซ้ำ) กับครึ่ง consumer (จังหวะ commit สำหรับ at-most vs at-least-once) default ที่ทนทานคือ **at-least-once end-to-end บวกกับ sink ที่ idempotent** ส่วน **exactly-once** จริง ๆ มาจาก Kafka **transactions** และคุ้มค่ากับต้นทุนก็ต่อเมื่อ duplicate ยอมรับไม่ได้
@@ -50,7 +50,7 @@ export const quizGuarantees = [
   {
     q: 'ทำไมต้องคิดถึง guarantee ฝั่ง producer และ consumer พร้อมกัน',
     options: [
-      'มันไม่เกี่ยวกันและมองข้ามได้',
+      'ไม่เกี่ยวกันและมองข้ามได้',
       'แต่ละ hop (producer ไป log, log ไป consumer) มี failure mode ของตัวเอง guarantee แบบ end-to-end แข็งแรงเท่าจุดที่อ่อนที่สุด',
       'consumer เป็นตัวคุม producer',
       'มีแต่ฝั่ง producer เท่านั้นที่สำคัญ',
@@ -83,7 +83,7 @@ export const quizGuarantees = [
       'กับทุก pipeline ไม่ว่าจะจำเป็นหรือไม่',
       'เมื่อ pipeline อยู่ภายใน Kafka และ duplicate ยอมรับไม่ได้จริง ๆ',
       'เฉพาะตอนที่มี consumer ตัวเดียว',
-      'ไม่มีวันคุ้ม มันใช้ไม่ได้',
+      'ไม่มีวันคุ้ม ใช้งานจริงไม่ได้',
     ],
     answer: 1,
   },

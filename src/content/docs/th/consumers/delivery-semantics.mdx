@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 delivery semantics มีสามแบบ — **at-most-once**, **at-least-once** และ **exactly-once** — จากที่นั่งของ consumer คุณเลือกระหว่างสองแบบแรกได้จาก **จังหวะที่คุณ commit** เป็นหลัก แล้วไปถึงแบบที่สามด้วย idempotent processing หรือ transaction.
 
@@ -36,7 +36,7 @@ at-least-once บวกกับ **idempotent processing** คือเส้น
 - **Dedup ด้วย record id** ที่ producer ประทับมา แล้วทิ้ง id ที่เคย apply ไปแล้ว
 - ทำ operation ปลายทางให้ **commutative/idempotent** (เช่น "set status = shipped" ไม่ใช่ "increment count").
 
-เส้นทางที่แข็งแรงกว่าในระดับ framework คือ Kafka **transaction** — เขียน output record และ commit input offset พร้อมกันแบบ atomic — ซึ่ง module ถัดไปจะครอบคลุมเต็ม ๆ มันให้ exactly-once สำหรับ pipeline แบบ **consume-transform-produce** ที่อยู่ภายใน Kafka.
+เส้นทางที่แข็งแรงกว่าในระดับ framework คือ Kafka **transaction** — เขียน output record และ commit input offset พร้อมกันแบบ atomic — ซึ่ง module ถัดไปจะครอบคลุมเต็ม ๆ transaction ให้ exactly-once สำหรับ pipeline แบบ **consume-transform-produce** ที่อยู่ภายใน Kafka.
 
 <Callout title="สรุปหนึ่งบรรทัด">
 **At-most-once** (commit ก่อน process → อาจหาย), **at-least-once** (commit หลัง → อาจซ้ำ) และ **exactly-once** คือสาม semantic จังหวะ commit เลือกสองแบบแรก โดย **at-least-once เป็นดีฟอลต์ที่สมเหตุสมผล** ไปถึง effectively-exactly-once ได้ด้วยการทำ process ให้ **idempotent** (upsert, dedup ด้วย id, operation แบบ commutative) หรือใช้ Kafka **transaction** สำหรับ consume-transform-produce ภายใน Kafka.

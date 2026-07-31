@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในประโยคเดียว
 
-**Key** ของ record เป็นตัวตัดสินว่ามันไป partition ไหน — default partitioner จะ hash key ให้ **key เดียวกันลง partition เดียวกันเสมอ** ซึ่งเป็นวิธีได้ ordering ต่อ entity (ต่อ user, ต่อ order, ต่อ account).
+**Key** ของ record เป็นตัวตัดสินว่าไป partition ไหน — default partitioner จะ hash key ให้ **key เดียวกันลง partition เดียวกันเสมอ** ที่เป็นวิธีได้ ordering ต่อ entity (ต่อ user, ต่อ order, ต่อ account).
 
 ## Key เข้า partition ออก
 
@@ -44,7 +44,7 @@ export const keyDiagram = `flowchart TB
 
 ## ข้อควรระวังเรื่องเพิ่ม partition
 
-เพราะ mapping คือ `hash(key) % numberOfPartitions` การ **เปลี่ยนจำนวน partition ทำให้ key ลง partition เปลี่ยน** เพิ่ม partition ให้ topic ที่ใช้งานอยู่ แล้ว `user-42` อาจ hash ไป partition ใหม่ — event ในอนาคตของมันไปคนละที่กับของเดิม ทำลาย ordering ต่อ key ที่คุณพึ่งพาอยู่
+เพราะ mapping คือ `hash(key) % numberOfPartitions` การ **เปลี่ยนจำนวน partition ทำให้ key ลง partition เปลี่ยน** เพิ่ม partition ให้ topic ที่ใช้งานอยู่ แล้ว `user-42` อาจ hash ไป partition ใหม่ — event ในอนาคตของตัวเองไปคนละที่กับของเดิม ทำลาย ordering ต่อ key ที่คุณพึ่งพาอยู่
 
 ผลในทางปฏิบัติ:
 
@@ -93,7 +93,7 @@ export const quizKeys = [
   {
     q: 'ทำไมการเพิ่ม partition ให้ topic ที่ใช้ key ถึงเสี่ยง?',
     options: [
-      'มันลบข้อมูลเดิม',
+      'ลบข้อมูลเดิม',
       'hash(key) % partitions เปลี่ยน key อาจ map ไป partition ใหม่ ทำลาย ordering ต่อ key นับจากนั้น',
       'ต้องหยุดทั้ง cluster',
       'ไม่มีผลกับ record ที่มี key',

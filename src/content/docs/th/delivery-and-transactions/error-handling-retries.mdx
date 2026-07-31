@@ -16,7 +16,7 @@ code Kafka ที่ทนทานจะจัดทุก failure ลงหน
 
 ## producer retry อัตโนมัติและมีกรอบ
 
-KafkaJS retry error แบบ retriable เอง เช่น leader election หรือ network สะดุดชั่วคราว โดยคุมด้วย **`retry` policy** ของ client: จำนวน `retries` ที่จำกัด พร้อม **exponential backoff** (แต่ละรอบเริ่มที่ `initialRetryTime` แล้วโตขึ้นไปจนถึง `maxRetryTime`) คุณตั้งครั้งเดียวบน `Kafka` client และมันครอบคลุมทั้งการ produce, consume และ admin call
+KafkaJS retry error แบบ retriable เอง เช่น leader election หรือ network สะดุดชั่วคราว โดยคุมด้วย **`retry` policy** ของ client: จำนวน `retries` ที่จำกัด พร้อม **exponential backoff** (แต่ละรอบเริ่มที่ `initialRetryTime` แล้วโตขึ้นไปจนถึง `maxRetryTime`) คุณตั้งครั้งเดียวบน `Kafka` client และครอบคลุมทั้งการ produce, consume และ admin call
 
 ```typescript
 const kafka = new Kafka({
@@ -60,7 +60,7 @@ try {
 
 ## poison message, dead-letter topic และ safety net
 
-**poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ payload พัง schema ที่ parse ไม่ได้ หรือ downstream ที่ล้มถาวร retry มันไปเรื่อย ๆ จะทำให้ทั้ง partition ค้างอยู่หลังมัน วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)** หลังลองล้มเหลว N ครั้ง ก็ produce record บวก context ของ error ไปยัง topic `orders-dlq` แยกต่างหาก commit ข้ามมันไป แล้วปล่อยให้ flow หลักเดินต่อ คนหรือ job แยกค่อยมาตรวจ DLT ทีหลัง
+**poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ payload พัง schema ที่ parse ไม่ได้ หรือ downstream ที่ล้มถาวร ถ้า retry ไปเรื่อย ๆ record ตัวนี้จะบล็อกทั้ง partition ไว้ วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)** หลังลองล้มเหลว N ครั้ง ก็ produce record บวก context ของ error ไปยัง topic `orders-dlq` แยกต่างหาก commit ข้าม record นั้นไป แล้วปล่อยให้ flow หลักเดินต่อ คนหรือ job แยกค่อยมาตรวจ DLT ทีหลัง
 
 ```typescript
 try {

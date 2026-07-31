@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## จริง ๆ แล้ว log คืออะไร
 
-log ของ Kafka ไม่ใช่ไฟล์ text ที่มีบรรทัด debug มันคือ sequence ของ record ที่เรียงลำดับและแก้ไม่ได้ record ใหม่ถูก **append ไปท้าย** record เดิมไม่เคยถูกแก้ตรงที่เดิม record แต่ละตัวได้ offset จำนวนเต็มตัวถัดไป
+log ของ Kafka ไม่ใช่ไฟล์ text ที่มีบรรทัด debug แต่เป็น sequence ของ record ที่เรียงลำดับและแก้ไม่ได้ record ใหม่ถูก **append ไปท้าย** record เดิมไม่เคยถูกแก้ตรงที่เดิม record แต่ละตัวได้ offset จำนวนเต็มตัวถัดไป
 
 ```text
 offset:   0      1      2      3      4      5   →  (append here)
@@ -29,7 +29,7 @@ record: [ev0]  [ev1]  [ev2]  [ev3]  [ev4]  [ev5]
 
 ## การอ่านอิงตำแหน่ง ไม่ทำลายข้อมูล
 
-consumer อ่านด้วยการบอกว่า "ขอ record เริ่มจาก offset N" แล้ว Kafka ก็ stream ให้ตามลำดับ offset ของ consumer คือ **cursor ที่มันคุมเอง** ไม่ใช่สิ่งที่ broker ไปแก้ตอนส่ง นี่แหละคือกลไกทั้งหมด
+consumer อ่านด้วยการบอกว่า "ขอ record เริ่มจาก offset N" แล้ว Kafka ก็ stream ให้ตามลำดับ offset ของ consumer คือ **cursor ที่คุมเอง** ไม่ใช่สิ่งที่ broker ไปแก้ตอนส่ง นี่แหละคือกลไกทั้งหมด
 
 - เลื่อน cursor **ถอยหลัง** เพื่อ **replay** ประมวลผล event ของเมื่อวานใหม่หลังแก้ bug เสร็จ
 - เลื่อน **ไปข้างหน้า** เพื่อข้าม
@@ -53,7 +53,7 @@ export const logDiagram = `flowchart LR
 
 ## ลำดับเป็นแบบต่อ log
 
-log อันเดียวให้ **ลำดับสมบูรณ์** คือ offset 4 มาหลัง offset 3 เสมอ guarantee เรื่องลำดับนี้เป็นรากฐานของความถูกต้อง แต่มันเป็นจริง **ภายใน partition เดียว** ไม่ใช่ทั้ง topic module ถัดไปจะแกะความต่างตรงนี้ให้ เพราะมันกำหนดวิธีที่คุณออกแบบ key และ scale throughput ตอนนี้ขอแค่จำไอเดียหลักไว้ log มีลำดับ, append-only และอ่านตามตำแหน่ง
+log อันเดียวให้ **ลำดับสมบูรณ์** คือ offset 4 มาหลัง offset 3 เสมอ guarantee เรื่องลำดับนี้เป็นรากฐานของความถูกต้อง แต่เป็นจริง **ภายใน partition เดียว** ไม่ใช่ทั้ง topic module ถัดไปจะแกะความต่างตรงนี้ให้ เพราะกำหนดวิธีที่คุณออกแบบ key และ scale throughput ตอนนี้ขอแค่จำไอเดียหลักไว้ log มีลำดับ, append-only และอ่านตามตำแหน่ง
 
 <Callout title="สรุปหนึ่งบรรทัด">
 primitive หลักของ Kafka คือ **log แบบ append-only** record ถูก append ไปท้ายและได้ **offset** ที่เพิ่มขึ้น ทำให้เขียนแบบ **sequential** ได้เร็ว การอ่าน **อิงตำแหน่ง** โดย consumer เป็นเจ้าของ cursor เอง ซึ่งนี่แหละคือสิ่งที่ทำให้ **replay** และการอ่านหลาย consumer แบบอิสระเป็นไปได้ log อันเดียว **มีลำดับสมบูรณ์ตาม offset**
@@ -71,12 +71,12 @@ export const quizLog = [
     answer: 1,
   },
   {
-    q: 'เกิดอะไรขึ้นกับ record เมื่อ consumer อ่านมัน',
+    q: 'เกิดอะไรขึ้นกับ record เมื่อ consumer อ่านไปแล้ว',
     options: [
-      'มันถูกลบออกจาก log',
+      'ถูกลบออกจาก log',
       'ไม่มีอะไรเกิดขึ้น record ยังอยู่ consumer แค่เลื่อน offset cursor ของตัวเอง',
-      'มันถูกย้ายไป archive partition',
-      'offset ของมันถูก reset เป็นศูนย์',
+      'ถูกย้ายไป archive partition',
+      'offset ของตัวเองถูก reset เป็นศูนย์',
     ],
     answer: 1,
   },

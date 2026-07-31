@@ -10,9 +10,9 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
-consumer บันทึกว่าประมวลผลไปถึงไหนด้วยการ **commit offset** ต่อ partition Kafka เก็บมันไว้ใน topic ภายในชื่อ `__consumer_offsets` และ **จุดที่คุณ commit** เทียบกับ **จุดที่คุณ process** เป็นตัวตัดสินว่าคุณจะทำ record หายหรือซ้ำได้
+consumer บันทึกว่าประมวลผลไปถึงไหนด้วยการ **commit offset** ต่อ partition Kafka เก็บ offset เหล่านี้ไว้ใน topic ภายในชื่อ `__consumer_offsets` และ **จุดที่คุณ commit** เทียบกับ **จุดที่คุณ process** เป็นตัวตัดสินว่าคุณจะทำ record หายหรือซ้ำได้
 
 ## committed เทียบกับ current position
 
@@ -25,7 +25,7 @@ consumer บันทึกว่าประมวลผลไปถึงไ�
 
 ## auto-commit สะดวกแต่เสี่ยง
 
-โดยดีฟอลต์ KafkaJS จะ commit ให้อัตโนมัติ (`autoCommit: true`): มัน commit offset ที่ส่งไปแล้วเป็นระยะ ทุก ๆ `autoCommitInterval` มิลลิวินาที (หรือหลังครบ `autoCommitThreshold` message) มันง่าย แต่มัน commit ตามตารางเวลาโดยไม่สนว่าการประมวลผลของคุณสำเร็จหรือไม่ ถ้า crash หลัง auto-commit แต่ก่อน process จะทำให้ record เหล่านั้น **หาย** สำหรับงานที่สำคัญ ให้ตั้ง `autoCommit: false` แล้ว commit **หลัง** process:
+โดยดีฟอลต์ KafkaJS จะ commit ให้อัตโนมัติ (`autoCommit: true`): โดย commit offset ที่ส่งไปแล้วเป็นระยะ ทุก ๆ `autoCommitInterval` มิลลิวินาที (หรือหลังครบ `autoCommitThreshold` message) วิธีนี้ง่าย แต่ commit ตามตารางเวลาโดยไม่สนว่าการประมวลผลของคุณสำเร็จหรือไม่ ถ้า crash หลัง auto-commit แต่ก่อน process จะทำให้ record เหล่านั้น **หาย** สำหรับงานที่สำคัญ ให้ตั้ง `autoCommit: false` แล้ว commit **หลัง** process:
 
 ```typescript
 const consumer = kafka.consumer({ groupId: 'order-processor' });
@@ -46,11 +46,11 @@ await consumer.run({
 
 ## manual commit ใน KafkaJS
 
-เมื่อ `autoCommit: false` คุณ commit เองด้วย **`consumer.commitOffsets([...])`** ซึ่งคืน Promise **await มัน** เพื่อให้แน่ใจว่า commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัยและช้ากว่านิดหน่อย เหมือน commit แบบ synchronous ถ้าไม่ `await` ก็ยิงมันเบื้องหลังเพื่อ throughput โดยยอมรับว่า error จะไม่ถูกจับตรงนั้น ไม่ว่าทางไหนคุณ commit offset **ตัวถัดไป** ที่ต้องอ่าน (`offset + 1`) เพราะนั่นคือจุดที่ consumer ควรกลับมาเริ่ม
+เมื่อ `autoCommit: false` คุณ commit เองด้วย **`consumer.commitOffsets([...])`** ซึ่งคืน Promise ให้ **`await`** ทุกครั้ง เพื่อให้แน่ใจว่า commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัยและช้ากว่านิดหน่อย เหมือน commit แบบ synchronous ถ้าไม่ `await` ก็ปล่อยให้ commit วิ่งเบื้องหลังเพื่อ throughput โดยยอมรับว่า error จะไม่ถูกจับตรงนั้น ไม่ว่าทางไหนคุณ commit offset **ตัวถัดไป** ที่ต้องอ่าน (`offset + 1`) เพราะนั่นคือจุดที่ consumer ควรกลับมาเริ่ม
 
 ## จะเริ่มอ่านจากไหน และ replay ด้วย seek()
 
-committed offset จะมีประโยชน์ก็ต่อเมื่อมันมีอยู่ ครั้งแรกที่ group อ่าน partition หนึ่ง หรือถ้า committed offset หมดอายุตาม retention ไปแล้ว flag `fromBeginning` บน `subscribe()` ของ KafkaJS จะเป็นตัวตัดสินว่าจะเริ่มตรงไหน:
+committed offset จะมีประโยชน์ก็ต่อเมื่อมีอยู่จริง ครั้งแรกที่ group อ่าน partition หนึ่ง หรือถ้า committed offset หมดอายุตาม retention ไปแล้ว flag `fromBeginning` บน `subscribe()` ของ KafkaJS จะเป็นตัวตัดสินว่าจะเริ่มตรงไหน:
 
 - **`fromBeginning: true`** เริ่มจากต้น partition แล้ว process history ที่เก็บไว้ทั้งหมดใหม่ (policy `earliest`)
 - **`fromBeginning: false`** เริ่มจากท้าย อ่านเฉพาะ record ที่เข้ามานับจากนี้ (ดีฟอลต์ `latest`)
@@ -77,7 +77,7 @@ export const commitDiagram = `flowchart LR
 
 ## ทำไมดีฟอลต์นี้จึงเป็น at-least-once
 
-commit **หลัง** process แล้ว crash ระหว่างสองจุดนั้น หมายความว่า record เหล่านั้นจะถูกอ่านและ process ซ้ำตอน restart คือ **at-least-once** อาจซ้ำได้ ส่วน commit **ก่อน** process แล้ว crash หมายถึงมันถูกข้ามไป คือ **at-most-once** อาจหายได้ at-least-once เป็นดีฟอลต์ที่ใช้กันทั่วไป จะทำให้มันเป็น exactly-once จริง ๆ ต้องอาศัย idempotent processing หรือ transaction ซึ่ง module ถัดไปจะครอบคลุม
+commit **หลัง** process แล้ว crash ระหว่างสองจุดนั้น หมายความว่า record เหล่านั้นจะถูกอ่านและ process ซ้ำตอน restart คือ **at-least-once** อาจซ้ำได้ ส่วน commit **ก่อน** process แล้ว crash หมายถึง record เหล่านั้นถูกข้ามไป คือ **at-most-once** อาจหายได้ at-least-once เป็นดีฟอลต์ที่ใช้กันทั่วไป จะยกระดับเป็น exactly-once จริง ๆ ต้องอาศัย idempotent processing หรือ transaction ซึ่ง module ถัดไปจะครอบคลุม
 
 <Callout title="สรุปหนึ่งบรรทัด">
 consumer commit **offset** เพื่อทำเครื่องหมายความคืบหน้า (เก็บใน `__consumer_offsets`) และกลับมาเริ่มจาก **committed** offset หลัง restart **auto-commit** (`autoCommit: true`) ง่ายแต่ commit ตามตารางเวลาและอาจทำ record หาย เพื่อความถูกต้องให้ตั้ง **`autoCommit: false`** แล้ว **commit หลัง process** ด้วย `consumer.commitOffsets([...])` การ commit หลัง process ให้ผลเป็น **at-least-once** (อาจซ้ำ) คือดีฟอลต์ที่ต้องออกแบบเผื่อไว้ ใช้ **`fromBeginning`** ตัดสินว่า group ใหม่เอี่ยมจะเริ่มตรงไหน (earliest/latest) และใช้ **`seek()`** เพื่อ replay
@@ -97,10 +97,10 @@ export const quizOffsets = [
   {
     q: 'ทำไม auto-commit จึงเสี่ยงสำหรับงานประมวลผลที่สำคัญ?',
     options: [
-      'มัน commit น้อยเกินไปจนไม่มีประโยชน์',
-      'มัน commit ตามตารางเวลาโดยไม่สนว่า process สำเร็จหรือไม่ ดังนั้น crash อาจทำ record หาย',
-      'มันทำ record ซ้ำทุกตัว',
-      'มันปิดการทำงานของ consume loop',
+      'commit น้อยเกินไปจนไม่มีประโยชน์',
+      'commit ตามตารางเวลาโดยไม่สนว่า process สำเร็จหรือไม่ ดังนั้น crash อาจทำ record หาย',
+      'ทำ record ซ้ำทุกตัว',
+      'ปิดการทำงานของ consume loop',
     ],
     answer: 1,
   },
@@ -118,9 +118,9 @@ export const quizOffsets = [
     q: 'เมื่อ manual commit ใน KafkaJS การ await consumer.commitOffsets(...) ให้อะไรกับคุณ?',
     options: [
       'ไม่ให้อะไร commit เกิดขึ้นทันทีและไม่ถูก ack เสมอ',
-      'มันรอจน commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัย เทียบกับการยิงเบื้องหลังเพื่อ throughput',
-      'มันลบ offset เก่าออกจาก topic',
-      'มันสร้าง consumer group ใหม่',
+      'รอจน commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัย เทียบกับการยิงเบื้องหลังเพื่อ throughput',
+      'ลบ offset เก่าออกจาก topic',
+      'สร้าง consumer group ใหม่',
     ],
     answer: 1,
   },

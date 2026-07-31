@@ -16,7 +16,7 @@ producer **รวม record เป็น batch** และ **compress** ตา�
 
 ## linger.ms กับ batch.size แลก latency กับ throughput
 
-producer ไม่ได้ส่งทีละ record มันสะสม record ต่อ partition เข้าเป็น **batch** แล้วส่ง batch เป็น request เดียว มีสองค่ามาตรฐานที่กำหนดรูปร่างของ batch — นี่คือ **ชื่อ config ของ Java client / librdkafka** ที่คุณจะเจอใน official docs และ client ส่วนใหญ่:
+producer ไม่ได้ส่งทีละ record แต่สะสม record ต่อ partition เข้าเป็น **batch** แล้วส่ง batch เป็น request เดียว มีสองค่ามาตรฐานที่กำหนดรูปร่างของ batch — นี่คือ **ชื่อ config ของ Java client / librdkafka** ที่คุณจะเจอใน official docs และ client ส่วนใหญ่:
 
 - **`batch.size`** — ขนาดสูงสุดเป็น **byte** ของ batch เดียว batch จะถูกส่งเมื่อเต็มถึงขนาดนี้ (หรือเมื่อ `linger.ms` หมดเวลา)
 - **`linger.ms`** — producer จะ **รอ** record เพิ่มนานแค่ไหนก่อนส่ง batch ที่ยังไม่เต็ม ค่า default คือ `0` (ส่งให้เร็วที่สุด) เพิ่มเป็น เช่น `10` จะให้ record สะสมได้มากขึ้น เกิด batch ที่เต็มกว่า
@@ -29,7 +29,7 @@ linger.ms=10
 batch.size=65536
 ```
 
-**KafkaJS ไม่มีปุ่ม `linger.ms` หรือ `batch.size`** มันรวม message ที่คุณส่งใน `send()` ครั้งเดียวเข้าด้วยกันเองแล้วส่งพร้อมกัน — คุณคุม batching ด้วยวิธีจัดกลุ่ม message เข้า `send()` แต่ละครั้ง (เช่น buffer record เองแล้วส่งเป็น array เดียว) ไม่ใช่ด้วย linger timer
+**KafkaJS ไม่มีปุ่ม `linger.ms` หรือ `batch.size`** แต่จะรวม message ที่คุณส่งใน `send()` ครั้งเดียวเข้าด้วยกันเองแล้วส่งพร้อมกัน — คุณคุม batching ด้วยวิธีจัดกลุ่ม message เข้า `send()` แต่ละครั้ง (เช่น buffer record เองแล้วส่งเป็น array เดียว) ไม่ใช่ด้วย linger timer
 
 ## Compress batch
 
@@ -57,7 +57,7 @@ await producer.send({
 
 ## buffer.memory, back-pressure และเส้นตายของการส่ง
 
-เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O layer จะส่งออก ใน Java client `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อมันเต็ม `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด **KafkaJS ไม่มี setting buffer แบบนี้ให้ปรับ** มันไม่ได้ pre-buffer record ก่อน `send()` แบบที่ Java client ทำ จึงไม่มีคู่ `buffer.memory`/`max.block.ms` ให้จูน
+เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O layer จะส่งออก ใน Java client `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อ buffer เต็ม `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด **KafkaJS ไม่มี setting buffer แบบนี้ให้ปรับ** ไม่ได้ pre-buffer record ก่อน `send()` แบบที่ Java client ทำ จึงไม่มีคู่ `buffer.memory`/`max.block.ms` ให้จูน
 
 Java client ยังคุมทั้งเส้นทางด้วยเส้นตาย: `delivery.timeout.ms` (ค่า default **120000**) คือ **เส้นตายรวม** ตั้งแต่ตอน `send()` คืนค่าจนถึงตอน record ถูก acknowledge — ครอบคลุมทั้ง delay ของ batching, การส่งผ่าน network **และ retry ทั้งหมด** ควรตั้งให้ **>= `request.timeout.ms` + `linger.ms`** ถ้าส่ง record ไม่สำเร็จภายในเวลานี้ การ send จะ fail ถาวร
 
@@ -85,7 +85,7 @@ export const batchDiagram = `flowchart LR
 ใน Java client ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด ใน **KafkaJS** เพราะไม่มีปุ่ม batching ให้จูน ให้เน้นงาน throughput ที่: ส่ง message array ที่ใหญ่ขึ้นต่อการ `send()` หนึ่งครั้ง เลือก `compression: CompressionTypes.GZIP` (หรือ codec LZ4/ZSTD ที่ลงทะเบียนไว้) และตั้ง `retry` policy ให้กว้างพอจะทนต่อ broker สะดุด
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Java client รวม record เป็น batch ด้วย **`linger.ms`** และ **`batch.size`** (แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก) compress แต่ละ batch ด้วย **`compression.type`** ใส่ **back-pressure** ผ่าน **`buffer.memory`** และคุมทั้งการส่งด้วย **`delivery.timeout.ms`** (ค่า default **120000**) **KafkaJS ไม่มีปุ่ม linger/batch-size/buffer** มันรวม batch เองต่อการ `send()` แต่ละครั้ง compress ผ่าน option **`compression`** บน `send()` และคุม retry ด้วย **`retry`** policy ระดับ client แทนเส้นตายเดี่ยว ๆ
+Java client รวม record เป็น batch ด้วย **`linger.ms`** และ **`batch.size`** (แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก) compress แต่ละ batch ด้วย **`compression.type`** ใส่ **back-pressure** ผ่าน **`buffer.memory`** และคุมทั้งการส่งด้วย **`delivery.timeout.ms`** (ค่า default **120000**) **KafkaJS ไม่มีปุ่ม linger/batch-size/buffer** แต่รวม batch เองต่อการ `send()` แต่ละครั้ง compress ผ่าน option **`compression`** บน `send()` และคุม retry ด้วย **`retry`** policy ระดับ client แทนเส้นตายเดี่ยว ๆ
 </Callout>
 
 export const quizBatching = [
@@ -112,9 +112,9 @@ export const quizBatching = [
   {
     q: 'KafkaJS จัดการ batching ฝั่ง producer ยังไง เทียบกับ Java client',
     options: [
-      'มัน expose property linger.ms และ batch.size แบบเดียวกัน',
-      'มันไม่มีปุ่ม linger/batch-size — มันรวม message ใน send() ครั้งเดียวเองภายใน ไม่มี linger timer',
-      'มันไม่ batch record เลย',
+      'expose property linger.ms และ batch.size แบบเดียวกัน',
+      'ไม่มีปุ่ม linger/batch-size — รวม message ใน send() ครั้งเดียวเองภายใน ไม่มี linger timer',
+      'ไม่ batch record เลย',
       'ต้องใช้ library แยกสำหรับ batching',
     ],
     answer: 1,

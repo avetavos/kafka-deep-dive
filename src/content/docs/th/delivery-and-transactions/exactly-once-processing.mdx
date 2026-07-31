@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-use case คลาสสิกของ exactly-once คือ **consume-transform-produce** อ่านจาก input topic แปลง แล้วเขียนไป output topic และ Kafka ทำให้มันเป็น exactly-once ด้วยการ commit **input offset ภายใน transaction เดียวกัน** กับ output record
+use case คลาสสิกของ exactly-once คือ **consume-transform-produce** อ่านจาก input topic แปลง แล้วเขียนไป output topic และ Kafka ทำให้ flow นี้เป็น exactly-once ด้วยการ commit **input offset ภายใน transaction เดียวกัน** กับ output record
 
 ## ทำไม offset ต้องเข้าไปอยู่ใน transaction
 

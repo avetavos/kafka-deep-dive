@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 Kafka consumer จะ subscribe topic แล้ว **รัน consume loop** — KafkaJS เรียก handler `eachMessage` ของคุณด้วย record จาก partition ที่ถูก assign ให้ และ loop ที่รันอยู่นี้เองที่คอยทำให้ consumer ยังมีชีวิตอยู่ใน group
 
@@ -44,7 +44,7 @@ main();
 
 ## ทำไม run loop ถึงสำคัญ
 
-`run()` ทำมากกว่าแค่ดึงข้อมูล เบื้องหลังมันคอย poll Kafka, ส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ให้ ถ้า `eachMessage` ของคุณ block นานเกินไป — process record หนึ่งนานกว่า session timeout — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **คุมเวลา process ต่อ record ให้จำกัด**
+`run()` ทำมากกว่าแค่ดึงข้อมูล เบื้องหลังจะคอย poll Kafka, ส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ให้ ถ้า `eachMessage` ของคุณ block นานเกินไป — process record หนึ่งนานกว่า session timeout — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **คุมเวลา process ต่อ record ให้จำกัด**
 
 <Mermaid title="The consumer run loop" code={pollDiagram} />
 
@@ -68,9 +68,9 @@ export const quizConsumerApi = [
     q: 'consumer.run() (poll loop) ทำอะไรอีกนอกจากคืน record?',
     options: [
       'ไม่ทำอะไรอีก — แค่ดึงข้อมูลอย่างเดียว',
-      'มันยังส่ง heartbeat, ประสาน group membership และดึง partition assignment ด้วย',
-      'มัน commit offset ลงฐานข้อมูล',
-      'มันสร้าง partition ใหม่',
+      'ยังส่ง heartbeat, ประสาน group membership และดึง partition assignment ด้วย',
+      'commit offset ลงฐานข้อมูล',
+      'สร้าง partition ใหม่',
     ],
     answer: 1,
   },
@@ -78,7 +78,7 @@ export const quizConsumerApi = [
     q: 'ถ้า consumer หยุด consume (handler block) นานเกินไปจะเกิดอะไรขึ้น?',
     options: [
       'Kafka จะเร่งความเร็วในการส่ง',
-      'group coordinator จะถือว่ามันตายแล้ว และ rebalance ย้าย partition ไปให้ consumer ตัวอื่น',
+      'group coordinator จะถือว่าตายแล้ว และ rebalance ย้าย partition ไปให้ consumer ตัวอื่น',
       'consumer จะ scale up อัตโนมัติ',
       'ไม่มีอะไรเกิดขึ้น การ consume เป็นทางเลือก',
     ],

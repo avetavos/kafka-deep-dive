@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-รัน Kafka 4.x บนเครื่องคือการสตาร์ท **broker ตัวเดียวในโหมด KRaft** ไม่มี ZooKeeper ไม่มี dependency ภายนอก แล้วคุยกับมันทั้งหมดผ่าน `--bootstrap-server localhost:9092` เพื่อสร้าง topic, produce record และ consume มันกลับมา
+รัน Kafka 4.x บนเครื่องคือการสตาร์ท **broker ตัวเดียวในโหมด KRaft** ไม่มี ZooKeeper ไม่มี dependency ภายนอก แล้วคุยกับ broker ตัวนั้นทั้งหมดผ่าน `--bootstrap-server localhost:9092` เพื่อสร้าง topic, produce record และ consume กลับมา
 
 ## ทางที่เร็วที่สุด: Docker container เดียว
 
@@ -27,7 +27,7 @@ docker run -d --name kafka -p 9092:9092 apache/kafka:latest
 
 ## ทางแบบ manual: format storage แล้วค่อยสตาร์ท
 
-ถ้าคุณรัน tarball ที่โหลดมาแทน Docker KRaft ต้องมีขั้นตอน **format storage** ครั้งเดียว คุณ generate cluster UUID แล้วเขียนมันลง log directory ก่อนสตาร์ทครั้งแรก
+ถ้าคุณรัน tarball ที่โหลดมาแทน Docker KRaft ต้องมีขั้นตอน **format storage** ครั้งเดียว คุณ generate cluster UUID แล้วเขียน UUID นั้นลง log directory ก่อนสตาร์ทครั้งแรก
 
 ```bash
 # 1. Generate a unique cluster ID
@@ -42,7 +42,7 @@ bin/kafka-storage.sh format --standalone \
 bin/kafka-server-start.sh config/server.properties
 ```
 
-คู่ `random-uuid` กับ `format` คือพิธี bootstrap ของ KRaft มันแทนที่การ handshake กับ ZooKeeper แบบเดิม ทำแค่ครั้งเดียวต่อ data directory หนึ่งอัน
+คู่ `random-uuid` กับ `format` คือพิธี bootstrap ของ KRaft ใช้แทนการ handshake กับ ZooKeeper แบบเดิม ทำแค่ครั้งเดียวต่อ data directory หนึ่งอัน
 
 <Mermaid title="workflow KRaft บนเครื่อง: format, สตาร์ท แล้ว produce และ consume" code={localFlow} />
 
@@ -70,7 +70,7 @@ kafka-topics.sh --bootstrap-server localhost:9092 \
 kafka-console-producer.sh --bootstrap-server localhost:9092 --topic demo
 ```
 
-และ consumer ใน terminal อีกอันเพื่ออ่านมันกลับตั้งแต่ต้น
+และ consumer ใน terminal อีกอันเพื่ออ่านกลับตั้งแต่ต้น
 
 ```bash
 # Consume: --from-beginning replays every record in the topic
@@ -79,7 +79,7 @@ kafka-console-consumer.sh --bootstrap-server localhost:9092 \
 ```
 
 <Callout title="อย่าพิมพ์ --zookeeper">
-ถ้าคำสั่งหรือ tutorial บอกให้ใส่ `--zookeeper localhost:2181` แสดงว่ามันเก่ากว่า Kafka 4.x ใน Kafka แบบ KRaft-only flag นี้ **หายไปแล้ว** CLI tool ทุกตัว ทั้ง `kafka-topics.sh`, `kafka-console-producer.sh`, `kafka-consumer-groups.sh` ใช้ **`--bootstrap-server`** อย่างเดียวสำหรับระบุ address ของ cluster
+ถ้าคำสั่งหรือ tutorial บอกให้ใส่ `--zookeeper localhost:2181` แสดงว่าเก่ากว่า Kafka 4.x ใน Kafka แบบ KRaft-only flag นี้ **หายไปแล้ว** CLI tool ทุกตัว ทั้ง `kafka-topics.sh`, `kafka-console-producer.sh`, `kafka-consumer-groups.sh` ใช้ **`--bootstrap-server`** อย่างเดียวสำหรับระบุ address ของ cluster
 </Callout>
 
 <Callout title="สรุปหนึ่งบรรทัด">
@@ -90,7 +90,7 @@ export const quizLocal = [
   {
     q: 'ต้องติดตั้งอะไรเพิ่มคู่กับ Kafka 4.x เพื่อรันบนเครื่อง',
     options: [
-      'ZooKeeper และสตาร์ทมันก่อน broker',
+      'ZooKeeper และสตาร์ท ZooKeeper ก่อน broker',
       'ไม่ต้องเพิ่มอะไร Kafka 4.x เป็น KRaft-only ไม่ต้องใช้ ZooKeeper',
       'ฐานข้อมูล relational สำหรับเก็บ metadata',
       'controller cluster แยกบนอีกเครื่อง',

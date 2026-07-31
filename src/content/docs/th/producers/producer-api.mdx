@@ -21,7 +21,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 message พก 3 อย่างที่เราสนใจมากสุด:
 
 - **topic** — ชื่อ stream ที่จะเขียนลง (ระบุตอนเรียก `send()`, จำเป็น)
-- **key** — ใส่หรือไม่ก็ได้ record ที่มี key เดียวกันจะไปลง partition เดียวกัน ซึ่งเป็นวิธีที่ Kafka รักษา ordering ต่อ key
+- **key** — ใส่หรือไม่ก็ได้ record ที่มี key เดียวกันจะไปลง partition เดียวกัน นั่นคือวิธีที่ Kafka รักษา ordering ต่อ key
 - **value** — payload หรือตัว event data นั่นเอง
 
 เพราะ broker เก็บแค่ **byte** เท่านั้น `key` และ `value` ของ message จึงต้องเป็น `string`, `Buffer` หรือ `null` KafkaJS **ไม่มี serializer class แบบ pluggable** — คุณ serialize payload เอง ปกติใช้ `JSON.stringify(...)` สำหรับ value ที่เป็น structured และใช้ string ธรรมดาสำหรับ key (client อื่นอย่าง Java จะตั้งค่า `key.serializer` และ `value.serializer` เป็น class แทน)
@@ -36,7 +36,7 @@ const producer = kafka.producer();
 
 ## send() เป็น asynchronous — await Promise
 
-`send()` **ไม่** block รอจน record ถึง broker แต่ KafkaJS จะ buffer และ batch ให้ภายใน แล้วคืน `Promise` กลับมา ถ้าอยากรู้ผลลัพธ์ — partition และ offset ที่ Kafka assign ให้ — ก็ `await` promise นั้น (หรือใช้ `.then()`) และถ้าล้มเหลวมันจะ **throw** ดังนั้นครอบด้วย `try`/`catch`
+`send()` **ไม่** block รอจน record ถึง broker แต่ KafkaJS จะ buffer และ batch ให้ภายใน แล้วคืน `Promise` กลับมา ถ้าอยากรู้ผลลัพธ์ — partition และ offset ที่ Kafka assign ให้ — ก็ `await` promise นั้น (หรือใช้ `.then()`) และถ้าล้มเหลว promise จะ **throw** ดังนั้นครอบด้วย `try`/`catch`
 
 ```typescript
 import { Kafka } from 'kafkajs';
@@ -75,7 +75,7 @@ export const producerDiagram = `flowchart LR
   broker --> cb["Promise resolves: metadata, or throws"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-สร้าง **message** (topic, key, value) โดย `key` และ `value` เป็น string/Buffer ที่คุณ **serialize เอง** (เช่น `JSON.stringify`) แล้วเรียก **`send()`** — มันเป็น **asynchronous** และคืน **`Promise`** ดังนั้นให้ **`await`** มัน (และใช้ `try`/`catch` จัดการ error) แทนการ block และ connect producer ครั้งเดียวแล้วใช้ซ้ำ
+สร้าง **message** (topic, key, value) โดย `key` และ `value` เป็น string/Buffer ที่คุณ **serialize เอง** (เช่น `JSON.stringify`) แล้วเรียก **`send()`** — เป็น **asynchronous** และคืน **`Promise`** ดังนั้นให้ **`await`** ทุกครั้ง (และใช้ `try`/`catch` จัดการ error) แทนการ block และ connect producer ครั้งเดียวแล้วใช้ซ้ำ
 </Callout>
 
 export const quizProducerApi = [
@@ -92,10 +92,10 @@ export const quizProducerApi = [
   {
     q: 'send() คืนค่าอะไร และทำงานเสร็จเมื่อไร',
     options: [
-      'มัน block แล้วคืน offset ตรง ๆ เมื่อเขียนเสร็จ',
-      'มันคืน Promise ทันที แล้วทำงานเสร็จแบบ asynchronous เบื้องหลัง',
-      'มันคืน void และไม่เคยรายงานว่าสำเร็จหรือล้มเหลว',
-      'มันคืน byte ดิบที่ส่งไป',
+      'block แล้วคืน offset ตรง ๆ เมื่อเขียนเสร็จ',
+      'คืน Promise ทันที แล้วทำงานเสร็จแบบ asynchronous เบื้องหลัง',
+      'คืน void และไม่เคยรายงานว่าสำเร็จหรือล้มเหลว',
+      'คืน byte ดิบที่ส่งไป',
     ],
     answer: 1,
   },
@@ -112,10 +112,10 @@ export const quizProducerApi = [
   {
     q: 'brokers array บน new Kafka({...}) ใช้ทำอะไร',
     options: [
-      'มันระบุ broker ทุกตัวที่ต้อง online ไม่งั้นการ send จะล้มเหลว',
-      'มันคือ list broker เริ่มต้นที่ client ติดต่อเพื่อ discover cluster',
-      'มันตั้งระยะเวลา retention ของ topic',
-      'มันเลือก partition ที่ record จะลง',
+      'ระบุ broker ทุกตัวที่ต้อง online ไม่งั้นการ send จะล้มเหลว',
+      'เป็น list broker เริ่มต้นที่ client ติดต่อเพื่อ discover cluster',
+      'ตั้งระยะเวลา retention ของ topic',
+      'เลือก partition ที่ record จะลง',
     ],
     answer: 1,
   },
