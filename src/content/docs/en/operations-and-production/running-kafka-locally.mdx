@@ -20,7 +20,7 @@ The official `apache/kafka` image ships a KRaft-ready broker that formats its ow
 
 ```bash
 # Start a single-node Kafka 4.x broker in KRaft mode, port 9092 exposed
-docker run -d --name kafka -p 9092:9092 apache/kafka:latest
+docker run -d --name kafka -p 9092:9092 apache/kafka:4.3.1
 ```
 
 That is the whole cluster. There is nothing else to install — **no ZooKeeper process** exists in Kafka 4.x. The container comes with the CLI scripts baked in, so you can run admin commands inside it with `docker exec`, or install the Kafka tarball locally and point the scripts at `localhost:9092`.
