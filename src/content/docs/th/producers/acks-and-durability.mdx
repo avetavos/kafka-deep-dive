@@ -36,7 +36,7 @@ acks=all
 ใน **KafkaJS** `acks` ไม่ใช่ property ระดับ producer แต่เป็น **option ต่อการ send แต่ละครั้ง** ที่คุณส่งให้ `send()` โดยใช้สามค่าเดิม:
 
 ```typescript
-// -1 = all (ค่า default), 1 = leader เท่านั้น, 0 = fire-and-forget
+// -1 = all (the default), 1 = leader only, 0 = fire-and-forget
 await producer.send({ topic: 'orders', acks: -1, messages })
 ```
 
