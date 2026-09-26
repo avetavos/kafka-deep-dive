@@ -4,6 +4,8 @@ dist/
 .astro/
 # deps
 node_modules/
+# snippet-verification probe (tools/verify-snippets.mjs) — regenerated, never committed
+tools/probe/
 # env
 .env
 .env.production
