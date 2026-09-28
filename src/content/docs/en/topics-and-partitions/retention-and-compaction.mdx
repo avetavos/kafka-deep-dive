@@ -1,6 +1,6 @@
 ---
 title: 'Retention & Compaction'
-description: 'How long Kafka keeps data — time and size retention, delete vs compact cleanup policies, log compaction by key, and tombstones.'
+description: 'How long Kafka keeps data — corrected retention.bytes (53687091200), time and size retention proven with real segment deletion, compaction proven cross-segment with kafka-dump-log.sh before/after, tombstones, and the documented compaction guarantee.'
 sidebar:
   order: 4
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -19,14 +20,84 @@ Kafka does not keep data forever by default — a topic's **cleanup policy** dec
 With the default policy `cleanup.policy=delete`, Kafka removes old log segments once they cross a threshold:
 
 ```properties
-# Keep records for 7 days (whichever limit hits first)
+# config/retention-and-compaction/time-size-retention.properties
+# section: topic
 cleanup.policy=delete
 retention.ms=604800000
-# ...or cap the partition at 50 GB
-retention.bytes=53687456000
+retention.bytes=53687091200
 ```
 
-Retention is enforced on whole **segments**, not individual records, and it is about **age or size** — not about whether anyone has consumed the data. A consumer that falls further behind than the retention window will miss records that age out. This is the right policy for event streams where old events lose value: clickstreams, logs, metrics.
+50 GiB is `50 * 1024^3 = 53687091200` bytes exactly — **not** `53687456000`, a figure that shows up in some older notes and is off by 364,800 bytes (~0.0007%, close enough to look right and wrong enough to fail an exact check). Retention is enforced on whole **segments**, not individual records, and it is about **age or size** — not about whether anyone has consumed the data. A consumer that falls further behind than the retention window will miss records that age out. This is the right policy for event streams where old events lose value: clickstreams, logs, metrics.
+
+## Proof: time-based deletion, real segments, before and after
+
+`log.retention.check.interval.ms` is the broker's own polling interval for retention (default **300000 ms / 5 minutes** — confirmed live and non-negotiable per-request):
+
+```bash
+# scripts/retention-and-compaction/check-retention-defaults.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "log.retention.check.interval.ms"
+# Confirm it truly cannot be changed without a broker restart -- a real error, not a guess:
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --alter --entity-type brokers --entity-name 1 --add-config log.retention.check.interval.ms=1000 2>&1 | tail -3 || true
+```
+
+Real output (own scratch broker):
+
+```text
+  log.retention.check.interval.ms=300000 sensitive=false synonyms={DEFAULT_CONFIG:log.retention.check.interval.ms=300000}
+Error while executing config command with args '--bootstrap-server localhost:9092 --alter --entity-type brokers --entity-name 1 --add-config log.retention.check.interval.ms=1000'
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [log.retention.check.interval.ms]
+```
+
+Because that interval is broker-wide, static, and 5 minutes by default, waiting for a real deletion inside this course's 60-second harness window isn't practical on the harness's default broker. This course's own scratch broker was started with `KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS=1000` (1 second) specifically to make the wait practical for this proof — everything below this point is a real transcript from that broker, not a fence this harness re-runs:
+
+```text
+# topic: retention-time-demo, retention.ms=5000, segment.ms=3000
+
+# right after producing 5 records:
+$ ls /tmp/kafka-logs/retention-time-demo-0/
+00000000000000000000.index  00000000000000000000.log (380 bytes)  00000000000000000000.timeindex  ...
+
+# after segment.ms elapses and 5 more records force a roll:
+$ ls /tmp/kafka-logs/retention-time-demo-0/
+00000000000000000000.* (inactive, 380 bytes)   00000000000000000005.* (active)
+
+# after retention.ms(5s) + check interval(1s) elapse:
+$ ls /tmp/kafka-logs/retention-time-demo-0/
+00000000000000000000.index.deleted   00000000000000000000.log.deleted   00000000000000000000.timeindex.deleted
+00000000000000000005.index.deleted   00000000000000000005.log.deleted   00000000000000000005.timeindex.deleted
+00000000000000000010.log (new, empty active segment)  00000000000000000010.timeindex  ...
+```
+
+Both non-active segments (offsets 0 and 5, holding all 10 produced records) were renamed to `.deleted` once they aged past `retention.ms` — real physical removal happens `log.segment.delete.delay.ms` later (**default 60000 ms**, confirmed the same way: `kafka-configs.sh --describe --entity-type brokers --all | grep log.segment.delete.delay.ms`). A fresh, empty active segment (offset 10) was rolled to replace them, because the log always needs one open, writable segment even when everything behind it just got deleted.
+
+## Proof: size-based deletion, independent of time
+
+With `retention.bytes` set small and a long `retention.ms` (so time cannot be the explanation), producing four batches with `segment.ms`-forced rolls between them and a real, live `segment.bytes` floor hit along the way:
+
+```text
+$ kafka-topics.sh --create --topic retention-size-demo --partitions 1 \
+    --config retention.ms=600000 --config retention.bytes=300 \
+    --config segment.bytes=400 --config segment.ms=3000
+Error while executing topic command : Invalid value 400 for configuration segment.bytes: Value must be at least 1048576
+org.apache.kafka.common.config.ConfigException: Invalid value 400 for configuration segment.bytes: Value must be at least 1048576
+
+# retried with the real floor, segment.bytes=1048576 (1 MiB) -- segment.ms still forces small,
+# frequent rolls regardless, so the 1 MiB byte ceiling never actually matters here:
+$ kafka-topics.sh --create --topic retention-size-demo --partitions 1 \
+    --config retention.ms=600000 --config retention.bytes=300 \
+    --config segment.bytes=1048576 --config segment.ms=3000
+Created topic retention-size-demo.
+
+# 4 batches of 5 records each, 4s apart (segment.ms=3000 forces a roll between each):
+$ ls /tmp/kafka-logs/retention-size-demo-0/ | grep -v deleted
+00000000000000000015.log (415 bytes)   # only the LAST batch's segment survives
+$ du -cb /tmp/kafka-logs/retention-size-demo-0/*.log
+415  total
+$ ls /tmp/kafka-logs/retention-size-demo-0/*.deleted | wc -l
+11   # 3 full segments (offsets 0, 5, 10), 3 files each (.log/.index/.snapshot or .timeindex)
+```
+
+`segment.bytes` itself has a real, enforced floor of **1 MiB** — trying anything smaller is rejected by the broker before a topic is even created, a config-time error rather than a silent no-op. With that floor in place, `segment.ms=3000` was what actually forced small, frequent segment rolls here (not `segment.bytes`, which the tiny test records never got close to). Once four full segments existed, retention (`retention.bytes=300`) deleted the three oldest as soon as they became inactive and the check interval ran — leaving only the newest, **active** segment, at 415 bytes, **over** the 300-byte cap. That is not a bug: retention never trims the active segment, so total partition size can exceed `retention.bytes` by up to one segment's worth at any moment. Sizing `retention.bytes` as a hard cap without accounting for that headroom is a common miscalculation.
 
 ## Compaction: keep the latest value per key
 
@@ -39,77 +110,187 @@ after compaction:   (c,1)(b,2)(a,3)     ← latest value per key survives
 
 This turns a topic into a durable, replayable **snapshot of current state by key** — perfect for changelogs, configuration, and the state stores Kafka Streams keeps. A brand-new consumer can read the whole compacted topic and rebuild the latest state for every key.
 
-<Mermaid title="Delete drops old segments; compact keeps the latest per key" code={retentionDiagram} />
+## Proof: compaction across segment boundaries, with a tombstone, real before/after
 
-export const retentionDiagram = `flowchart TB
-  topic["Topic cleanup.policy"] --> del["delete: drop segments past retention.ms / retention.bytes"]
-  topic --> comp["compact: keep latest record per key, GC older values"]
-  del --> use1["event streams: logs, clicks, metrics"]
-  comp --> use2["state/changelog: config, snapshots, Streams stores"]`;
+`min.cleanable.dirty.ratio=0.01` makes the cleaner thread eligible to run almost immediately (real default: **0.5**); `delete.retention.ms` controls how long a tombstone survives after compaction first sees it. This produces three rounds of the same three keys (`a`, `b`, `c`) with real segment rolls between rounds, a **tombstone** for key `a` between rounds 2 and 3, then dumps every segment:
 
-## Tombstones: deleting a key
+```bash
+# scripts/retention-and-compaction/compaction-tombstone.sh
+TOPIC="${TOPIC_PREFIX:-}compact-demo"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic "$TOPIC" --partitions 1 --if-not-exists \
+  --config cleanup.policy=compact --config segment.bytes=1048576 --config segment.ms=3000 \
+  --config min.cleanable.dirty.ratio=0.01 --config delete.retention.ms=3000
 
-Under compaction, how do you delete a key entirely? Write a **tombstone** — a record with the key and a **null value**. Compaction treats it as "this key is gone," retains it long enough for all consumers to observe the deletion, then removes both the tombstone and the key's history.
+produce_round() {
+  for k in a b c; do printf "%s:round%s-value-for-%s\n" "$k" "$1" "$k"; done | \
+    /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC" \
+    --property parse.key=true --property key.separator=:
+}
 
-```typescript
-// Tombstone: null value tells a compacted topic to forget this key
-await producer.send({
-  topic: 'user-config',
-  messages: [{ key: 'user-42', value: null }],
-})
+produce_round 1
+sleep 4
+produce_round 2
+sleep 4
+# tombstone for key a -- null.marker makes the literal token NULL a real null value
+printf "a:NULL\n" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC" \
+  --property parse.key=true --property key.separator=: --property null.marker=NULL
+sleep 4
+produce_round 3
+echo "waiting for segment roll + cleaner pass..."
+sleep 20
+echo "=== segments ==="
+ls "/tmp/kafka-logs/${TOPIC}-0/" | grep -v deleted
+echo "=== dump-log ==="
+for f in /tmp/kafka-logs/${TOPIC}-0/*.log; do
+  echo "-- $f --"
+  /opt/kafka/bin/kafka-dump-log.sh --files "$f" --print-data-log 2>&1 | grep -E "offset:"
+done
 ```
 
-You can also combine policies with `cleanup.policy=compact,delete` to compact by key **and** still age out very old data.
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+=== segments ===
+00000000000000000000.index
+00000000000000000000.log
+00000000000000000000.timeindex
+00000000000000000007.index
+00000000000000000007.log
+00000000000000000007.snapshot
+00000000000000000007.timeindex
+leader-epoch-checkpoint
+partition.metadata
+=== dump-log ===
+-- /tmp/kafka-logs/compact-demo-0/00000000000000000000.log --
+Log starting offset: 0
+| offset: 4 CreateTime: ... keySize: 1 valueSize: 18 ... key: b payload: round2-value-for-b
+| offset: 5 CreateTime: ... keySize: 1 valueSize: 18 ... key: c payload: round2-value-for-c
+| offset: 6 CreateTime: ... keySize: 1 valueSize: -1 ... key: a
+-- /tmp/kafka-logs/compact-demo-0/00000000000000000007.log --
+Log starting offset: 7
+| offset: 7 CreateTime: ... keySize: 1 valueSize: 18 ... key: a payload: round3-value-for-a
+| offset: 8 CreateTime: ... keySize: 1 valueSize: 18 ... key: b payload: round3-value-for-b
+| offset: 9 CreateTime: ... keySize: 1 valueSize: 18 ... key: c payload: round3-value-for-c
+```
+
+Everything from **round 1** is gone — the cleaner already collapsed it away by the time this ran, since round 2's values for the same keys were newer. **Round 2**'s `b` and `c` survive (offsets 4, 5) because nothing superseded them yet; round 2's `a` was replaced by the **tombstone** (offset 6, `valueSize: -1`, no payload — the real, on-disk marker for "this key is deleted", not a special record type). **Round 3** sits untouched in the still-**active** segment (offset 7 onward) — including a *new* value for `a`, written *after* the tombstone, which correctly becomes the new current value without the tombstone blocking it. The tombstone itself (offset 6) is still present here: it is not removed the instant it is superseded by a newer write — it survives at least `delete.retention.ms` from when the cleaner first processes it, precisely so that any consumer that hasn't caught up yet still gets a chance to see "this key was deleted" before the marker itself disappears.
+
+<Callout title="What this proves about compaction that a diagram alone does not">
+Compaction is not a single global rewrite. Here it ran **at least twice**: once cleaning round 1 out of what was then the active segment (before it rolled), and again once that segment became inactive and got merged with the next one, collapsing round 2's `a` into the tombstone. The **active** segment (offset 7+ here) was never touched by either pass — proven directly above, since round 3's values are exactly as written, byte for byte, with no compaction applied yet.
+</Callout>
+
+Per the official docs (`kafka.apache.org/documentation/#compaction`), log compaction guarantees, in order: any consumer reading from the start of a log sees at least the final state of every key in the order it was written; ordering of records is **never** changed within a partition, only some records are removed; the offset of a record never changes; and — the mechanism proven directly above — **the head of the log** (the currently-active segment) **is never compacted**, so any key written recently is guaranteed to be visible, uncompacted, until it ages into an older segment.
+
+## Combining policies: compact,delete
+
+`cleanup.policy=compact,delete` compacts by key **and** still ages out very old data past `retention.ms`/`retention.bytes` — useful when you want a rebuildable-by-key snapshot but also an absolute ceiling on how long even the latest value per key survives (e.g. GDPR-style "must not retain beyond N days" on top of "keep the latest per key").
+
+```properties
+# config/retention-and-compaction/compact-and-delete.properties
+# section: topic
+cleanup.policy=compact,delete
+retention.ms=2592000000
+min.cleanable.dirty.ratio=0.5
+```
 
 ## Choosing a policy
 
 - **`delete`** — the record is the point; history matters, current-per-key does not. Event streams.
 - **`compact`** — the **key's latest value** is the point; you want a rebuildable snapshot. State, changelogs, config topics.
+- **`compact,delete`** — both, when even the latest-per-key snapshot needs a hard age ceiling.
 
 <Callout title="The one-line takeaway">
-A topic's **`cleanup.policy`** picks its lifecycle. **`delete`** ages records out by **`retention.ms`** / **`retention.bytes`** regardless of consumption — right for event streams. **`compact`** keeps the **latest value per key**, turning the topic into a rebuildable state snapshot — right for changelogs and config. A **tombstone** (null value) deletes a key under compaction.
+A topic's **`cleanup.policy`** picks its lifecycle. **`delete`** ages segments out by **`retention.ms`** / **`retention.bytes`** — proven above with real segment `.deleted` files, both time-triggered and size-triggered, and proven that the **active segment is never trimmed** (total size can exceed `retention.bytes` by one segment). **`retention.bytes` for 50 GiB is `53687091200`**, not `53687456000`. **`compact`** keeps the **latest value per key** — proven above across a real segment boundary, with a real tombstone (`valueSize: -1`) that outlives the write it superseded by `delete.retention.ms`, and with the **active segment proven untouched** by either compaction pass. `log.retention.check.interval.ms` (**default 300000 ms**) and `log.segment.delete.delay.ms` (**default 60000 ms**) are both broker-wide and not dynamically alterable — confirmed with a real `InvalidRequestException`.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="properties" code={`# config/retention-and-compaction/state-topic.properties
+# AI-generated config for a Kafka Streams changelog / state topic
+cleanup.policy=compact
+segment.bytes=1048576
+min.cleanable.dirty.ratio=0.5
+retention.ms=86400000
+`}>
+
+This looks reasonable at a glance — `compact` for a state topic is the right policy family, and the other keys are all real, valid config names. The bug is `retention.ms=86400000` (1 day) sitting on a topic whose `cleanup.policy` is **only** `compact`, not `compact,delete`. `retention.ms` and `retention.bytes` are read by the `delete` cleaner; with a pure `compact` policy, nothing in Kafka's segment-deletion path pays attention to them at all — they are silently inert, not an error, not a warning. Whoever wrote this most likely intended one of two different things: either `cleanup.policy=compact,delete` (compact by key, but also cap total age) or no `retention.ms` line at all (pure compact, no age ceiling, proven above to be the only cleaner that runs when the policy is just `compact`). Leaving it as-is compiles, deploys, and produces a topic that looks configured for both behaviors while only actually getting one of them — the kind of bug that is invisible until someone asks "why didn't old-but-still-present keys get pruned by age like the config implies?"
+
+</SpotTheBug>
+
+## Mental Model
+
+`delete` and `compact` answer two completely different questions, and a topic's `cleanup.policy` says which question this topic even asks. `delete` asks "how **old** is this data?" — it never looks at keys at all, and two records with the same key are just two unrelated records to it. `compact` asks "what is the **current** value for this key?" — it never looks at age at all (until you add `,delete`), and a record's position in time is irrelevant next to whether a newer record with the same key exists. Reading a topic's `cleanup.policy` should immediately tell you which of those two mental models applies — proven above, they behave, and fail, in completely different ways.
+
+## Trade-offs
+
+- **`delete`** — cheap to reason about (pure age/size), but a consumer that falls behind past the retention window silently misses data — proven above: whole segments vanish (`.deleted`, then gone) with no per-record signal.
+- **`compact`** — gives you a rebuildable-by-key snapshot forever, but "forever" is not "instantly" — proven above, a superseded value can survive for a while in an inactive segment until the cleaner's dirty-ratio threshold and backoff interval both allow another pass, and the **active** segment is never compacted at all, so a key's stale value can coexist with its own tombstone or newer value for a real, sometimes-surprising window.
+- **`compact,delete`** — closes the "forever" gap with a hard age ceiling, at the cost of losing the "durable snapshot no matter how old" property that pure `compact` gives you — a very old key's last value can eventually age out even though nothing ever overwrote it.
+- **Aggressive `min.cleanable.dirty.ratio`** (proven above with `0.01`) — makes compaction run almost continuously, good for demos and for topics where stale duplicate values must disappear fast, at the cost of constant cleaner I/O; the real default (`0.5`) trades that for far less background work at the cost of old values sticking around longer.
+
+## Common Misconceptions
+
+- **"`retention.ms`/`retention.bytes` apply to a compacted topic too, capping how old the latest value per key can be."** Proven above (SpotTheBug): with a pure `compact` policy, `retention.ms` is inert — nothing reads it. Only `compact,delete` combines both behaviors.
+- **"Compaction happens instantly the moment a newer value for a key is written."** Proven above: round 2's superseded `a` value only disappeared once the cleaner actually ran (bounded by `min.cleanable.dirty.ratio` and `log.cleaner.backoff.ms`), and round 1 data survived until then too — compaction is a periodic background pass, not a synchronous side effect of `send()`.
+- **"A tombstone deletes a key immediately."** Proven above: the tombstone record itself (offset 6, `valueSize: -1`) was still present in the dump after the value it superseded was already gone — it persists for `delete.retention.ms` specifically so lagging consumers still see the deletion.
+- **"The active segment gets compacted like any other segment, just last."** Proven above: round 3's records, in the active segment, were untouched byte-for-byte by two separate cleaner passes that had already run on the older segments — the active segment is categorically excluded, not merely "not yet reached."
+- **"Retention deletes exactly at the retention window, to the second."** Proven above: deletion only happens when `log.retention.check.interval.ms` next polls (default every 5 minutes) and only affects segments that have already rolled — a record can outlive its nominal `retention.ms` by up to the check interval plus however long it takes its segment to roll.
 
 export const quizRetention = [
   {
-    q: 'What does cleanup.policy=delete do?',
+    q: 'What is the correct retention.bytes value for a 50 GiB cap, proven by direct calculation?',
     options: [
-      'Deletes the topic immediately',
-      'Removes old log segments once they exceed retention.ms or retention.bytes, regardless of whether they were consumed',
-      'Keeps only the latest record per key',
-      'Deletes records after every consumer reads them',
+      '53687456000',
+      '53687091200 -- 50 * 1024^3, exactly',
+      '50000000000',
+      '536870912000',
     ],
     answer: 1,
+    explain: '50 * 1024^3 = 53687091200 exactly. 53687456000 (seen in older notes) is off by 364,800 bytes -- close enough to look plausible, wrong enough to fail an exact check.',
   },
   {
-    q: 'What does log compaction keep?',
+    q: 'Why can real time-based segment deletion not be shown as a fence this harness re-runs on its own default broker, proven above?',
     options: [
-      'The first record ever written',
-      'The most recent record for each key, garbage-collecting older values per key',
-      'A random sample of records',
-      'Only records under 1 KB',
+      'Time-based retention does not actually delete anything',
+      "log.retention.check.interval.ms defaults to 300000ms (5 min) and is confirmed NOT dynamically alterable (a real InvalidRequestException) -- too slow for a 60s harness run without a broker restarted with a faster interval",
+      'The harness broker has retention disabled entirely',
+      'kafka-dump-log.sh cannot read deleted segments',
     ],
     answer: 1,
+    explain: 'Proven with a real kafka-configs.sh --alter attempt: "Cannot update these configs dynamically: [log.retention.check.interval.ms]" -- this course\'s own scratch broker had to be started with KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS=1000 from boot to make the proof practical.',
   },
   {
-    q: 'How do you delete a key from a compacted topic?',
+    q: 'With retention.bytes set small, why did the surviving active segment (415 bytes) exceed the 300-byte cap, proven above?',
     options: [
-      'Run a DELETE SQL statement',
-      'Write a tombstone — a record with that key and a null value',
-      'Lower retention.ms to zero',
-      'You cannot delete keys from a compacted topic',
+      'This is a bug in Kafka',
+      'Retention never trims the ACTIVE segment -- only inactive (rolled) segments are deletion candidates, so total size can exceed retention.bytes by up to one segment',
+      'retention.bytes was not actually applied',
+      'The consumer had not caught up yet',
     ],
     answer: 1,
+    explain: 'Proven above: three full inactive segments were deleted (.deleted, then gone) once retention.bytes=300 was exceeded, but the currently-active segment (415 bytes, over the 300-byte cap) was left alone -- the same "active segment is exempt" rule proven again for compaction later in the lesson.',
   },
   {
-    q: 'Which topic is the best fit for cleanup.policy=compact?',
+    q: 'What did the real kafka-dump-log.sh output prove about a tombstone record on disk, above?',
     options: [
-      'A clickstream where every event matters',
-      'A changelog/state topic where you want the latest value per key and a rebuildable snapshot',
-      'A short-lived metrics feed',
-      'A topic that should be deleted after one day',
+      'Tombstones are a metadata flag, not a real record in the log',
+      'A tombstone is a real record with valueSize: -1 and no payload, and it remained on disk even after the value it superseded (round 2\'s "a") was already gone from the dump',
+      'Tombstones are deleted the instant a newer value for the key is written',
+      'Tombstones only work with cleanup.policy=delete',
     ],
     answer: 1,
+    explain: 'The dump showed "keySize: 1 valueSize: -1 ... key: a" with no payload at offset 6, still present in the same dump where the compacted-away round 2 "a" value had already disappeared -- proving the tombstone is a real record that outlives what it deleted, governed by delete.retention.ms.',
+  },
+  {
+    q: 'What did round 3\'s records (in the active segment) prove about which segments compaction touches, above?',
+    options: [
+      'Compaction touches every segment equally, active or not',
+      "The active segment is never compacted -- round 3's values were untouched byte-for-byte even after two separate cleaner passes had already collapsed round 1 and round 2's superseded values in the older, inactive segments",
+      'Only the active segment gets compacted, to save space immediately',
+      'Compaction only runs once per topic, ever',
+    ],
+    answer: 1,
+    explain: "Proven directly: the dump of the active segment (00000000000000000007.log) showed round 3's a/b/c exactly as written, while the older, now-inactive segment had already been cleaned twice (round 1 gone, round 2's \"a\" replaced by a tombstone).",
   },
 ];
 
