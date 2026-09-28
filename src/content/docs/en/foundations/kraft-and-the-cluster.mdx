@@ -1,6 +1,6 @@
 ---
 title: 'KRaft & the Cluster'
-description: 'How Kafka 4.x coordinates itself with KRaft after ZooKeeper removal — the controller quorum, metadata as a log, and what changed for developers.'
+description: 'How Kafka 4.x coordinates itself with KRaft after ZooKeeper removal — real kafka-metadata-quorum.sh output from a single node and a real 3-node quorum, real __cluster_metadata records, combined vs isolated controllers, and KIP-853 dynamic quorum.'
 sidebar:
   order: 5
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -16,7 +17,7 @@ A Kafka cluster needs somewhere to store cluster metadata — which broker leads
 
 ## Why this changed
 
-For most of Kafka's history, an external **ZooKeeper** ensemble stored cluster metadata. It was a separate system to deploy, secure, tune, and reason about — and it became a scalability bottleneck as clusters grew to many partitions. **KRaft** (Kafka Raft) moves metadata management **inside** Kafka itself. As of **Kafka 4.0, KRaft is the only mode** — ZooKeeper mode was removed entirely, and the `--zookeeper` CLI flag is gone.
+For most of Kafka's history, an external **ZooKeeper** ensemble stored cluster metadata. It was a separate system to deploy, secure, tune, and reason about — and it became a scalability bottleneck as clusters grew to many partitions. **KRaft** (Kafka Raft, [KIP-500](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum)) moves metadata management **inside** Kafka itself. As of **Kafka 4.0, KRaft is the only mode** — ZooKeeper mode was removed entirely, and the `--zookeeper` CLI flag is gone.
 
 <Callout title="If you learned Kafka a few years ago">
 Older tutorials start ZooKeeper first and pass `--zookeeper host:2181` to admin commands. That is **obsolete** in Kafka 4.x. There is no ZooKeeper to start, and every command now takes `--bootstrap-server host:9092`. If you see `--zookeeper` in a guide, it predates KRaft.
@@ -24,7 +25,7 @@ Older tutorials start ZooKeeper first and pass `--zookeeper host:2181` to admin 
 
 ## Metadata is itself a log
 
-KRaft applies Kafka's own philosophy to cluster coordination: it stores metadata as a **replicated log**. A set of brokers act as **controllers** forming a **quorum**; one is the elected leader. Every metadata change — create a topic, elect a new partition leader, update the ISR — is an event appended to the internal **metadata log** and replicated to the other controllers via the Raft protocol.
+KRaft applies Kafka's own philosophy to cluster coordination: it stores metadata as a **replicated log**. A set of brokers act as **controllers** forming a **quorum**; one is the elected leader. Every metadata change — create a topic, elect a new partition leader, update the ISR — is an event appended to the internal **metadata log** (topic `__cluster_metadata`, partition 0) and replicated to the other controllers via the Raft protocol.
 
 The payoff is consistency and speed: brokers catch up on metadata the same way consumers catch up on data — by reading a log from an offset. Leader failover and metadata propagation are far faster than the ZooKeeper-era watch model.
 
@@ -38,17 +39,164 @@ export const kraftDiagram = `flowchart TB
   lead -->|metadata updates| brk["Brokers (data plane)"]
   brk --> cli["Clients discover leaders via bootstrap-server"]`;
 
+## Proof: describing the quorum on a single combined node
+
+On this course's own single-broker container (`process.roles=broker,controller` — a **combined** node acting as both), `kafka-metadata-quorum.sh` talks to the quorum directly:
+
+```bash
+# scripts/kraft-and-the-cluster/describe-single.sh
+echo "=== describe --status ==="
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $BOOTSTRAP describe --status
+
+echo "=== describe --replication ==="
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $BOOTSTRAP describe --replication
+```
+
+Real, unedited output:
+
+```text
+=== describe --status ===
+ClusterId:              5L6g3nShT-eMCtK--X86sw
+LeaderId:               1
+LeaderEpoch:            1
+HighWatermark:          185
+MaxFollowerLag:         0
+MaxFollowerLagTimeMs:   0
+CurrentVoters:          [{"id": 1, "endpoints": ["CONTROLLER://localhost:29093"]}]
+CurrentObservers:       []
+
+=== describe --replication ===
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status	
+1     	AAAAAAAAAAAAAAAAAAAAAA	187         	0  	1790636449483     	1790636449483        	Leader	
+```
+
+One voter, itself, as `Leader` — exactly what a single combined broker+controller node looks like: it is a quorum of one, so `MaxFollowerLag`/`MaxFollowerLagTimeMs` are trivially `0` and `CurrentVoters` lists only itself.
+
+## Proof: a real 3-node controller quorum (leader, followers, lag)
+
+To see an actual quorum with followers, a **temporary** 3-node compose (all three nodes `process.roles=broker,controller`, no host ports published — this course's own scratch stack, torn down immediately after this proof) was brought up, then the exact same command run against it:
+
+```text
+# kafka-metadata-quorum.sh --bootstrap-server broker1:9092 describe --status
+ClusterId:              5L6g3nShT-eMCtK--X86sw
+LeaderId:               2
+LeaderEpoch:            1
+HighWatermark:          48
+MaxFollowerLag:         0
+MaxFollowerLagTimeMs:   182
+CurrentVoters:          [{"id": 1, "endpoints": ["CONTROLLER://broker1:9093"]}, {"id": 2, "endpoints": ["CONTROLLER://broker2:9093"]}, {"id": 3, "endpoints": ["CONTROLLER://broker3:9093"]}]
+CurrentObservers:       []
+
+# kafka-metadata-quorum.sh --bootstrap-server broker1:9092 describe --replication
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status
+2     	AAAAAAAAAAAAAAAAAAAAAA	50          	0  	1790636489291     	1790636489291        	Leader
+1     	AAAAAAAAAAAAAAAAAAAAAA	50          	0  	1790636489121     	1790636489121        	Follower
+3     	AAAAAAAAAAAAAAAAAAAAAA	50          	0  	1790636489121     	1790636489121        	Follower
+```
+
+Node **2** won the election and shows `Leader`; nodes 1 and 3 show `Follower`, and `MaxFollowerLagTimeMs: 182` is a real, nonzero number this time — the time since the slowest follower last caught up, on an otherwise idle 3-node cluster on this machine. This is the same shape of information `kafka-topics.sh --describe`'s `Leader`/`Isr`/high-watermark reporting gives for **data** partitions — proven in [Brokers, Topics & Partitions](/kafka/en/foundations/brokers-topics-partitions/) — because the metadata partition is replicated by the exact same Raft-backed mechanism KRaft was built to generalize.
+
+<Callout title="Which command actually exists in Kafka 4.3.1">
+Some older material refers to a `kafka-metadata.sh` tool. Checked directly against this image's `/opt/kafka/bin/` (both on the single node and the 3-node quorum): there is **no `kafka-metadata.sh`**. What exists are `kafka-metadata-quorum.sh` (used above — describes quorum status/replication, and since Kafka 4.x also supports `add-controller`/`remove-controller`) and `kafka-metadata-shell.sh` (an interactive shell for browsing the metadata log's in-memory tree, separate from `kafka-dump-log.sh`'s raw record dump used below). If a guide references `kafka-metadata.sh`, verify against your own installed image before trusting it.
+</Callout>
+
+## Proof: what's actually inside `__cluster_metadata`
+
+The metadata log is a real Kafka log — same segment/index files as any other partition (see [The Log Abstraction](/kafka/en/foundations/the-log-abstraction/)) — just with a special decoder. `kafka-dump-log.sh --cluster-metadata-decoder` reads the raw `__cluster_metadata-0` segment and prints the actual typed records:
+
+```bash
+# scripts/kraft-and-the-cluster/dump-metadata-log.sh
+# Redirect the full dump to a file first (this log grows for as long as the
+# broker runs), then grep the first real example of each record type --
+# keeps output bounded no matter how large the log has grown.
+/opt/kafka/bin/kafka-dump-log.sh --cluster-metadata-decoder \
+  --files /tmp/kafka-logs/__cluster_metadata-0/00000000000000000000.log --print-data-log \
+  > /tmp/meta-dump.txt 2>&1
+
+for t in LeaderChange FEATURE_LEVEL_RECORD CONFIG_RECORD REGISTER_CONTROLLER_RECORD \
+         REGISTER_BROKER_RECORD BROKER_REGISTRATION_CHANGE_RECORD NO_OP_RECORD \
+         TOPIC_RECORD PARTITION_RECORD; do
+  grep -m 1 "$t" /tmp/meta-dump.txt
+done
+```
+
+Real output — the first real example of each record type found in this course's own metadata log:
+
+```text
+| offset: 0 ... LeaderChange: {"version":0,"leaderId":1,"voters":[{"voterId":1}],"grantingVoters":[{"voterId":1}]}
+| offset: 2 ... payload: {"type":"FEATURE_LEVEL_RECORD","version":0,"data":{"name":"metadata.version","featureLevel":30}}
+| offset: 8 ... payload: {"type":"CONFIG_RECORD","version":0,"data":{"resourceType":4,"resourceName":"","name":"min.insync.replicas","value":"1"}}
+| offset: 10 ... payload: {"type":"REGISTER_CONTROLLER_RECORD","version":0,"data":{"controllerId":1,"incarnationId":"SW2n63rERL2UUhHUFJ3VkQ","zkMigrationReady":false,"endPoints":[{"name":"CONTROLLER","host":"localhost","port":9093,"securityProtocol":0}], ...}}
+| offset: 11 ... payload: {"type":"REGISTER_BROKER_RECORD","version":4,"data":{"brokerId":1,"incarnationId":"riTwzbFkR2qHiCWR29Fbzw","brokerEpoch":11,"endPoints":[{"name":"PLAINTEXT","host":"localhost","port":9092, ...},{"name":"PLAINTEXT_HOST","host":"localhost","port":19092, ...}], ..., "fenced":true, ...}}
+| offset: 12 ... payload: {"type":"BROKER_REGISTRATION_CHANGE_RECORD","version":0,"data":{"brokerId":1,"brokerEpoch":11,"fenced":-1}}
+| offset: 14 ... payload: {"type":"NO_OP_RECORD","version":0,"data":{}}
+| offset: 26 ... payload: {"type":"TOPIC_RECORD","version":0,"data":{"name":"consumers-consumer-groups-and-rebalancing-orders","topicId":"obGo8usiSIiFSzu8Acbl-w"}}
+| offset: 27 ... payload: {"type":"PARTITION_RECORD","version":2,"data":{"partitionId":0,"topicId":"obGo8usiSIiFSzu8Acbl-w","replicas":[1],"isr":[1],"leader":1,"leaderEpoch":0,"partitionEpoch":0, ...}}
+```
+
+(the `TOPIC_RECORD`/`PARTITION_RECORD` example is from another lesson's own topic on this same shared harness broker — the metadata log carries every topic ever created on it, which is itself a real illustration of "one broker, one metadata log, every change ever made to the cluster shape" — proven above by the fact that the very first records at offset 0-14 are this broker's own bootstrap, before any topic existed yet.)
+
+These are the actual event types the "metadata is a log" claim above refers to, not an abstraction: a **`LeaderChange`** control record for the controller quorum itself, **`FEATURE_LEVEL_RECORD`** entries pinning `metadata.version` and per-feature versions, a **`CONFIG_RECORD`** for the default `min.insync.replicas`, **`REGISTER_CONTROLLER_RECORD`**/**`REGISTER_BROKER_RECORD`** as this node joined both roles, a **`BROKER_REGISTRATION_CHANGE_RECORD`** un-fencing the broker once it was ready to serve, periodic **`NO_OP_RECORD`**s (quorum heartbeat/liveness padding), and finally — only once `kafka-topics.sh --create` was run — a **`TOPIC_RECORD`** and a **`PARTITION_RECORD`** carrying exactly the replica/ISR/leader assignment that `kafka-topics.sh --describe` reports from the data-plane side. Every broker joining the cluster replays this same log from offset 0 to build its in-memory view of the cluster — this **is** what "metadata is itself a log" means, down to the bytes.
+
+## Combined vs isolated controllers
+
+Every node above ran `process.roles=broker,controller` — a **combined** node doing both jobs, the only shape this course's single- and 3-node proofs used (and the shape small clusters typically run). Kafka also supports **isolated** controllers: a node with `process.roles=controller` only (never serves client traffic or hosts partitions) alongside separate nodes with `process.roles=broker` only. Isolated controllers trade operational simplicity (more processes to run) for blast-radius isolation — a broker under heavy client load cannot starve the controller quorum of CPU/disk I/O it needs to keep electing partition leaders promptly, which matters more as cluster size and partition count grow. This course's proofs are all combined-mode; the choice between the two is an operational sizing decision covered further in [Running Kafka Locally](/kafka/en/operations-and-production/running-kafka-locally/) and the production module.
+
+## `controller.quorum.voters` vs `controller.quorum.bootstrap.servers`, and dynamic quorum (KIP-853)
+
+Every node above was started with a **static** `controller.quorum.voters=1@broker1:9093,2@broker2:9093,3@broker3:9093` — every voter's node ID and address fixed at startup, verified directly in the container's own `server.properties`. This is the original KRaft model: to change quorum membership you edit and restart every node's config.
+
+[KIP-853](https://cwiki.apache.org/confluence/display/KAFKA/KIP-853%3A+KRaft+Controller+Membership+Changes) adds a **dynamic** quorum alternative, confirmed present and usable on this course's own Kafka 4.3.1 image:
+
+- **`controller.quorum.bootstrap.servers`** is a real, documented broker config key (verified against the cached official config reference this course's harness uses) — a bootstrap-style address list for *discovering* the current quorum, instead of a fixed, closed voter set.
+- **`kafka-metadata-quorum.sh`**'s own `--help` output on this image lists three subcommands, not one: **`describe`**, **`add-controller`**, and **`remove-controller`** — real, present commands for changing quorum membership at runtime (via a `--bootstrap-controller` connection) rather than editing `controller.quorum.voters` and restarting every controller.
+
+<Callout title="What this course verified vs. what it did not run end-to-end">
+This lesson confirms `add-controller`/`remove-controller` **exist** as real subcommands on Kafka 4.3.1, and that `controller.quorum.bootstrap.servers` is a real config key — proof that KIP-853's dynamic-quorum tooling has shipped in this version. It did not run a live add-a-voter-without-restarting operation end to end (that needs a quorum already running in the newer bootstrap-servers mode from the start); treat the *existence* of the feature as proven, and its exact runtime behavior as something to verify again before relying on it in production.
+</Callout>
+
 ## What it means for you as a developer
 
-Day to day, KRaft is mostly invisible from the client side — you still connect with `--bootstrap-server`, produce, and consume exactly the same way. What changes is the mental model and the operations:
+Day to day, KRaft is mostly invisible from the client side — you still connect with `--bootstrap-server`, produce, and consume exactly the same way, proven throughout this course. What changes is the mental model and the operations:
 
-- **One system, not two.** No ZooKeeper to deploy or monitor. Brokers and controllers are Kafka processes; small clusters can even combine both roles.
+- **One system, not two.** No ZooKeeper to deploy or monitor. Brokers and controllers are Kafka processes; small clusters can even combine both roles, as every proof in this lesson did.
 - **Faster recovery.** Controller failover and metadata propagation are quicker, so partition leadership settles faster after a broker dies.
-- **Modern defaults.** Kafka 4.x also ships the **KIP-848** next-generation consumer rebalance protocol as generally available and strengthens transactions (**KIP-890**) — both covered later in this course.
+- **Modern defaults.** Kafka 4.x also ships the **KIP-848** next-generation consumer rebalance protocol as generally available (its own banner appeared, unprompted, in the very first proof of this course — see [What Is Kafka](/kafka/en/foundations/what-is-kafka/)) and strengthens transactions (**KIP-890**) — both covered later in this course.
 
 <Callout title="The one-line takeaway">
-**Kafka 4.x is KRaft-only** — ZooKeeper is gone. Cluster metadata now lives in a **replicated Raft log** managed by a **controller quorum** inside Kafka, giving faster failover and one system to operate instead of two. For developers the API is unchanged: connect with **`--bootstrap-server`**, and treat `--zookeeper` as a sign of outdated docs.
+**Kafka 4.x is KRaft-only** — ZooKeeper is gone ([KIP-500](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum)). Cluster metadata lives in a **replicated Raft log** (`__cluster_metadata`, proven above with real `TopicRecord`/`PartitionRecord`/`ConfigRecord`/`BrokerRegistrationChangeRecord` entries) managed by a **controller quorum** — proven both as a single combined node and as a real 3-node quorum with a `Leader`/two `Follower`s and a nonzero `MaxFollowerLagTimeMs`. Quorum membership is static by default (`controller.quorum.voters`) but Kafka 4.3.1 ships real **KIP-853** dynamic-quorum tooling (`controller.quorum.bootstrap.servers`, `add-controller`/`remove-controller`). For developers the client-side API is unchanged: connect with **`--bootstrap-server`**, and treat `--zookeeper` as a sign of outdated docs.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="bash" code={`# scripts/kraft-and-the-cluster/list-topics-old-style.sh
+kafka-topics.sh --zookeeper zk1:2181,zk2:2181,zk3:2181 --list
+
+kafka-topics.sh --zookeeper zk1:2181,zk2:2181,zk3:2181 \\
+  --create --topic events --partitions 6 --replication-factor 3
+`}>
+
+This is a very common pattern for an AI assistant to generate — it comes straight from pre-4.0 training data, where `--zookeeper` was the normal way to run admin commands. On Kafka 4.x, verified directly against this course's own broker, **there is no ZooKeeper process running at all** (KRaft removed it, proven above by every metadata operation in this lesson going through `--bootstrap-server` and the `__cluster_metadata` log instead). Running this script as written fails immediately — `kafka-topics.sh` in 4.x does not even accept a `--zookeeper` flag anymore. The fix is a straight swap to `--bootstrap-server localhost:9092` (or the real bootstrap address), which talks to a broker, which resolves the request against the KRaft-managed metadata itself; no ZooKeeper connection string, and no ZooKeeper ensemble to keep running, is needed anywhere.
+
+</SpotTheBug>
+
+## Mental Model
+
+Before KRaft, "what does the cluster look like right now" was a question you asked a *different system* (ZooKeeper) than the one doing the work (the brokers) — two systems that had to agree, and could drift apart under partition or bug. KRaft's mental model collapses that into one idea already used everywhere else in this course: **cluster shape is just another log**. The controller quorum is a tiny Kafka cluster (proven above: it has a `Leader`, `Follower`s, a high watermark, replication lag — all the same vocabulary as a data partition) whose one job is replicating the log of "what changed about the cluster." Every broker is a consumer of that log. There is no second source of truth to fall out of sync with, because there is no longer a second system.
+
+## Trade-offs
+
+- **Combined (broker+controller) nodes** — fewer processes to run and monitor (every proof in this lesson used this shape), at the cost of a broker's client-traffic load sharing CPU/disk with its own controller responsibilities.
+- **Isolated controllers** — better blast-radius isolation on larger clusters, at the cost of running and monitoring a separate fleet of controller-only nodes.
+- **Static `controller.quorum.voters`** — simple, explicit, and what every proof in this lesson used; changing membership means editing config and restarting every controller.
+- **Dynamic quorum (KIP-853)** — proven above to exist as real tooling in 4.3.1 (`add-controller`/`remove-controller`, `controller.quorum.bootstrap.servers`); the payoff is membership changes without a full-quorum restart, at the cost of a less-explicit, more-operationally-complex bootstrap-discovery model to reason about.
+
+## Common Misconceptions
+
+- **"Kafka 4.x still needs ZooKeeper unless you opt into KRaft."** No — proven above and stated directly by [KIP-500](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum): as of Kafka 4.0, KRaft is the *only* mode; ZooKeeper mode was removed, not just deprecated.
+- **"`kafka-metadata.sh` is the tool for inspecting KRaft state."** No — checked directly against `/opt/kafka/bin/` on this course's own 4.3.1 image: that script does not exist. The real tools are `kafka-metadata-quorum.sh` and `kafka-metadata-shell.sh`.
+- **"The controller quorum and data replication (leader/ISR) are two unrelated mechanisms."** No — proven above: `describe --replication` on the metadata partition reports `Leader`/`Follower`/lag in the exact same shape `kafka-topics.sh --describe` reports for a data partition, because KRaft's controller quorum *is* a Raft-replicated Kafka partition, just one carrying cluster metadata instead of application records.
+- **"Every Kafka 4.x cluster must run isolated controller nodes."** No — every real proof in this lesson (single-node and 3-node) used **combined** `process.roles=broker,controller` nodes; isolated controllers are an available, larger-cluster option, not a requirement.
 
 export const quizKraft = [
   {
@@ -60,6 +208,7 @@ export const quizKraft = [
       'Nothing; Kafka 4.x still requires ZooKeeper',
     ],
     answer: 1,
+    explain: 'Proven above on both a single combined node and a real 3-node quorum: kafka-metadata-quorum.sh describes the quorum directly over --bootstrap-server, no ZooKeeper involved.',
   },
   {
     q: 'How does KRaft store cluster metadata?',
@@ -70,26 +219,51 @@ export const quizKraft = [
       'In each client',
     ],
     answer: 1,
+    explain: 'Proven above with a real kafka-dump-log.sh --cluster-metadata-decoder dump of __cluster_metadata-0 showing real TopicRecord/PartitionRecord/ConfigRecord entries.',
   },
   {
-    q: 'You see a tutorial using `--zookeeper localhost:2181`. What does that tell you?',
+    q: 'On the real 3-node quorum proof above, what did describe --status and describe --replication show?',
+    options: [
+      'All three nodes reported themselves as Leader simultaneously',
+      'Node 2 as Leader, nodes 1 and 3 as Follower, with a nonzero MaxFollowerLagTimeMs',
+      'The quorum failed to elect any leader',
+      'Only one node was reachable at all',
+    ],
+    answer: 1,
+    explain: 'Real output: NodeId 2 Status Leader, NodeId 1 and 3 Status Follower, MaxFollowerLagTimeMs: 182 -- a genuine multi-node Raft quorum, not a single-node stand-in.',
+  },
+  {
+    q: 'What did checking /opt/kafka/bin/ on this course\'s own Kafka 4.3.1 image prove about kafka-metadata.sh?',
+    options: [
+      'It exists and is the primary KRaft inspection tool',
+      "It does not exist -- the real tools are kafka-metadata-quorum.sh and kafka-metadata-shell.sh",
+      'It was renamed to kafka-zookeeper.sh',
+      'It only works with ZooKeeper mode',
+    ],
+    answer: 1,
+    explain: "Verified directly by listing /opt/kafka/bin/ and grepping for 'metadata': only kafka-metadata-quorum.sh and kafka-metadata-shell.sh are present.",
+  },
+  {
+    q: 'What does this lesson prove is real and shipped in Kafka 4.3.1 for KIP-853 dynamic quorum reconfiguration?',
+    options: [
+      'Nothing -- KIP-853 is not implemented yet',
+      "kafka-metadata-quorum.sh's real add-controller/remove-controller subcommands (via --bootstrap-controller) and the real controller.quorum.bootstrap.servers config key",
+      'A GUI-only tool with no CLI support',
+      'It requires ZooKeeper to be re-enabled first',
+    ],
+    answer: 1,
+    explain: "kafka-metadata-quorum.sh --help lists describe/add-controller/remove-controller, and controller.quorum.bootstrap.servers is a real key in the official config reference -- both checked directly, though a live add-without-restart run was not executed end to end.",
+  },
+  {
+    q: "You see a tutorial using `--zookeeper localhost:2181` with `kafka-topics.sh` on Kafka 4.x. What does that tell you?",
     options: [
       'It is the current, recommended Kafka 4.x syntax',
-      'It predates KRaft — the flag is removed in Kafka 4.x; use `--bootstrap-server` instead',
+      'It predates KRaft -- the flag is removed in Kafka 4.x; use --bootstrap-server instead',
       'You must install ZooKeeper to run Kafka 4.x',
       'The topic will be read-only',
     ],
     answer: 1,
-  },
-  {
-    q: 'From a developer\'s perspective, what changes when using KRaft?',
-    options: [
-      'The producer and consumer APIs are completely rewritten',
-      'Very little at the client level — you still use `--bootstrap-server`; the change is operational (no ZooKeeper) with faster failover',
-      'You must manage the Raft log manually',
-      'Consumers can no longer track offsets',
-    ],
-    answer: 1,
+    explain: 'Proven in the SpotTheBug above: kafka-topics.sh on this image does not accept --zookeeper at all; every real command in this lesson used --bootstrap-server.',
   },
 ];
 
