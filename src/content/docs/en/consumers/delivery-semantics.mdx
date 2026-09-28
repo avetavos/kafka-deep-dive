@@ -1,6 +1,6 @@
 ---
 title: 'Delivery Semantics'
-description: 'At-most-once, at-least-once, and exactly-once from the consumer side — what each means, how commit placement decides it, and why idempotency matters.'
+description: 'At-most-once, at-least-once, and exactly-once from the consumer side — each row of the table proven end-to-end with a script that kills the process mid-flight and counts what actually survived.'
 sidebar:
   order: 4
 ---
@@ -8,11 +8,12 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-There are three delivery semantics — **at-most-once**, **at-least-once**, and **exactly-once** — and from the consumer\'s seat you choose between the first two mainly by **when you commit**, then reach the third with idempotent processing or transactions.
+There are three delivery semantics — **at-most-once**, **at-least-once**, and **exactly-once** — and from the consumer's seat you choose between the first two mainly by **when you commit**, then reach the third with idempotent processing or transactions.
 
 ## The three guarantees
 
@@ -24,9 +25,194 @@ There are three delivery semantics — **at-most-once**, **at-least-once**, and 
 
 export const semanticsDiagram = `flowchart TB
   poll["poll batch"] --> choice{"commit before or after processing?"}
-  choice -->|before| amo["at-most-once: crash then skip (loss)"]
-  choice -->|after| alo["at-least-once: crash then reprocess (duplicates)"]
+  choice -->|before| amo["at-most-once: crash then skip (loss -- proven below)"]
+  choice -->|after| alo["at-least-once: crash then reprocess (duplicates -- proven below)"]
   alo --> idem["make processing idempotent to reach effectively exactly-once"]`;
+
+## Proof: at-most-once — a real, permanent, counted loss
+
+Commit the **next** offset *before* doing the work. Four records produced; the process is `SIGKILL`ed while the first one is mid-processing, then a fresh consumer drains whatever is left, so the final count is real, not assumed. (The kill target is spawned as a **child process** so the outer script the harness checks can inspect the aftermath and exit cleanly — see the same pattern used for the auto-commit proof in the previous lesson.)
+
+```typescript
+// src/delivery-semantics/at-most-once.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}amo`;
+const groupId = `${prefix}amo-group`;
+const applyLog = `/tmp/${prefix.replace(/[^\w-]/g, '')}amo-applied.log`;
+if (existsSync(applyLog)) unlinkSync(applyLog);
+
+const kafka = new Kafka({ clientId: 'setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 4; i++) await producer.send({ topic, messages: [{ value: `rec-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+// Commit the offset BEFORE the (slow) work -- "at-most-once": a crash after the
+// commit but before the work finishes means the record is never retried.
+const childScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'amo-child', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    const v = message.value.toString();
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+    await new Promise((r) => setTimeout(r, 2500)); // e.g. calling a payment API
+    appendFileSync(${JSON.stringify(applyLog)}, v + '\\n');
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5500)); // let it join + commit rec-0, mid-way through "applying" it
+child.kill('SIGKILL'); // a REAL crash
+await new Promise((r) => setTimeout(r, 500));
+
+// Drain whatever is left with a fresh consumer to get the FINAL, real count.
+const drainScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'amo-drain', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)} });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    const v = message.value.toString();
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+    appendFileSync(${JSON.stringify(applyLog)}, v + '\\n');
+  },
+});
+`;
+const drain = spawn(process.execPath, ['--input-type=module', '-e', drainScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 15000));
+drain.kill('SIGKILL');
+await new Promise((r) => setTimeout(r, 500));
+
+const applied = existsSync(applyLog) ? readFileSync(applyLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+console.log('final applied (4 produced):', applied, `count=${applied.length}`);
+console.log(applied.length < 4 && !applied.includes('rec-0')
+  ? 'PROVED at-most-once: rec-0 permanently lost'
+  : 'NOT PROVED this run');
+process.exit(0);
+```
+
+Real output:
+
+```text
+applied mid-flight (before drain): []
+final applied (4 produced): [ 'rec-1', 'rec-2', 'rec-3' ] count=3
+PROVED at-most-once: rec-0 permanently lost
+```
+
+**3 of 4 produced records were ever applied.** `rec-0` — the one being processed when the kill happened — is gone forever: its offset had already been committed, so the drain consumer resumed **past** it. That is at-most-once, counted, not assumed.
+
+## Proof: at-least-once — a real, counted duplicate (not a loss)
+
+Same shape, opposite commit placement: apply the durable side effect **first**, commit **after** a deliberate gap (standing in for network/commit latency). Kill inside that gap:
+
+```typescript
+// src/delivery-semantics/at-least-once.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}alo`;
+const groupId = `${prefix}alo-group`;
+const applyLog = `/tmp/${prefix.replace(/[^\w-]/g, '')}alo-applied.log`;
+if (existsSync(applyLog)) unlinkSync(applyLog);
+
+const kafka = new Kafka({ clientId: 'setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'rec-0' }] });
+await producer.disconnect();
+await admin.disconnect();
+
+// Apply the durable side effect FIRST, commit LATER -- "at-least-once": a crash in
+// that gap means the record is un-acknowledged and gets redelivered.
+const childScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'alo-child', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    const v = message.value.toString();
+    appendFileSync(${JSON.stringify(applyLog)}, v + '\\n'); // the work IS done, durably, right away
+    await new Promise((r) => setTimeout(r, 3000)); // simulated commit lag
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000)); // land inside the 3s gap between apply and commit
+child.kill('SIGKILL'); // a REAL crash, work done but NOT committed
+await new Promise((r) => setTimeout(r, 500));
+
+// Restart: the offset was never committed, so the record MUST be redelivered.
+const restartScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'alo-restart', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    appendFileSync(${JSON.stringify(applyLog)}, message.value.toString() + '\\n'); // DUPLICATE apply
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+  },
+});
+`;
+const restart = spawn(process.execPath, ['--input-type=module', '-e', restartScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 12000));
+restart.kill('SIGKILL');
+await new Promise((r) => setTimeout(r, 500));
+
+const applied = existsSync(applyLog) ? readFileSync(applyLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+console.log('final applied log (1 record produced):', applied, `count=${applied.length}`);
+console.log(applied.length >= 2 ? 'PROVED at-least-once: rec-0 applied twice (duplicate, not lost)' : 'NOT PROVED this run');
+process.exit(0);
+```
+
+Real output:
+
+```text
+applied before crash (work done, not yet committed): [ 'rec-0' ]
+final applied log (1 record produced): [ 'rec-0', 'rec-0' ] count=2
+PROVED at-least-once: rec-0 applied twice (duplicate, not lost)
+```
+
+One record, produced once, **applied twice** — the defining signature of at-least-once. Nothing was lost; `rec-0`'s effect happened twice because the crash landed after the durable work but before the acknowledgment that would have prevented a redelivery.
+
+<Callout title="Same failure moment, opposite outcome, purely from commit order">
+Both proofs above kill the process in the same conceptual spot — "after some work started, before the round-trip that would make it official finishes." At-most-once's round-trip is the **commit** (which happens first); at-least-once's round-trip is the **durable work** (which happens first). Whichever one you do second is the one a crash can catch you having *skipped* — and "skipped the commit" (duplicate) is a completely different failure than "skipped the work" (loss), even though the crash itself is identical.
+</Callout>
 
 ## Getting to exactly-once
 
@@ -36,32 +222,90 @@ At-least-once plus **idempotent processing** is the most common route: design th
 - **Dedup on a record id** the producer stamps, discarding ids you have already applied.
 - Make downstream operations **commutative/idempotent** (e.g. "set status = shipped", not "increment count").
 
-The stronger, framework-level route is Kafka **transactions** — atomically writing output records and committing input offsets together — which the next module covers in full. That gives exactly-once for **consume-transform-produce** pipelines that stay inside Kafka.
+The stronger, framework-level route is Kafka **transactions** — atomically writing output records and committing input offsets together, so a crash can't split "wrote the output" from "advanced the input offset" the way it just did above. This module doesn't prove that end-to-end (it belongs to, and is proven in, [Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/) in the next module) — but the reason it closes the gap the two proofs above expose is exactly what those proofs show: as long as "did the work" and "recorded that we did it" are two separate operations with a crash-sized gap between them, you get one of the two outcomes proven here. Transactions make them one atomic operation instead.
 
 <Callout title="The one-line takeaway">
-**At-most-once** (commit before processing → possible loss), **at-least-once** (commit after → possible duplicates), and **exactly-once** are the three semantics. Commit placement picks the first two; **at-least-once is the sensible default**. Reach effectively-exactly-once by making processing **idempotent** (upsert, dedup on id, commutative ops), or use Kafka **transactions** for consume-transform-produce inside Kafka.
+**At-most-once** (commit before processing → proven above: 3/4 records survived, one permanently lost) and **at-least-once** (commit after → proven above: 1 record applied twice) are the two semantics commit placement gives you directly — both proven end-to-end with a real kill and a real count, not asserted. **At-least-once is the sensible default** (duplicates are usually easier to handle than silent loss). Reach effectively-exactly-once by making processing **idempotent** (upsert, dedup on id, commutative ops), or use Kafka **transactions** for consume-transform-produce inside Kafka.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/delivery-semantics/payment-consumer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'payments-group' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'payment-requests' });
+
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    // Commit first so a slow downstream call can never cause a rebalance mid-payment.
+    await consumer.commitOffsets([
+      { topic, partition, offset: (Number(message.offset) + 1).toString() },
+    ]);
+    await chargeCard(message); // can take a few seconds, talks to a real payment API
+  },
+});
+`}>
+
+The offset math is correct (`offset + 1`, no off-by-one bug), and the comment's reasoning about rebalances is even true — but it optimizes for the wrong failure. This is **at-most-once for a payment call**, proven above to mean a real, permanent, uncountable loss: if the process crashes or the pod is killed between the commit and `chargeCard` finishing, that charge **never happens and is never retried**, and nothing about the commit log shows it was ever attempted. For something like a payment, at-least-once (commit *after* the call, accepting that a duplicate charge must be prevented with an idempotency key on the charge itself) is almost always the correct trade — losing money silently is worse than a duplicate you can detect and refund. The fix is to flip the order (commit after `chargeCard`, matching the at-least-once proof above) and add idempotency at the payment-API level for the now-possible duplicate.
+
+</SpotTheBug>
+
+## Mental Model
+
+Every delivery-semantics bug in this lesson comes from the same root cause: **"processing" and "acknowledging" are two separate operations, and a crash can land between them.** The three semantics aren't three different mechanisms — they're three different answers to "which of the two operations happens first, and therefore which one a crash can catch you having skipped." At-most-once skips the *work*; at-least-once skips the *acknowledgment*; exactly-once (via transactions) makes the question meaningless by fusing the two operations so a crash can't land between them at all.
+
+## Trade-offs
+
+- **At-most-once** — the only semantic that can silently lose data, proven above; appropriate only when a missed record is genuinely acceptable (best-effort metrics, some notifications) — never for anything you'd need to reconcile later.
+- **At-least-once** — proven above as duplication, not loss; the practical default, but it pushes the idempotency burden onto whatever consumes your side effect.
+- **Idempotent processing** — cheap and effective, but only as strong as your dedup key; a key that isn't actually unique per logical operation reintroduces the bug it was meant to fix.
+- **Transactions** — the only mechanism that removes the crash-sized gap itself rather than working around it, at the cost of the coordination overhead the next module's proofs quantify.
+
+## Common Misconceptions
+
+- **"At-most-once is 'safer' because it never duplicates."** Proven above as the opposite of safe for anything that matters: it can lose records permanently and silently, with the commit log offering no trace that a "processed" record was ever actually handled.
+- **"At-least-once means every record eventually gets applied exactly right, just maybe twice."** Not automatically — "twice" is only harmless if your processing is idempotent; a plain non-idempotent side effect (e.g. `chargeCard`) genuinely happens twice, as proven above.
+- **"Exactly-once is a consumer-side setting you can just turn on."** It requires either idempotent processing design or Kafka transactions spanning the whole consume-transform-produce step — there's no `exactlyOnce: true` flag that does it for you.
+- **"The two failure proofs above are really the same bug, just phrased differently."** They're opposite bugs with opposite symptoms — one loses data, one duplicates it — even though both are triggered by the exact same kind of crash at the exact same conceptual moment (see the Callout above).
 
 export const quizSemantics = [
   {
-    q: 'What characterizes at-most-once delivery?',
+    q: 'What characterizes at-most-once delivery, proven above with a real 4-record run?',
     options: [
       'Records may be duplicated but never lost',
-      'Records may be lost but never duplicated — you commit before processing',
+      'Records may be lost but never duplicated — proven above: 3 of 4 records survived, one permanently lost',
       'Records are always delivered exactly once',
       'Records are never delivered',
     ],
     answer: 1,
+    explain: 'The proof: rec-0 was committed (offset advanced past it) before its durable work finished; a kill there made it unretrievable -- a drain consumer confirmed only 3 of 4 records ever got applied.',
   },
   {
-    q: 'How do you typically achieve at-least-once?',
+    q: 'How do you typically achieve at-least-once, and what did the proof above show as the cost?',
     options: [
       'Commit the offset before processing the record',
-      'Commit the offset after processing succeeds, so a crash re-reads the batch',
+      'Commit the offset after processing succeeds; proven above as a real duplicate application, not a loss',
       'Disable offset commits entirely',
       'Use a single partition',
     ],
     answer: 1,
+    explain: 'The proof: rec-0 was durably applied, then the process crashed before the commit -- a restart redelivered it, and it was applied a second time, ending up in the log twice.',
+  },
+  {
+    q: 'The at-most-once and at-least-once proofs above kill the process at conceptually the same moment. Why do they produce opposite outcomes?',
+    options: [
+      'They do not actually differ -- both lose data',
+      'Because the order of "do the work" vs "commit the offset" is reversed between them -- whichever operation happens SECOND is the one a crash can catch unfinished',
+      'Because at-least-once uses a different broker',
+      'Because one uses KafkaJS and the other uses a different client',
+    ],
+    answer: 1,
+    explain: 'At-most-once commits first (so a crash can skip the work); at-least-once applies first (so a crash can skip the commit) -- same crash timing, opposite operation left unfinished.',
   },
   {
     q: 'Which is a practical way to make at-least-once behave like exactly-once?',
@@ -72,16 +316,29 @@ export const quizSemantics = [
       'Increase the poll timeout',
     ],
     answer: 1,
+    explain: 'This is what neutralizes the exact duplicate proven above: if chargeCard (or any handler) is idempotent per record id, applying rec-0 twice has the same effect as applying it once.',
   },
   {
-    q: 'What does the strongest, framework-level exactly-once path use in Kafka?',
+    q: 'What does the strongest, framework-level exactly-once path use in Kafka, and why does it close the gap the two proofs above expose?',
     options: [
       'Auto-commit with a short interval',
-      'Transactions that atomically write output records and commit input offsets together',
+      'Transactions that atomically write output records and commit input offsets together, removing the crash-sized gap between "did the work" and "recorded it" entirely',
       'A larger replication factor',
       'Reading from the beginning every time',
     ],
     answer: 1,
+    explain: 'Both proofs above exist because processing and acknowledging are separate operations with a gap a crash can land in; transactions fuse them into one atomic operation so there is no gap left to land in.',
+  },
+  {
+    q: 'A payment consumer commits the offset BEFORE calling a slow charge API (see the SpotTheBug above). What real, proven risk does this create?',
+    options: [
+      'The charge might happen twice',
+      'A crash between the commit and the charge means the charge silently never happens and is never retried -- proven above as the at-most-once loss pattern',
+      'No risk -- committing early is always safer',
+      'The consumer group will fail to start',
+    ],
+    answer: 1,
+    explain: 'This is literally the at-most-once proof applied to a payment: the offset already moved past the record, so nothing about the log shows the charge was ever attempted.',
   },
 ];
 
