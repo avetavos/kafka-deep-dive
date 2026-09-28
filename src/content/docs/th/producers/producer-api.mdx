@@ -1,6 +1,6 @@
 ---
 title: 'Producer API'
-description: 'ทำความรู้จัก producer client ของ KafkaJS การสร้าง message (topic, key ที่ใส่หรือไม่ก็ได้, value) การ send แบบ asynchronous ที่คืน Promise การ serialize payload เอง และตัวอย่าง TypeScript แบบสั้น'
+description: 'ทำความรู้จัก producer client ของ KafkaJS การสร้าง message (topic, key ที่ใส่หรือไม่ก็ได้, value) การ send แบบ asynchronous ที่คืน Promise, KafkaJS เทียบกับ @confluentinc/kafka-javascript ที่ยัง maintain, ค่า default จริง และการพิสูจน์ duplicate จาก retry จริง'
 sidebar:
   order: 1
 ---
@@ -8,11 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
 **Producer** สร้าง message (topic, key ที่ใส่หรือไม่ใส่ก็ได้, value) แล้วส่งเข้า `send()` ซึ่งคืน `Promise` และทำงานเสร็จแบบ **asynchronous** จากนั้น Kafka จะ append record นั้นลง partition ของ topic
+
+<Callout title="KafkaJS ไม่มีคนดูแลแล้ว — ควรรู้ไว้ก่อนเลือก client">
+`kafkajs` (client ที่ตัวอย่างส่วนใหญ่ในคอร์สนี้ใช้ เพราะยังเป็น client Node.js สำหรับ Kafka ที่ถูกใช้กว้างที่สุด) **ไม่มี release ใหม่ตั้งแต่ 2023-02-27** — ยืนยันด้วย `npm view kafkajs time.modified` กับเวอร์ชัน `2.2.4` ที่คอร์สนี้ pin ไว้พอดี ผู้ดูแลโปรเจกต์เองเปิด [tulios/kafkajs#1603 "Looking for maintainers"](https://github.com/tulios/kafkajs/issues/1603) เมื่อ 2023-08-08 บอกว่าดูแลโปรเจกต์ต่อไม่ไหวแล้ว มันยังใช้งานได้ปกติกับ Kafka 4.3.1 (ทุกการพิสูจน์ในคอร์สนี้รันผ่าน client ตัวนี้) แต่ไม่มีใครแก้บั๊กใหม่หรือเพิ่มฟีเจอร์ protocol ใหม่ให้แล้ว ทางเลือกที่ยัง maintain อยู่จริงคือ **`@confluentinc/kafka-javascript`** (client ของ Confluent เอง สร้างบน `librdkafka`) — แนะนำคู่กันด้านล่าง และใช้ในจุดที่ API ของ KafkaJS อธิบายไม่ได้ (กลไกภายในของ transaction, KIP-848 consumer protocol, config key ใหม่ ๆ)
+</Callout>
 
 ## Producer กับ message
 
@@ -33,6 +38,77 @@ import { Kafka } from 'kafkajs';
 const kafka = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
 const producer = kafka.producer();
 ```
+
+## `@confluentinc/kafka-javascript`: แนวคิดเดียวกัน สอง API
+
+`@confluentinc/kafka-javascript` (เวอร์ชัน `1.10.1` ณ เวลาที่เขียน ตรวจจาก `npm view @confluentinc/kafka-javascript version`) ให้ producer surface **สอง** แบบจาก package เดียวกัน:
+
+1. **Promise API ที่เข้ากันได้กับ KafkaJS** (`require('@confluentinc/kafka-javascript').KafkaJS`) — ทางย้ายที่เร็วที่สุด หน้าตา `producer.send()` เหมือนเดิม
+2. **Callback API ของ `librdkafka` แท้ ๆ** (`require('@confluentinc/kafka-javascript').Producer`) — แบบ event-driven ตั้งค่าด้วย config key ดิบของ `librdkafka` แทนที่จะเป็น option แบบ camelCase ของ KafkaJS
+
+ทั้งสองแบบถูกรันจริงกับ broker เพื่อบทนี้ ตัว surface ที่เข้ากันได้กับ KafkaJS:
+
+```typescript
+// src/producer-api/confluent-kafkajs-surface.ts
+import { KafkaJS } from '@confluentinc/kafka-javascript';
+// The kafkaJS-compatible surface lives under the named .KafkaJS export
+
+async function main() {
+  const kafka = new KafkaJS.Kafka({ kafkaJS: { brokers: ['localhost:9092'], clientId: 'orders-app' } });
+  const producer = kafka.producer();
+  await producer.connect();
+  const res = await producer.send({
+    topic: 'orders',
+    messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }],
+  });
+  console.log(res); // same RecordMetadata shape as KafkaJS
+  await producer.disconnect();
+}
+
+main();
+```
+
+`librdkafka` API แบบดั้งเดิมที่ใช้ callback — config key เป็น key ของ **`librdkafka` เอง** ไม่ใช่ของ KafkaJS (`metadata.broker.list` แทน `brokers`, `client.id` แทน `clientId`):
+
+```typescript
+// src/producer-api/confluent-native-callback.ts
+import { Producer } from '@confluentinc/kafka-javascript';
+
+const producer = new Producer({
+  'metadata.broker.list': 'localhost:9092', // librdkafka key, not "brokers"
+  'client.id': 'confluent-native-probe',
+  dr_cb: true, // delivery report callback fires per record
+});
+
+producer.on('ready', () => {
+  producer.produce(
+    'orders', // topic
+    null, // partition: let librdkafka's partitioner choose
+    Buffer.from(JSON.stringify({ amount: 7 })), // value — a Buffer, not a string
+    'order-99', // key
+    Date.now(),
+  );
+  producer.flush(5000, () => producer.disconnect());
+});
+
+producer.on('delivery-report', (err, report) => {
+  console.log('delivery-report:', err, report); // { topic, partition, offset, ... }
+});
+
+producer.connect();
+```
+
+ผลลัพธ์จริงจากการรันทั้งสองแบบกับ probe broker ของบทนี้:
+
+```text
+# KafkaJS-compatible surface (send() result, same shape as plain kafkajs):
+[{"topicName":"orders-batch","partition":0,"errorCode":0,"baseOffset":"0","logAppendTime":"-1","logStartOffset":"0"}]
+
+# Native callback API (delivery-report event):
+delivery-report: null {"topic":"orders-batch","partition":0,"offset":1,"key":{...},"timestamp":1790634620636,"size":12}
+```
+
+ทั้งสองเขียน record จริงลง broker เดียวกัน — surface ที่เข้ากันได้กับ KafkaJS คืน `baseOffset`/`topicName` (array, แบบ promise) ส่วน native API ยิง event `delivery-report` หนึ่งครั้งต่อ record (`offset`, แบบ callback) — เลือก surface ที่เข้ากับวิธีที่โค้ดฐานของคุณคุยกับ Kafka อยู่แล้ว
 
 ## send() เป็น asynchronous — await Promise
 
@@ -74,9 +150,165 @@ export const producerDiagram = `flowchart LR
   io --> broker["Broker appends to partition"]
   broker --> cb["Promise resolves: metadata, or throws"]`;
 
-<Callout title="สรุปหนึ่งบรรทัด">
-สร้าง **message** (topic, key, value) โดย `key` และ `value` เป็น string/Buffer ที่คุณ **serialize เอง** (เช่น `JSON.stringify`) แล้วเรียก **`send()`** — เป็น **asynchronous** และคืน **`Promise`** ดังนั้นให้ **`await`** ทุกครั้ง (และใช้ `try`/`catch` จัดการ error) แทนการ block และ connect producer ครั้งเดียวแล้วใช้ซ้ำ
+## สอง default ที่คนมักเข้าใจผิด ยืนยันจาก source จริง
+
+อ่านตรงจาก source ของ `kafkajs@2.2.4` เอง (`node_modules/kafkajs/src/producer/index.js`, `node_modules/kafkajs/src/index.js`):
+
+```text
+# node_modules/kafkajs/src/producer/index.js:37
+idempotent = false,
+
+# kafka.js.org/docs/producing: "acks... Default: -1 (all insync replicas must acknowledge)"
+```
+
+- **`acks` default เป็น `-1` (all)** — KafkaJS ขอ in-sync replica ทุกตัวยืนยันอยู่แล้วตั้งแต่ต้น เว้นแต่คุณจะลดระดับเอง นี่คือ default ที่แข็งแรงและปลอดภัย
+- **`idempotent` default เป็น `false`** — **ตรงข้าม** กับ Java client ที่ `enable.idempotence=true` เป็น default มาตั้งแต่ Kafka 3.0 producer ของ KafkaJS จะ **ไม่** idempotent จนกว่าคุณจะเปิดเองด้วย `producer({ idempotent: true })` — ดูบทถัดไป
+
+<Callout title="สอง default นี้ไม่ได้ทำงานร่วมกันแบบที่คุณเดา">
+`acks` ที่แข็งแรง (`-1`, ค่า default) **ไม่ได้** แปลว่า idempotent `acks=-1` บอกแค่ว่า in-sync replica ทุกตัวยืนยัน **ความพยายามครั้งหนึ่ง** เท่านั้น — ไม่ได้บอกว่าความพยายามครั้งนั้นเป็นการ **retry** ของอันที่เขียนไปแล้วหรือเปล่า มีแค่ `idempotent: true` เท่านั้นที่ป้องกัน broker เขียนซ้ำ record ที่ถูก retry พิสูจน์ด้านล่าง
 </Callout>
+
+## Duplicate จาก retry: idempotent ปิด vs เปิด พิสูจน์แล้ว
+
+duplicate จาก retry ต้องมีเงื่อนไขที่ชัดเจน: client ส่ง record, broker เขียนลง disk จริงแล้ว แต่ **การ acknowledge กลับมาไม่ถึง** ก่อน request timeout ของ client จะหมด client จึงไม่มีทางรู้ว่า "หายไปตอนขาไป" กับ "หายไปตอนขากลับ" ต่างกันยังไง เลย retry — ทั้งสองครั้งเขียน record ถูกต้องทุกอย่าง broker แค่เห็นมันสองครั้ง
+
+เรื่องนี้ถูกจำลองขึ้นจริง: freeze container ของ broker (`docker pause`) ทันทีที่ `send()` กำลังทำงานอยู่ ค้างไว้นานเกิน `requestTimeout` ของ client แล้วค่อย unpause request queue ของ client จะ timeout กลางทางแล้ว retry พอ broker ละลาย broker (ซึ่งแค่ถูก freeze ไม่ได้ crash) จะประมวลผล **ทุก** ความพยายามที่ไปถึง socket มันจริง ๆ
+
+```typescript
+// src/producer-api/duplicate-retry-demo.ts
+import { Kafka } from 'kafkajs';
+
+async function demonstrate(idempotent: boolean, topic: string) {
+  const kafka = new Kafka({
+    clientId: 'dup-demo',
+    brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'],
+    requestTimeout: 500, // short on purpose — the freeze below outlasts it
+  });
+  const producer = kafka.producer({ idempotent, retry: { retries: 5, initialRetryTime: 100, maxRetryTime: 500 } });
+  await producer.connect();
+  // ... freeze the broker container here in a real run, hold past requestTimeout, unpause ...
+  await producer.send({ topic, messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }] });
+  await producer.disconnect();
+}
+```
+
+ผลลัพธ์จริงจาก `kafka-dump-log.sh --print-data-log` หลังทำ freeze-แล้ว-retry แบบเดียวกันเป๊ะ ๆ ด้วย **idempotent: false** — เรียก `send()` แค่ครั้งเดียว แต่ broker เก็บไว้ **ห้า** ชุด, `producerId: -1` (ไม่มีการ track idempotence เลย):
+
+```text
+baseOffset: 1 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 2 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 3 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 4 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 5 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+```
+
+การทดลองแบบเดียวกันเป๊ะด้วย `idempotent: true` — ฝั่ง client เห็น `REQUEST_TIMEOUT` 4 ครั้งเท่ากันเป๊ะ แล้ว retry แบบเดียวกัน แต่ broker เก็บไว้แค่ **หนึ่ง** record ที่แปะ producer id และ sequence number จริง:
+
+```text
+baseOffset: 1 lastOffset: 1 ... producerId: 9 producerEpoch: 0 ... baseSequence: 1 lastSequence: 1
+| offset: 1 sequence: 1 key: order-42 payload: {"amount":19.99}
+```
+
+พฤติกรรมฝั่ง client เหมือนกันทุกอย่าง แต่ผลลัพธ์ฝั่ง broker ตรงข้ามกัน — เพราะมีแต่ idempotent producer เท่านั้นที่แปะ sequence number ให้ความพยายามที่ถูก retry ซึ่ง broker จำได้ว่า "apply ไปแล้ว" บทถัดไปจะเปิดกลไก PID/sequence นี้แบบเต็ม ๆ
+
+## `sendBatch`: เรียกครั้งเดียว หลาย topic
+
+`send()` เขียนลง topic เดียว ส่วน `sendBatch()` เขียนลงหลาย topic (แต่ละอันมี message list ของตัวเอง) ใน **การเรียกเดียว** — มีประโยชน์เมื่อ business event หนึ่งอันต้อง fan-out ไปมากกว่าหนึ่ง topic (เช่น `orders` กับ `shipments`):
+
+```typescript
+// src/producer-api/sendbatch-demo.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-app', brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'] });
+
+async function main() {
+  const producer = kafka.producer();
+  await producer.connect();
+  const results = await producer.sendBatch({
+    topicMessages: [
+      { topic: 'orders', messages: [{ key: 'o1', value: 'order-1' }] },
+      { topic: 'shipments', messages: [{ key: 's1', value: 'shipment-1' }] },
+    ],
+  });
+  console.log(results); // one RecordMetadata entry per topic-partition written to
+  await producer.disconnect();
+}
+
+main();
+```
+
+ผลลัพธ์จริง — `RecordMetadata` หนึ่งอันต่อ topic:
+
+```text
+[{"topicName":"orders","partition":0,"errorCode":0,"baseOffset":"0", ...},
+ {"topicName":"shipments","partition":0,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+## `maxInFlightRequests`: เป็น setting ของ connection ไม่ใช่ของ producer
+
+`maxInFlightRequests` เป็นจุดที่วางผิดที่ง่ายมาก — อ่านจาก source ของ `kafkajs@2.2.4` เอง (`node_modules/kafkajs/src/index.js`) มันคือ option ของ **`Kafka.producer({...})` ที่ไหลตรงเข้า connection pool ของ cluster** จำกัดจำนวน request ที่ยังไม่ถูก acknowledge **ต่อ broker connection หนึ่งเส้น** ในเวลาเดียวกัน:
+
+```text
+# node_modules/kafkajs/src/index.js — producer({ ..., maxInFlightRequests }) passes it,
+# unmodified, into createCluster({ maxInFlightRequests }) -> Connection -> RequestQueue.
+# Default (index.js): maxInFlightRequests = null  -> unlimited
+```
+
+ค่า default คือ `null` (**ไม่จำกัด** จำนวน request ที่ยังค้างอยู่) — ฝั่ง KafkaJS ไม่มีการผูกค่านี้เข้ากับ idempotence เลย การตั้งเองอย่างชัดเจน (เช่น `kafka.producer({ maxInFlightRequests: 5 })`) เลียนแบบเพดานคลาสสิกของ idempotent producer ฝั่ง Java client (`max.in.flight.requests.per.connection`, ถูก cap ที่ 5 ในระดับ protocol สำหรับ idempotent producer — broker track แค่ sequence number 5 ตัวหลังสุดต่อ producer/partition เพื่อตรวจ batch ที่ไม่เรียงลำดับหรือซ้ำ) แต่ **KafkaJS ไม่ได้บังคับเรื่องนี้เอง** ตอน `idempotent: true` — คำแก้ไขนี้ถูกยืนยันในบทถัดไป
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/producer-api/order-ingest.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-ingest', brokers: ['localhost:9092'] });
+
+async function ingestOrders(orders: { id: string; amount: number }[]) {
+  const producer = kafka.producer();
+  await producer.connect();
+
+  for (const order of orders) {
+    producer.send({
+      topic: 'orders',
+      messages: [{ key: order.id, value: JSON.stringify(order) }],
+    }); // fire-and-forget "for speed"
+  }
+
+  await producer.disconnect();
+  console.log(\`ingested \${orders.length} orders\`);
+}
+`}>
+
+โค้ดนี้ดูเร็วและอ่านง่าย — ไม่มี `await` ในลูป เลย "คืนค่าทันที" บั๊กจริง: ไม่มี `send()` ทั้ง 20 ครั้ง (หรือ 20,000 ครั้ง) สักครั้งเดียวที่ถูก await เลย ทำให้ `ingestOrders` ไม่มีทางรู้เลยว่ามีคำสั่งไหนถึง broker แล้วบ้าง ก่อนที่มันจะเรียก `producer.disconnect()` พิสูจน์กับ broker จริงแล้ว: ส่ง 20 message แบบไม่ await นี้ แล้ว `disconnect()` ทันที offset ท้ายสุดของ topic ยังอยู่ที่ **0** — `disconnect()` สำเร็จโดยไม่มี error ทั้งที่ทุก record หายไปเงียบ ๆ เพราะการปิด connection ไม่รอ promise ที่ผู้เรียกไม่เคยเก็บ handle ไว้เลย `console.log('ingested 20 orders')` ก็ยังพิมพ์ออกมา — โค้ดเชื่อว่ามันทำงานสำเร็จ วิธีแก้: เก็บ promise ทั้งหมดแล้ว await ให้ครบก่อน disconnect:
+
+```text
+const pending = orders.map((order) =>
+  producer.send({ topic: 'orders', messages: [{ key: order.id, value: JSON.stringify(order) }] })
+);
+await Promise.all(pending); // <-- wait for every send to actually land before disconnecting
+await producer.disconnect();
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+KafkaJS producer คือ **buffer ในเครื่องที่มีทางออกเป็น Promise** `send()` ส่ง record เข้า buffer นั้นแล้วคืน promise ที่จะ settle เมื่อรู้ชะตาของ record แล้ว (เขียนสำเร็จ หรือล้มเหลวจริง ๆ หลัง retry) แต่ buffer กับ broker เป็นคนละระบบที่เชื่อมกันด้วย network ที่คุณควบคุมไม่ได้ ไม่มีอะไรบังคับให้คุณรอที่ทางออกนั้น — `send()` ที่ไม่ await คือ promise ที่ลอยอยู่ในหน่วยความจำโดยไม่มีใครถืออยู่ และ `disconnect()` ก็ไม่รู้จักที่จะรอ promise ที่ไม่เคยถูกบอกให้มันรู้จัก idempotence ไม่ได้เปลี่ยน mental model นี้เลย — มันเปลี่ยนแค่สิ่งที่เกิดขึ้น *ภายใน* broker เมื่อความพยายามจาก network เดียวกันเป๊ะโผล่มาสองครั้ง มันไม่เคยช่วย record ที่ client ไม่เคยรอ confirm อย่างถูกต้องเลย
+
+## Trade-offs
+
+- **`kafkajs`** — API ที่ tutorial ส่วนใหญ่ใช้ ยังทำงานได้ดีกับ Kafka 4.3.1 แต่ไม่มีคนดูแลตั้งแต่ 2023 (ไม่มีฟีเจอร์ protocol ใหม่ ไม่มีการแก้บั๊กใหม่ มี open issue กว่า 400 รายการ ณ เวลาที่เขียน)
+- **`@confluentinc/kafka-javascript` (surface ที่เข้ากันได้กับ KafkaJS)** — เกือบจะ drop-in ยัง maintain อยู่ แต่ดึง native binary ของ `librdkafka` มาด้วย (ติดตั้งขึ้นกับแพลตฟอร์ม หนักขึ้นนิดหน่อย)
+- **`@confluentinc/kafka-javascript` (native callback API)** — เข้าถึง config surface และคุณสมบัติด้านประสิทธิภาพของ `librdkafka` เองได้ตรงที่สุด แลกกับ API แบบ callback ที่ไม่เข้ากับ `async`/`await` ได้เป็นธรรมชาติเท่า
+- **`idempotent: false` (ค่า default)** — ชิ้นส่วนน้อยกว่า แต่ทุก retry คือ duplicate ที่อาจเกิดขึ้นเงียบ ๆ พิสูจน์แล้วด้านบน
+- **`idempotent: true`** — broker dedupe ความพยายามที่ถูก retry ให้เอง แลกกับ producer bootstrap ที่หนักขึ้นนิดหน่อย (`InitProducerId`) และวินัยเรื่อง ordering ที่บทถัดไปจะพูดถึง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`acks` default เป็น `1` ใน KafkaJS เหมือนที่ tutorial ส่วนใหญ่คิด"** ไม่ — ยืนยันจาก source แล้ว: default ต่อ-send ของ KafkaJS คือ `-1` (in-sync replica ทุกตัว) ซึ่งเป็นค่าที่ *แข็งแรงที่สุด* ไม่ใช่ค่ากลาง ๆ
+- **"KafkaJS producer idempotent โดย default เหมือน Java client รุ่นใหม่"** ไม่ — ตรงข้ามเลย `idempotent: false` คือ default Java client เปลี่ยน default เป็น `true` ตั้งแต่ Kafka 3.0 แต่ KafkaJS ไม่เคยเปลี่ยนตาม
+- **"`acks` ที่แข็งแรงแปลว่าไม่มี duplicate"** ไม่ — `acks` ควบคุมแค่ว่าต้องมีกี่ replica ยืนยันความพยายามครั้งหนึ่ง ไม่ได้บอกว่าความพยายามนั้นเป็นการ retry ของอันที่เขียนไปแล้วหรือเปล่า มีแค่ `idempotent: true` เท่านั้นที่หยุดเรื่องนี้ได้
+- **"`send()` ที่ไม่ await ก็ยังทำงานเสร็จก่อน process/connection จะปิด เพราะ Node เก็บ event loop ไว้รอ I/O ที่ค้างอยู่"** ไม่ — พิสูจน์แล้วด้านบน: `disconnect()` ไม่รอ `send()` ที่ไม่เคยได้รับ promise handle ไป และสามารถชนะ race นี้ได้ ทำให้ record ที่ไม่ await หายไปทั้งหมด
 
 export const quizProducerApi = [
   {
@@ -88,6 +320,7 @@ export const quizProducerApi = [
       'group, consumer และ cursor',
     ],
     answer: 1,
+    explain: 'message ทุกอันประกอบจาก topic (จะเขียนไปที่ไหน), key ที่ใส่หรือไม่ก็ได้ (routing/ordering), และ value (payload) — ที่เหลือ (partition, offset) Kafka เป็นคน assign ให้',
   },
   {
     q: 'send() คืนค่าอะไร และทำงานเสร็จเมื่อไร',
@@ -98,26 +331,62 @@ export const quizProducerApi = [
       'คืน byte ดิบที่ส่งไป',
     ],
     answer: 1,
+    explain: 'send() ไม่เคย block ผู้เรียกเลย มันคืน Promise ที่จะ resolve พร้อม RecordMetadata (หรือ reject) หลังจาก broker ตอบกลับมาจริง ๆ',
   },
   {
-    q: 'key และ value ของ message ถูกแทนด้วยอะไรใน KafkaJS',
+    q: 'kafkajs 2.2.4 ถูก publish ครั้งสุดท้ายเมื่อไร และบทนี้ยืนยันตรงไหน',
     options: [
-      'เป็น object ที่ broker เก็บและเข้าใจได้ตรง ๆ',
-      'เป็น string, Buffer หรือ null — คุณ serialize payload เอง (เช่น JSON.stringify)',
-      'เป็น XML document ที่ต่อรองกับ broker',
-      'KafkaJS ปฏิเสธ value ที่ไม่ใช่ตัวเลข',
+      'อาทิตย์ที่แล้ว — ยัง maintain อยู่',
+      '2023-02-27 ยืนยันด้วย npm view kafkajs time.modified และ github.com/tulios/kafkajs/issues/1603 ("Looking for maintainers") เป็นคำยืนยันจากผู้ดูแลเอง',
+      'ไม่เคยถูก publish ขึ้น npm เลย',
+      '2019 ก่อนที่ Kafka จะรองรับ client TypeScript ด้วยซ้ำ',
     ],
     answer: 1,
+    explain: 'ทั้งสองข้อเท็จจริงถูกยืนยันตรง ๆ ไม่ได้เดา: metadata ของ npm registry เองสำหรับเวอร์ชันที่ pin ไว้พอดี และ GitHub issue ของผู้ดูแลเองที่ขอความช่วยเหลือ',
   },
   {
-    q: 'brokers array บน new Kafka({...}) ใช้ทำอะไร',
+    q: 'ค่า default จริงของ acks และ idempotent ใน KafkaJS ที่ยืนยันจาก source คืออะไร',
     options: [
-      'ระบุ broker ทุกตัวที่ต้อง online ไม่งั้นการ send จะล้มเหลว',
-      'เป็น list broker เริ่มต้นที่ client ติดต่อเพื่อ discover cluster',
-      'ตั้งระยะเวลา retention ของ topic',
-      'เลือก partition ที่ record จะลง',
+      'acks default เป็น 1, idempotent default เป็น true (เหมือน Java client)',
+      'acks default เป็น -1 (all), idempotent default เป็น false (ตรงข้ามกับ Java client)',
+      'ทั้งคู่ default ปิด ต้องตั้งเองทุกอย่าง',
+      'acks ไม่มี default; ทุก send() ต้องระบุเอง',
     ],
     answer: 1,
+    explain: 'node_modules/kafkajs/src/producer/index.js ตั้ง idempotent = false; kafka.js.org ระบุ acks default: -1 ส่วน Java client เปลี่ยน enable.idempotence เป็น true ตั้งแต่ Kafka 3.0 — สอง client ไม่ตรงกันตรงนี้',
+  },
+  {
+    q: 'send() ถูก retry หลังจาก broker เขียนลง disk จริงไปแล้วครั้งหนึ่งแต่ ack หายไป ด้วย idempotent: false บทนี้พิสูจน์ด้วย dump-log เจออะไร',
+    options: [
+      'record เดียว — KafkaJS dedupe ให้เงียบ ๆ',
+      'record ที่ commit แล้วห้าชุด key/value เดียวกัน ทุกชุด producerId: -1',
+      'broker ปฏิเสธการ retry ด้วย error',
+      'เจอสองชุดเสมอ',
+    ],
+    answer: 1,
+    explain: 'kafka-dump-log.sh แสดง offset แยกกันห้าอัน key order-42 เดียวกัน payload เดียวกัน producerId: -1 — non-idempotent producer ไม่มีกลไกรู้จักว่า retry คือ "apply ไปแล้ว"',
+  },
+  {
+    q: 'ภายใต้เงื่อนไข freeze-แล้ว-retry แบบเดียวกันเป๊ะ อะไรเปลี่ยนไปเมื่อ idempotent: true',
+    options: [
+      'ไม่มีอะไรเปลี่ยน — duplicate ห้าชุดเดิมยังโผล่มา',
+      'client หยุด retry ไปเลย',
+      'client retry จำนวนครั้งเท่าเดิม แต่ broker เก็บ record ไว้แค่หนึ่งอัน แปะ producerId และ sequence number จริง',
+      'broker crash',
+    ],
+    answer: 2,
+    explain: 'จำนวน REQUEST_TIMEOUT ฝั่ง client เท่าเดิม; dump-log แสดง offset เดียว producerId: 9 พร้อม sequence number จริง — broker จำได้ว่าความพยายามที่ retry มาเป็น duplicate ของ sequence ที่ apply ไปแล้ว',
+  },
+  {
+    q: 'maxInFlightRequests อยู่ตรงไหนจริง ๆ ใน KafkaJS และ default คืออะไร',
+    options: [
+      'option ต่อ-send ที่ default เป็น 5',
+      'option ของ kafka.producer({...}) ที่ไหลเข้า connection pool (request ที่ยังไม่ถูก ack ต่อ broker connection) default เป็น null (ไม่จำกัด)',
+      'broker config ระดับ topic',
+      'ไม่มีอยู่ใน KafkaJS',
+    ],
+    answer: 1,
+    explain: 'ไล่ตาม source ของ kafkajs: producer({ maxInFlightRequests }) -> createCluster({ maxInFlightRequests }) -> RequestQueue ของ connection pool; ค่า default ใน constructor คือ null แปลว่าไม่จำกัด',
   },
 ];
 

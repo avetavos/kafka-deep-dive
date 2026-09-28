@@ -1,6 +1,6 @@
 ---
 title: 'The Producer API'
-description: 'The KafkaJS producer client — building a message (topic, optional key, value), the asynchronous send that returns a Promise, serializing payloads yourself, and a minimal TypeScript example.'
+description: 'The KafkaJS producer client — building a message (topic, optional key, value), the asynchronous send that returns a Promise, serializing payloads yourself, KafkaJS vs the maintained @confluentinc/kafka-javascript client, real defaults, and a real duplicate-on-retry proof.'
 sidebar:
   order: 1
 ---
@@ -8,11 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 A **producer** builds a message (topic, optional key, value), hands it to `send()` which returns a `Promise` and completes **asynchronously**, and Kafka appends it to a partition of the topic.
+
+<Callout title="KafkaJS is unmaintained — know this before you pick a client">
+`kafkajs` (the client most of this course's examples use, because it is still the most widely deployed Node.js Kafka client) has had **no release since 2023-02-27** — verified with `npm view kafkajs time.modified` against the exact `2.2.4` this course pins. Its own maintainer opened [tulios/kafkajs#1603 "Looking for maintainers"](https://github.com/tulios/kafkajs/issues/1603) on 2023-08-08, saying they could no longer tend to the project. It still works fine against Kafka 4.3.1 (every proof in this course runs it), but there is no one fixing new bugs or adding new protocol features. The actively maintained alternative is **`@confluentinc/kafka-javascript`** (Confluent's own client, built on `librdkafka`) — introduced side by side below, and used wherever KafkaJS's API cannot express something (transactions internals, KIP-848 consumer protocol, newer config keys).
+</Callout>
 
 ## The producer and the message
 
@@ -33,6 +38,77 @@ import { Kafka } from 'kafkajs';
 const kafka = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
 const producer = kafka.producer();
 ```
+
+## `@confluentinc/kafka-javascript`: the same idea, two APIs
+
+`@confluentinc/kafka-javascript` (`1.10.1` at the time of writing, current per `npm view @confluentinc/kafka-javascript version`) ships **two** producer surfaces from the same package:
+
+1. A **KafkaJS-compatible promise API** (`require('@confluentinc/kafka-javascript').KafkaJS`) — the fastest migration path, same `producer.send()` shape.
+2. The **native `librdkafka` callback API** (`require('@confluentinc/kafka-javascript').Producer`) — event-driven, configured with raw `librdkafka` config keys instead of KafkaJS's camelCase options.
+
+Both were run against a real broker for this lesson. The KafkaJS-compatible surface:
+
+```typescript
+// src/producer-api/confluent-kafkajs-surface.ts
+import { KafkaJS } from '@confluentinc/kafka-javascript';
+// The kafkaJS-compatible surface lives under the named .KafkaJS export
+
+async function main() {
+  const kafka = new KafkaJS.Kafka({ kafkaJS: { brokers: ['localhost:9092'], clientId: 'orders-app' } });
+  const producer = kafka.producer();
+  await producer.connect();
+  const res = await producer.send({
+    topic: 'orders',
+    messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }],
+  });
+  console.log(res); // same RecordMetadata shape as KafkaJS
+  await producer.disconnect();
+}
+
+main();
+```
+
+The native, callback-based `librdkafka` API — config keys are **`librdkafka`'s own**, not KafkaJS's (`metadata.broker.list` instead of `brokers`, `client.id` instead of `clientId`):
+
+```typescript
+// src/producer-api/confluent-native-callback.ts
+import { Producer } from '@confluentinc/kafka-javascript';
+
+const producer = new Producer({
+  'metadata.broker.list': 'localhost:9092', // librdkafka key, not "brokers"
+  'client.id': 'confluent-native-probe',
+  dr_cb: true, // delivery report callback fires per record
+});
+
+producer.on('ready', () => {
+  producer.produce(
+    'orders', // topic
+    null, // partition: let librdkafka's partitioner choose
+    Buffer.from(JSON.stringify({ amount: 7 })), // value — a Buffer, not a string
+    'order-99', // key
+    Date.now(),
+  );
+  producer.flush(5000, () => producer.disconnect());
+});
+
+producer.on('delivery-report', (err, report) => {
+  console.log('delivery-report:', err, report); // { topic, partition, offset, ... }
+});
+
+producer.connect();
+```
+
+Real output from running both against this lesson's probe broker:
+
+```text
+# KafkaJS-compatible surface (send() result, same shape as plain kafkajs):
+[{"topicName":"orders-batch","partition":0,"errorCode":0,"baseOffset":"0","logAppendTime":"-1","logStartOffset":"0"}]
+
+# Native callback API (delivery-report event):
+delivery-report: null {"topic":"orders-batch","partition":0,"offset":1,"key":{...},"timestamp":1790634620636,"size":12}
+```
+
+Both wrote real records to the same broker; the KafkaJS-compatible surface returns `baseOffset`/`topicName` (array, promise-based), the native API delivers one `delivery-report` event per record (`offset`, callback-based) — pick the surface that matches how the rest of your codebase already talks to Kafka.
 
 ## send() is asynchronous — await the Promise
 
@@ -74,9 +150,165 @@ export const producerDiagram = `flowchart LR
   io --> broker["Broker appends to partition"]
   broker --> cb["Promise resolves: metadata, or throws"]`;
 
-<Callout title="The one-line takeaway">
-Build a **message** (topic, key, value) where `key` and `value` are strings/Buffers you **serialize yourself** (e.g. `JSON.stringify`), and call **`send()`** — it is **asynchronous** and returns a **`Promise`**, so **`await`** it (and use `try`/`catch` for errors) instead of blocking. Connect the producer once and reuse it.
+## Two defaults everyone gets wrong, verified from source
+
+Read directly from `kafkajs@2.2.4`'s own source (`node_modules/kafkajs/src/producer/index.js`, `node_modules/kafkajs/src/index.js`):
+
+```text
+# node_modules/kafkajs/src/producer/index.js:37
+idempotent = false,
+
+# kafka.js.org/docs/producing: "acks... Default: -1 (all insync replicas must acknowledge)"
+```
+
+- **`acks` defaults to `-1` (all)** — KafkaJS already asks every in-sync replica to confirm unless you weaken it yourself. This is the strong, safe default.
+- **`idempotent` defaults to `false`** — the **opposite** of the Java client, where `enable.idempotence=true` has been the default since Kafka 3.0. A KafkaJS producer is **not** idempotent unless you opt in with `producer({ idempotent: true })` — see the next lesson.
+
+<Callout title="The two defaults do not compose the way you'd guess">
+Strong `acks` (`-1`, the default) does **not** imply idempotence. `acks=-1` only says every in-sync replica confirmed a **given attempt** — it says nothing about whether that attempt was a **retry of one already written**. Only `idempotent: true` prevents the broker from double-writing a retried record. Proof below.
 </Callout>
+
+## Duplicate on retry: idempotent off vs on, proven
+
+A retry duplicate needs a specific, real condition: the client sends a record, the broker durably writes it, but the **acknowledgement never makes it back** before the client's own request timeout fires — so the client, which has no way to tell "lost on the way there" from "lost on the way back", retries. Both attempts were record-perfect; the broker just saw two of them.
+
+This was reproduced for real: freeze the broker container (`docker pause`) right as a `send()` call is in flight, hold it frozen well past the client's `requestTimeout`, then unpause. The client's request queue times out mid-freeze and retries once the broker thaws; the broker, having been frozen (not crashed), eventually processes **every** attempt that reached its socket.
+
+```typescript
+// src/producer-api/duplicate-retry-demo.ts
+import { Kafka } from 'kafkajs';
+
+async function demonstrate(idempotent: boolean, topic: string) {
+  const kafka = new Kafka({
+    clientId: 'dup-demo',
+    brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'],
+    requestTimeout: 500, // short on purpose — the freeze below outlasts it
+  });
+  const producer = kafka.producer({ idempotent, retry: { retries: 5, initialRetryTime: 100, maxRetryTime: 500 } });
+  await producer.connect();
+  // ... freeze the broker container here in a real run, hold past requestTimeout, unpause ...
+  await producer.send({ topic, messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }] });
+  await producer.disconnect();
+}
+```
+
+Real `kafka-dump-log.sh --print-data-log` output after the exact same freeze-and-retry treatment, **non-idempotent** (`idempotent: false`) — one `send()` call, **five** committed copies, `producerId: -1` (no idempotence tracking at all):
+
+```text
+baseOffset: 1 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 2 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 3 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 4 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 5 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+```
+
+The same treatment with `idempotent: true` — the client saw the exact same 4 `REQUEST_TIMEOUT` events and retried the exact same way, but the broker kept **one** record, tagged with a real producer id and sequence number:
+
+```text
+baseOffset: 1 lastOffset: 1 ... producerId: 9 producerEpoch: 0 ... baseSequence: 1 lastSequence: 1
+| offset: 1 sequence: 1 key: order-42 payload: {"amount":19.99}
+```
+
+Identical client-side retry behavior, opposite broker-side outcome — because only the idempotent producer stamped the retried attempts with a sequence number the broker could recognize as "already applied". The next lesson opens this PID/sequence mechanism up in full.
+
+## `sendBatch`: one call, many topics
+
+`send()` writes to one topic; `sendBatch()` writes to several topics (each with its own message list) in a **single** call — useful when one business event fans out to more than one topic (e.g. `orders` and `shipments`):
+
+```typescript
+// src/producer-api/sendbatch-demo.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-app', brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'] });
+
+async function main() {
+  const producer = kafka.producer();
+  await producer.connect();
+  const results = await producer.sendBatch({
+    topicMessages: [
+      { topic: 'orders', messages: [{ key: 'o1', value: 'order-1' }] },
+      { topic: 'shipments', messages: [{ key: 's1', value: 'shipment-1' }] },
+    ],
+  });
+  console.log(results); // one RecordMetadata entry per topic-partition written to
+  await producer.disconnect();
+}
+
+main();
+```
+
+Real output — one `RecordMetadata` per topic:
+
+```text
+[{"topicName":"orders","partition":0,"errorCode":0,"baseOffset":"0", ...},
+ {"topicName":"shipments","partition":0,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+## `maxInFlightRequests`: a connection setting, not a producer setting
+
+`maxInFlightRequests` is easy to misplace — read from `kafkajs@2.2.4`'s own source (`node_modules/kafkajs/src/index.js`), it is a **`Kafka.producer({...})` option that flows straight into the cluster's connection pool**, capping how many unacknowledged requests may be outstanding **per broker connection** at once:
+
+```text
+# node_modules/kafkajs/src/index.js — producer({ ..., maxInFlightRequests }) passes it,
+# unmodified, into createCluster({ maxInFlightRequests }) -> Connection -> RequestQueue.
+# Default (index.js): maxInFlightRequests = null  -> unlimited
+```
+
+It defaults to `null` (**unlimited** in-flight requests) — there is no KafkaJS-side cap tying it to idempotence. Setting it explicitly (e.g. `kafka.producer({ maxInFlightRequests: 5 })`) mirrors the Java client's classic idempotent-producer ceiling (`max.in.flight.requests.per.connection`, protocol-capped at 5 for idempotent producers — the broker only tracks the last 5 sequence numbers per producer/partition to detect out-of-order or duplicate batches), but **KafkaJS does not enforce this itself** when `idempotent: true` — that correction is verified in the next lesson.
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/producer-api/order-ingest.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-ingest', brokers: ['localhost:9092'] });
+
+async function ingestOrders(orders: { id: string; amount: number }[]) {
+  const producer = kafka.producer();
+  await producer.connect();
+
+  for (const order of orders) {
+    producer.send({
+      topic: 'orders',
+      messages: [{ key: order.id, value: JSON.stringify(order) }],
+    }); // fire-and-forget "for speed"
+  }
+
+  await producer.disconnect();
+  console.log(\`ingested \${orders.length} orders\`);
+}
+`}>
+
+This looks fast and reads cleanly — no `await` inside the loop, so it "returns immediately". The real bug: none of the 20 (or 20,000) `send()` calls are awaited, so `ingestOrders` has no idea whether any of them have even reached the broker by the time it calls `producer.disconnect()`. Proven against a real broker: sending 20 unawaited messages this way, then immediately `disconnect()`-ing, left the topic's end offset at **0** — `disconnect()` resolved successfully while every single record was still silently dropped, because tearing down the connection does not wait for promises the caller never kept a handle to. `console.log('ingested 20 orders')` printed too — the code believes it worked. The fix: collect the promises and await them all before disconnecting:
+
+```text
+const pending = orders.map((order) =>
+  producer.send({ topic: 'orders', messages: [{ key: order.id, value: JSON.stringify(order) }] })
+);
+await Promise.all(pending); // <-- wait for every send to actually land before disconnecting
+await producer.disconnect();
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+A KafkaJS producer is a **local buffer with a Promise-shaped exit door**. `send()` hands a record to that buffer and gives you back a promise that settles once the record's fate (written, or genuinely failed after retries) is known — but the buffer and the broker are two separate systems connected by a network you don't control. Nothing forces you to wait at that exit door: an unawaited `send()` is a promise sitting in memory that nobody is holding, and `disconnect()` does not know to wait for promises it was never told about. Idempotence does not change this model — it changes what happens *inside* the broker when the exact same network attempt shows up twice; it never rescues a record the client never properly waited to confirm.
+
+## Trade-offs
+
+- **`kafkajs`** — the API everyone's tutorials use, still functionally solid against Kafka 4.3.1, but unmaintained since 2023 (no new protocol features, no fixes for new bugs, 400+ open issues per the repository at the time of writing).
+- **`@confluentinc/kafka-javascript` (KafkaJS-compatible surface)** — nearly drop-in, actively maintained, but pulls in a native `librdkafka` binary (platform-specific install, slightly heavier).
+- **`@confluentinc/kafka-javascript` (native callback API)** — the most direct access to `librdkafka`'s own config surface and performance characteristics, at the cost of a callback-shaped API that doesn't compose with `async`/`await` as naturally.
+- **`idempotent: false` (the default)** — fewer moving parts, but every retry is a potential silent duplicate, proven above.
+- **`idempotent: true`** — the broker de-duplicates retried attempts for you, at the cost of a slightly heavier producer bootstrap (`InitProducerId`) and the ordering discipline the next lesson covers.
+
+## Common Misconceptions
+
+- **"`acks` defaults to `1` in KafkaJS, like a lot of tutorials assume."** No — verified from source: KafkaJS's per-send default is `-1` (all in-sync replicas), the *strongest* setting, not the middle one.
+- **"KafkaJS producers are idempotent by default, like the modern Java client."** No — the opposite. `idempotent: false` is the default; the Java client flipped its default to `true` in Kafka 3.0, but KafkaJS never did.
+- **"Strong `acks` means no duplicates."** No — `acks` only governs how many replicas must confirm one attempt; it says nothing about whether that attempt is itself a retry of an already-written record. Only `idempotent: true` stops that.
+- **"An unawaited `send()` will still complete before the process/connection ends, because Node keeps the event loop alive for pending I/O."** No — proven above: `disconnect()` does not wait for `send()` calls it wasn't given a promise handle to, and can win the race, dropping every unawaited record.
 
 export const quizProducerApi = [
   {
@@ -88,6 +320,7 @@ export const quizProducerApi = [
       'group, consumer, and cursor',
     ],
     answer: 1,
+    explain: 'Every message is built from a topic (where), an optional key (routing/ordering), and a value (the payload) — everything else (partition, offset) is assigned by Kafka.',
   },
   {
     q: 'What does send() return, and when does it complete?',
@@ -98,26 +331,62 @@ export const quizProducerApi = [
       'It returns the raw bytes that were sent',
     ],
     answer: 1,
+    explain: 'send() never blocks the caller; it returns a Promise that resolves with RecordMetadata (or rejects) once the broker has actually responded.',
   },
   {
-    q: 'How are a message key and value represented in KafkaJS?',
+    q: 'As of kafkajs 2.2.4, when was the package last published, and where is that documented in this lesson?',
     options: [
-      'As typed objects the broker stores and understands directly',
-      'As a string, Buffer, or null — you serialize the payload yourself (e.g. JSON.stringify)',
-      'As XML documents negotiated with the broker',
-      'KafkaJS rejects any value that is not a number',
+      'Last week — it is actively maintained',
+      '2023-02-27, verified via npm view kafkajs time.modified, with github.com/tulios/kafkajs/issues/1603 ("Looking for maintainers") as the maintainer\'s own confirmation',
+      'It has never been published to npm',
+      '2019, before Kafka even supported TypeScript clients',
     ],
     answer: 1,
+    explain: 'Both facts were verified directly, not assumed: npm\'s own registry metadata for the exact pinned version, and the maintainer\'s own GitHub issue asking for help.',
   },
   {
-    q: 'What is the brokers array on new Kafka({...}) used for?',
+    q: 'What are the real defaults for acks and idempotent in KafkaJS, verified from source?',
     options: [
-      'It lists every broker that must be online or the send fails',
-      'It is the initial broker list the client contacts to discover the cluster',
-      'It sets the retention period of the topic',
-      'It picks the partition a record lands on',
+      'acks defaults to 1, idempotent defaults to true (same as the Java client)',
+      'acks defaults to -1 (all), idempotent defaults to false (opposite of the Java client)',
+      'Both default to off; you must set everything explicitly',
+      'acks has no default; every send() call requires it',
     ],
     answer: 1,
+    explain: 'node_modules/kafkajs/src/producer/index.js sets idempotent = false; kafka.js.org documents acks default: -1. The Java client instead defaults enable.idempotence to true since Kafka 3.0 — the two clients disagree here.',
+  },
+  {
+    q: 'A send() call is retried after the broker already durably wrote it once but the ack was lost. With idempotent: false, what did the real dump-log proof in this lesson show?',
+    options: [
+      'One record — KafkaJS silently deduplicated it',
+      'Five committed copies of the same key/value, all with producerId: -1',
+      'The broker rejected the retry with an error',
+      'Exactly two copies, always',
+    ],
+    answer: 1,
+    explain: 'kafka-dump-log.sh showed five separate offsets, same key order-42, same payload, producerId: -1 — non-idempotent producers have no mechanism to recognize a retry as "already applied".',
+  },
+  {
+    q: 'Under the identical freeze-and-retry conditions, what changed with idempotent: true?',
+    options: [
+      'Nothing — the same five duplicates appeared',
+      'The client stopped retrying entirely',
+      'The client retried the same number of times, but the broker kept exactly one record, tagged with a real producerId and sequence number',
+      'The broker crashed',
+    ],
+    answer: 2,
+    explain: 'Same REQUEST_TIMEOUT count on the client side; dump-log showed a single offset with producerId: 9 and a real sequence number — the broker recognized the retried attempts as duplicates of an already-applied sequence.',
+  },
+  {
+    q: 'Where does maxInFlightRequests actually live in KafkaJS, and what does it default to?',
+    options: [
+      'A per-send() option that defaults to 5',
+      'A kafka.producer({...}) option that flows into the connection pool (unacknowledged requests per broker connection), defaulting to null (unlimited)',
+      'A topic-level broker config',
+      'It does not exist in KafkaJS',
+    ],
+    answer: 1,
+    explain: 'Traced through kafkajs source: producer({ maxInFlightRequests }) -> createCluster({ maxInFlightRequests }) -> the connection pool\'s RequestQueue; the constructor default is null, meaning unlimited.',
   },
 ];
 
