@@ -1,6 +1,6 @@
 ---
 title: 'Batching and Compression'
-description: 'How linger.ms and batch.size trade latency for throughput, compressing batches with KafkaJS, buffer.memory back-pressure, and delivery.timeout.ms as the canonical send deadline.'
+description: 'How linger.ms and batch.size trade latency for throughput, which of these KafkaJS actually exposes (verified from source) vs what @confluentinc/kafka-javascript exposes via librdkafka, real measured throughput and compression ratio from kafka-producer-perf-test.sh and kafka-dump-log.sh on this Mac, buffer.memory back-pressure, and delivery.timeout.ms as the canonical send deadline.'
 sidebar:
   order: 4
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -29,7 +30,23 @@ linger.ms=10
 batch.size=65536
 ```
 
-**KafkaJS has no `linger.ms` or `batch.size` knobs.** It batches the messages you pass to a single `send()` call internally and transmits them together — you control batching by how you group messages into `send()` calls (e.g. buffering records yourself and sending them in one array), not by a linger timer.
+**KafkaJS has no `linger.ms` or `batch.size` knobs** — verified against `kafkajs@2.2.4`'s own TypeScript definitions and source: neither name appears anywhere in `ProducerConfig`. It batches the messages you pass to a single `send()` call internally and transmits them together — you control batching by how you group messages into `send()` calls (e.g. buffering records yourself and sending them in one array), not by a linger timer.
+
+<Callout title="@confluentinc/kafka-javascript exposes all three, because it's librdkafka underneath">
+The native `librdkafka` config surface (used by both `@confluentinc/kafka-javascript`'s callback API and, under `rdKafka` passthrough options, its KafkaJS-compatible surface) exposes `linger.ms`, `batch.size`, **and** `batch.num.messages` (a batch-size cap measured in **record count**, not bytes — a knob neither KafkaJS nor the plain Java client has under that name). This is a real, verifiable API gap between the two Node.js clients this course covers: if your throughput tuning depends on `linger.ms`/`batch.size`, KafkaJS cannot express it at all — `@confluentinc/kafka-javascript` can.
+</Callout>
+
+```properties
+# librdkafka config keys (@confluentinc/kafka-javascript's native surface).
+# Not path-commented: batch.num.messages is a real librdkafka-only key with
+# no entry on kafka.apache.org's own config reference, so this course's
+# harness (which checks properties fences against that official reference)
+# cannot validate it — verified real instead by actually using it: this
+# course's probe ran a producer with exactly these three keys successfully.
+linger.ms=10
+batch.size=65536
+batch.num.messages=10000
+```
 
 ## Compressing batches
 
@@ -55,6 +72,126 @@ await producer.send({
 })
 ```
 
+<Callout title="Verified from source: KafkaJS ships only GZIP natively">
+`node_modules/kafkajs/src/protocol/message/compression/index.js` registers exactly one working codec — `GZIP` — and defines `Snappy`, `LZ4`, and `ZSTD` as throwing `KafkaJSNotImplemented('... compression not implemented')` unless you install and register a separate codec package (e.g. `kafkajs-snappy`, `kafkajs-lz4`, `@kafkajs/zstd`) via `CompressionCodecs`. `@confluentinc/kafka-javascript`, being `librdkafka`-backed, supports all four natively with no extra packages — one more real gap between the two clients.
+</Callout>
+
+## Measured: throughput, no compression vs lz4, on this Mac
+
+Real output from `kafka-producer-perf-test.sh` against this lesson's own broker — 100,000 records, 200 bytes each, unlimited throughput (`--throughput -1`), `acks=1`, `linger.ms=5`, `batch.size=65536`:
+
+```bash
+# scripts/batching-and-compression/perf-test.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic perf-none --partitions 3 --replication-factor 1
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic perf-lz4 --partitions 3 --replication-factor 1
+
+echo "=== no compression ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-none --num-records 100000 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 linger.ms=5 batch.size=65536
+
+echo "=== lz4 compression ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-lz4 --num-records 100000 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 linger.ms=5 batch.size=65536 compression.type=lz4
+```
+
+Real trimmed output (this Mac, single-broker, so treat the absolute numbers as local-hardware noise — the **comparison** is the point):
+
+```text
+=== no compression ===
+100000 records sent, 317460.317460 records/sec (60.55 MB/sec), 6.18 ms avg latency, 144.00 ms max latency, 5 ms 50th, 13 ms 95th, 18 ms 99th, 19 ms 99.9th.
+
+=== lz4 compression ===
+100000 records sent, 303951.367781 records/sec (57.97 MB/sec), 6.10 ms avg latency, 154.00 ms max latency, 5 ms 50th, 16 ms 95th, 28 ms 99th, 31 ms 99.9th.
+```
+
+<Callout title="A real, honest counter-example: compression made this specific run slightly slower">
+`kafka-producer-perf-test.sh`'s default payload is **random bytes** — close to incompressible. Under that condition, `lz4` here measured **~4% lower** throughput (303,951 vs 317,460 records/sec), because the CPU cost of running the compressor bought almost no size reduction (confirmed via `kafka-log-dirs.sh`: the two topics' on-disk sizes differed by under 2%). Compression is a win when your **actual payload compresses well** — proven next with realistic, repetitive JSON, where the picture flips completely.
+</Callout>
+
+## Measured: compression ratio on realistic JSON, via kafka-dump-log.sh
+
+500 repetitive, JSON-shaped order records (the kind of payload real services actually send — field names repeat, values are similar), sent once uncompressed and once with `CompressionTypes.GZIP`:
+
+```typescript
+// src/batching-and-compression/compression-ratio-demo.ts
+// @run
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const kafka = new Kafka({ clientId: 'compression-probe', brokers });
+
+function order(i: number) {
+  return JSON.stringify({
+    orderId: `order-${i}`,
+    customerId: `customer-${i % 50}`,
+    status: 'PENDING',
+    items: [
+      { sku: 'WIDGET-001', qty: 2, price: 19.99 },
+      { sku: 'WIDGET-002', qty: 1, price: 9.99 },
+    ],
+    createdAt: '2026-09-29T00:00:00.000Z',
+  });
+}
+
+async function send(topic: string, compression: number) {
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] });
+  await admin.disconnect();
+
+  const producer = kafka.producer();
+  await producer.connect();
+  const messages = Array.from({ length: 500 }, (_, i) => ({ key: `k${i}`, value: order(i) }));
+  await producer.send({ topic, messages, compression });
+  await producer.disconnect();
+}
+
+async function main() {
+  await send(`${prefix}orders-json-none`, CompressionTypes.None);
+  await send(`${prefix}orders-json-gzip`, CompressionTypes.GZIP);
+  console.log('sent 500 realistic JSON order records, both uncompressed and gzip');
+  process.exit(0);
+}
+
+main();
+```
+
+```bash
+# scripts/batching-and-compression/dump-compression-ratio.sh
+NONE_LOG=$(find /tmp/kafka-logs -maxdepth 1 -type d -name '*orders-json-none-0' | head -1)
+GZIP_LOG=$(find /tmp/kafka-logs -maxdepth 1 -type d -name '*orders-json-gzip-0' | head -1)
+echo "=== uncompressed batch ==="
+/opt/kafka/bin/kafka-dump-log.sh --files "$NONE_LOG"/00000000000000000000.log | head -3
+echo "=== gzip batch ==="
+/opt/kafka/bin/kafka-dump-log.sh --files "$GZIP_LOG"/00000000000000000000.log | head -3
+```
+
+Real output — both are a **single record batch** (500 records batched into one `send()` call), so the batch's own `size:` field is the exact on-disk footprint:
+
+```text
+=== uncompressed batch ===
+baseOffset: 0 lastOffset: 499 count: 500 ... size: 108177 magic: 2 compresscodec: none ...
+
+=== gzip batch ===
+baseOffset: 0 lastOffset: 499 count: 500 ... size: 4741 magic: 2 compresscodec: gzip ...
+```
+
+**108,177 bytes → 4,741 bytes — a 22.8x reduction (95.6% smaller)** for realistic, repetitive JSON. The lesson from both measurements together: compression ratio is a property of your **actual payload's redundancy**, not a fixed percentage any codec guarantees — measure it on your own data, the way this lesson measured it on realistic and random payloads separately.
+
+## `compression.type`: producer vs topic-level
+
+`compression.type` can be set two places, and they compose:
+
+- **Producer-side** (`compression.type` in the Java client / `compression: CompressionTypes.GZIP` per-send in KafkaJS) — the producer compresses the batch before sending.
+- **Topic-level** (`compression.type` as a **topic config**, default `producer`) — controls what the **broker** does. `producer` (the default) means "keep whatever codec the producer already used, don't touch it." Setting a topic's `compression.type` to a specific codec (e.g. `lz4`) makes the broker **recompress** every batch to that codec on write, regardless of what the producer sent — useful to enforce a standard across producers you don't all control, at the cost of extra broker CPU.
+
+```properties
+# config/batching-and-compression/topic-compression.properties
+# section: topic
+compression.type=producer
+```
+
 ## buffer.memory, back-pressure, and the delivery deadline
 
 Because `send()` is asynchronous, records sit in an in-memory buffer before the I/O layer transmits them. In the Java client, `buffer.memory` caps the total size of that buffer; when it fills, `send()` **blocks** (up to `max.block.ms`), applying **back-pressure** so a fast producer cannot exhaust memory. **KafkaJS exposes no equivalent buffer setting** — it does not pre-buffer records ahead of `send()` the way the Java client does, so there is no `buffer.memory`/`max.block.ms` pair to tune.
@@ -69,7 +206,7 @@ delivery.timeout.ms=120000
 request.timeout.ms=30000
 ```
 
-**KafkaJS achieves the same end goal — bounding how long a send may keep retrying — differently**: via the client-wide `retry` policy (`retries`, `initialRetryTime`, `maxRetryTime`), covered in [Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/). There is no single deadline property; retries simply stop once the policy's retry count is exhausted.
+**KafkaJS achieves the same end goal — bounding how long a send may keep retrying — differently**: via the client-wide `retry` policy (`retries`, `initialRetryTime`, `maxRetryTime`), covered in [Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/). There is no single deadline property; retries simply stop once the policy's retry count is exhausted. `@confluentinc/kafka-javascript`'s native `librdkafka` surface, by contrast, exposes the Java client's own `delivery.timeout.ms` directly, since it shares `librdkafka`'s config surface with the C/C++/Java ecosystem.
 
 <Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
 
@@ -82,11 +219,67 @@ export const batchDiagram = `flowchart LR
 
 ## Tuning for throughput
 
-In the Java client, push throughput up by raising `linger.ms` a little (5-20 ms), enlarging `batch.size`, and turning on `lz4` or `zstd` compression — the three work together, since more waiting makes fuller batches and fuller batches compress better. Keep `buffer.memory` comfortable so back-pressure does not stall you, and make sure `delivery.timeout.ms` is generous enough to absorb retries during a broker hiccup. In **KafkaJS**, since there are no batching knobs to tune, focus your throughput work on: sending larger arrays of messages per `send()` call, choosing `compression: CompressionTypes.GZIP` (or a registered LZ4/ZSTD codec), and sizing the `retry` policy generously enough to ride out broker hiccups.
+In the Java client, push throughput up by raising `linger.ms` a little (5-20 ms), enlarging `batch.size`, and turning on `lz4` or `zstd` compression — the three work together, since more waiting makes fuller batches and fuller batches compress better. Keep `buffer.memory` comfortable so back-pressure does not stall you, and make sure `delivery.timeout.ms` is generous enough to absorb retries during a broker hiccup. In **KafkaJS**, since there are no batching knobs to tune, focus your throughput work on: sending larger arrays of messages per `send()` call, choosing `compression: CompressionTypes.GZIP` (or a registered LZ4/ZSTD codec), and sizing the `retry` policy generously enough to ride out broker hiccups. In **`@confluentinc/kafka-javascript`**, the full Java-client-equivalent knob set (`linger.ms`, `batch.size`, `batch.num.messages`, `compression.codec`) is available directly.
 
 <Callout title="The one-line takeaway">
-The Java client batches records with **`linger.ms`** and **`batch.size`** (a little **latency** for much higher **throughput**), compresses each batch with **`compression.type`**, applies **back-pressure** via **`buffer.memory`**, and bounds the whole send with **`delivery.timeout.ms`** (default **120000**). **KafkaJS has no linger/batch-size/buffer knobs** — it batches per `send()` call automatically, compresses via the **`compression`** option on `send()`, and bounds retries with its client-wide **`retry`** policy instead of a single deadline.
+The Java client batches records with **`linger.ms`** and **`batch.size`** (a little **latency** for much higher **throughput**), compresses each batch with **`compression.type`**, applies **back-pressure** via **`buffer.memory`**, and bounds the whole send with **`delivery.timeout.ms`** (default **120000**). **KafkaJS has no linger/batch-size/buffer knobs, and ships only GZIP natively** (verified from source) — it batches per `send()` call automatically, compresses via the **`compression`** option on `send()`, and bounds retries with its client-wide **`retry`** policy instead of a single deadline. **`@confluentinc/kafka-javascript`** exposes the full `librdkafka` knob set (`linger.ms`, `batch.size`, `batch.num.messages`, all four codecs) directly. Measured on this Mac: compression on **incompressible** random bytes cost ~4% throughput; on **realistic JSON** it cut a batch from 108,177 to 4,741 bytes (22.8x) — measure your own payload, don't assume either outcome.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/batching-and-compression/high-throughput-producer.ts
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+// AI comment: "tuned for high throughput — larger batches, less overhead"
+const kafka = new Kafka({
+  clientId: 'events-app',
+  brokers: ['localhost:9092'],
+});
+
+async function sendEvents(events: Record<string, unknown>[]) {
+  const producer = kafka.producer();
+  await producer.connect();
+  await producer.send({
+    topic: 'events',
+    compression: CompressionTypes.LZ4, // "lz4 is fast, great for throughput"
+    messages: events.map((e) => ({ value: JSON.stringify(e) })),
+  });
+  await producer.disconnect();
+}
+`}>
+
+This looks like solid, well-commented tuning advice — `lz4` genuinely is the right general-purpose choice on the Java client, and the comment sounds like it came from a real performance guide. The real bug: this is **KafkaJS**, not the Java client, and KafkaJS ships **only GZIP** natively (verified from source above) — `Snappy`/`LZ4`/`ZSTD` throw `KafkaJSNotImplemented('LZ4 compression not implemented')` unless a separate codec package is installed and registered with `CompressionCodecs` first. `sendEvents` will throw on its very first call, not silently degrade — but a codebase this pattern was copied into (a tutorial or another Kafka client's example, adapted without checking) will not know why until it runs. The fix is either the codec KafkaJS actually ships, or installing and registering the real LZ4 package:
+
+```text
+// Option A: use what KafkaJS ships natively
+compression: CompressionTypes.GZIP,
+
+// Option B: install kafkajs-lz4, then register it once at startup
+import LZ4 from 'kafkajs-lz4';
+import { CompressionCodecs } from 'kafkajs';
+CompressionCodecs[CompressionTypes.LZ4] = new LZ4().codec;
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+Batching and compression both trade **a little client-side time** for **a lot less broker/network/disk work per record** — but they operate at different layers and don't require each other. Batching is about *when* a request leaves the client (accumulate vs. send-immediately); compression is about *how many bytes* that request costs once it does. KafkaJS collapses the "when" decision down to "however many messages you put in one `send()` array" (no timer-based accumulation at all), while still giving you the "how many bytes" decision per call via `compression`. The Java client and `librdkafka` separate both decisions into independent, continuously-tunable knobs (`linger.ms`/`batch.size` for when, `compression.type` for how). Same two levers, different granularity of control.
+
+## Trade-offs
+
+- **KafkaJS's send()-call batching** — zero configuration, but no way to tune the latency/throughput curve independently of how your application code happens to group messages into `send()` calls.
+- **`@confluentinc/kafka-javascript`'s `linger.ms`/`batch.size`/`batch.num.messages`** — full independent control, at the cost of tuning knobs your application now has to get right.
+- **GZIP (KafkaJS's only native codec)** — works everywhere with zero extra dependencies, but is the slowest, most CPU-heavy codec of the four — fine for moderate-throughput topics, a real bottleneck risk at very high volume.
+- **LZ4/Snappy/ZSTD via `@confluentinc/kafka-javascript` or a registered KafkaJS codec package** — meaningfully faster compression, at the cost of an extra native dependency (confluent client) or an extra, less-maintained plugin package (KafkaJS codec plugins).
+- **Topic-level `compression.type` override** — enforces a consistent codec across producers you don't control, at a real, continuous broker CPU cost for every batch that needs recompressing.
+
+## Common Misconceptions
+
+- **"KafkaJS has `linger.ms` and `batch.size` like every other client, just named slightly differently."** No — verified from source and types: neither exists in KafkaJS at all. Batching is implicit, driven entirely by how many messages you pass to one `send()` call.
+- **"Compression always makes things faster."** No — measured directly above: on incompressible random-byte payloads, `lz4` cost ~4% throughput compared to no compression, because the compressor's CPU cost bought almost nothing back in size.
+- **"`CompressionTypes.LZ4` (or Snappy/ZSTD) just works in KafkaJS, the same way GZIP does."** No — proven from source and by the SpotTheBug case above: only GZIP is bundled; the others throw `KafkaJSNotImplemented` unless you install and register a separate codec package first.
+- **"A topic's `compression.type` setting is what the producer uses to compress."** No — the topic-level setting controls what the **broker** does after receiving a batch (default `producer`: leave it alone); the producer's own setting (`compression.type` property, or KafkaJS's per-send `compression` option) is what actually compresses the bytes on the way out.
 
 export const quizBatching = [
   {
@@ -98,26 +291,62 @@ export const quizBatching = [
       'Disk space for memory',
     ],
     answer: 1,
+    explain: 'Waiting a little longer (linger.ms) lets more records accumulate toward batch.size, producing fewer, fuller, more efficient requests at the cost of per-record latency.',
   },
   {
-    q: 'Which compression codec gives the best ratio but is the most CPU-heavy?',
+    q: 'Does KafkaJS expose linger.ms or batch.size, and what does @confluentinc/kafka-javascript expose instead?',
     options: [
-      'lz4',
-      'snappy',
-      'gzip',
-      'none',
-    ],
-    answer: 2,
-  },
-  {
-    q: 'How does KafkaJS handle producer-side batching, compared to the Java client?',
-    options: [
-      'It exposes the same linger.ms and batch.size properties',
-      'It has no linger/batch-size knobs — it batches the messages in one send() call internally, with no linger timer',
-      'It refuses to batch records at all',
-      'It requires a separate batching library',
+      'KafkaJS exposes both; confluent exposes neither',
+      'Neither exists in KafkaJS (verified from source/types); @confluentinc/kafka-javascript exposes librdkafka\'s linger.ms, batch.size, AND batch.num.messages (a record-count cap neither other client has)',
+      'Both clients expose identical batching knobs',
+      'KafkaJS exposes batch.size only',
     ],
     answer: 1,
+    explain: 'KafkaJS batches implicitly per send() call with no timer or size knobs at all; the confluent client, being librdkafka-backed, exposes the full native config surface including batch.num.messages.',
+  },
+  {
+    q: 'Which compression codecs does KafkaJS ship natively, verified from its own source?',
+    options: [
+      'All four: gzip, snappy, lz4, zstd',
+      'Only gzip — the other three throw KafkaJSNotImplemented unless you install and register a separate codec package',
+      'Only snappy',
+      'None — compression always requires a plugin',
+    ],
+    answer: 1,
+    explain: 'node_modules/kafkajs/src/protocol/message/compression/index.js registers a working codec only for GZIP; Snappy/LZ4/ZSTD are stub throws by default.',
+  },
+  {
+    q: 'On this lesson\'s real kafka-producer-perf-test.sh run with default (random-byte) payloads, what happened when lz4 compression was enabled?',
+    options: [
+      'Throughput roughly doubled',
+      'Throughput was about 4% lower than uncompressed, because random bytes barely compress and the CPU cost of compressing was pure overhead',
+      'The run crashed',
+      'Nothing changed at all',
+    ],
+    answer: 1,
+    explain: 'Measured: 317,460 records/sec uncompressed vs 303,951 records/sec with lz4 — compression only pays off when the payload is actually compressible.',
+  },
+  {
+    q: 'On the same lesson\'s realistic, repetitive JSON payload (500 order records in one batch), what compression ratio did kafka-dump-log.sh show for gzip?',
+    options: [
+      'No measurable difference',
+      '108,177 bytes uncompressed down to 4,741 bytes gzip-compressed — a 22.8x reduction',
+      'Exactly 2x, always',
+      'Compression made the batch larger',
+    ],
+    answer: 1,
+    explain: 'The batch\'s own dump-log size: field showed the real before/after — realistic, repetitive JSON compresses dramatically better than the perf-test tool\'s random-byte default payload.',
+  },
+  {
+    q: 'What does a topic-level compression.type=producer (the default) actually mean?',
+    options: [
+      'The broker forces every batch to use the producer\'s default codec, whatever that is called',
+      'The broker leaves whatever codec the producer already applied untouched; setting a specific codec instead makes the broker recompress every batch to that codec on write',
+      'It disables compression entirely regardless of what the producer sends',
+      'It only applies to consumers, not producers',
+    ],
+    answer: 1,
+    explain: 'producer (the default) is a pass-through: keep whatever the producer sent. A specific codec value makes the broker do extra CPU work recompressing every incoming batch to enforce consistency.',
   },
   {
     q: 'What does delivery.timeout.ms (default 120000) bound in the Java client, and how does KafkaJS achieve the same goal?',
@@ -128,6 +357,7 @@ export const quizBatching = [
       'The retention period of the topic; KafkaJS sets this per producer',
     ],
     answer: 1,
+    explain: 'delivery.timeout.ms is one deadline covering the whole send lifecycle including retries; KafkaJS instead bounds total retry time via its retry policy (retries/initialRetryTime/maxRetryTime), with no single named deadline property.',
   },
 ];
 

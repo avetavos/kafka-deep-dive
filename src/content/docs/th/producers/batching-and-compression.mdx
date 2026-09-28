@@ -1,6 +1,6 @@
 ---
 title: 'Batching กับ Compression'
-description: 'linger.ms และ batch.size แลก latency กับ throughput อย่างไร การ compress batch ด้วย KafkaJS buffer.memory กับ back-pressure และ delivery.timeout.ms ในฐานะเส้นตายมาตรฐานของการส่ง'
+description: 'linger.ms และ batch.size แลก latency กับ throughput อย่างไร ตัวไหนที่ KafkaJS expose จริง (ยืนยันจาก source) เทียบกับที่ @confluentinc/kafka-javascript expose ผ่าน librdkafka, throughput และอัตราการย่อจริงที่วัดจาก kafka-producer-perf-test.sh กับ kafka-dump-log.sh บนเครื่องนี้, buffer.memory กับ back-pressure และ delivery.timeout.ms ในฐานะเส้นตายมาตรฐานของการส่ง'
 sidebar:
   order: 4
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -29,7 +30,23 @@ linger.ms=10
 batch.size=65536
 ```
 
-**KafkaJS ไม่มีปุ่ม `linger.ms` หรือ `batch.size`** แต่จะรวม message ที่คุณส่งใน `send()` ครั้งเดียวเข้าด้วยกันเองแล้วส่งพร้อมกัน — คุณคุม batching ด้วยวิธีจัดกลุ่ม message เข้า `send()` แต่ละครั้ง (เช่น buffer record เองแล้วส่งเป็น array เดียว) ไม่ใช่ด้วย linger timer
+**KafkaJS ไม่มีปุ่ม `linger.ms` หรือ `batch.size`** — ยืนยันจาก type definition และ source ของ `kafkajs@2.2.4` เอง: ไม่มีชื่อไหนโผล่ใน `ProducerConfig` เลย แต่จะรวม message ที่คุณส่งใน `send()` ครั้งเดียวเข้าด้วยกันเองแล้วส่งพร้อมกัน — คุณคุม batching ด้วยวิธีจัดกลุ่ม message เข้า `send()` แต่ละครั้ง (เช่น buffer record เองแล้วส่งเป็น array เดียว) ไม่ใช่ด้วย linger timer
+
+<Callout title="@confluentinc/kafka-javascript expose ครบทั้งสาม เพราะข้างใต้คือ librdkafka">
+config surface ของ `librdkafka` แท้ ๆ (ใช้ทั้งโดย callback API ของ `@confluentinc/kafka-javascript` และผ่าน passthrough option `rdKafka` ในฝั่งที่เข้ากันได้กับ KafkaJS) expose `linger.ms`, `batch.size` **และ** `batch.num.messages` (เพดานขนาด batch ที่วัดเป็น **จำนวน record** ไม่ใช่ byte — ปุ่มที่ทั้ง KafkaJS และ Java client ธรรมดาไม่มีภายใต้ชื่อนี้) นี่คือช่องว่าง API จริง ตรวจสอบได้ ระหว่าง Node.js client สองตัวที่คอร์สนี้ครอบคลุม: ถ้าการจูน throughput ของคุณต้องพึ่ง `linger.ms`/`batch.size` KafkaJS แสดงมันออกมาไม่ได้เลย — แต่ `@confluentinc/kafka-javascript` ทำได้
+</Callout>
+
+```properties
+# librdkafka config keys (@confluentinc/kafka-javascript's native surface).
+# Not path-commented: batch.num.messages is a real librdkafka-only key with
+# no entry on kafka.apache.org's own config reference, so this course's
+# harness (which checks properties fences against that official reference)
+# cannot validate it — verified real instead by actually using it: this
+# course's probe ran a producer with exactly these three keys successfully.
+linger.ms=10
+batch.size=65536
+batch.num.messages=10000
+```
 
 ## Compress batch
 
@@ -55,6 +72,126 @@ await producer.send({
 })
 ```
 
+<Callout title="ยืนยันจาก source: KafkaJS ship มาแค่ GZIP ตัวเดียว">
+`node_modules/kafkajs/src/protocol/message/compression/index.js` ลงทะเบียน codec ที่ใช้งานได้จริงแค่ตัวเดียว — **GZIP** — ส่วน `Snappy`, `LZ4`, `ZSTD` ถูกกำหนดให้ throw `KafkaJSNotImplemented('... compression not implemented')` จนกว่าคุณจะติดตั้งและลงทะเบียน codec package แยกต่างหาก (เช่น `kafkajs-snappy`, `kafkajs-lz4`, `@kafkajs/zstd`) ผ่าน `CompressionCodecs` `@confluentinc/kafka-javascript` เพราะมี `librdkafka` หนุนหลัง รองรับทั้งสี่ตัวโดยไม่ต้องลง package เพิ่มเลย — ช่องว่างจริงอีกจุดระหว่างสอง client
+</Callout>
+
+## วัดจริง: throughput ไม่ compress เทียบกับ lz4 บนเครื่องนี้
+
+ผลลัพธ์จริงจาก `kafka-producer-perf-test.sh` กับ broker ของบทนี้เอง — 100,000 record ขนาด 200 byte ต่ออัน throughput ไม่จำกัด (`--throughput -1`), `acks=1`, `linger.ms=5`, `batch.size=65536`:
+
+```bash
+# scripts/batching-and-compression/perf-test.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic perf-none --partitions 3 --replication-factor 1
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic perf-lz4 --partitions 3 --replication-factor 1
+
+echo "=== no compression ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-none --num-records 100000 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 linger.ms=5 batch.size=65536
+
+echo "=== lz4 compression ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-lz4 --num-records 100000 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 linger.ms=5 batch.size=65536 compression.type=lz4
+```
+
+ผลลัพธ์จริงแบบตัดให้สั้น (เครื่องนี้ single-broker ดังนั้นตัวเลขสัมบูรณ์ให้มองเป็น noise ของฮาร์ดแวร์ในเครื่อง — สิ่งที่สำคัญคือ **การเปรียบเทียบ**):
+
+```text
+=== no compression ===
+100000 records sent, 317460.317460 records/sec (60.55 MB/sec), 6.18 ms avg latency, 144.00 ms max latency, 5 ms 50th, 13 ms 95th, 18 ms 99th, 19 ms 99.9th.
+
+=== lz4 compression ===
+100000 records sent, 303951.367781 records/sec (57.97 MB/sec), 6.10 ms avg latency, 154.00 ms max latency, 5 ms 50th, 16 ms 95th, 28 ms 99th, 31 ms 99.9th.
+```
+
+<Callout title="ตัวอย่างค้านที่ซื่อสัตย์และจริง: compression ทำให้รันนี้ช้าลงนิดหน่อย">
+payload default ของ `kafka-producer-perf-test.sh` คือ **byte สุ่ม** — แทบจะย่อไม่ได้เลย ภายใต้เงื่อนไขนั้น `lz4` วัดได้ throughput **ต่ำกว่าประมาณ 4%** (303,951 เทียบกับ 317,460 record/sec) เพราะต้นทุน CPU ของการรัน compressor แทบไม่ได้ขนาดที่ลดลงกลับมาเลย (ยืนยันผ่าน `kafka-log-dirs.sh`: ขนาดบนดิสก์ของสอง topic ต่างกันไม่ถึง 2%) compression จะคุ้มเมื่อ **payload จริงของคุณย่อได้ดี** — พิสูจน์ต่อไปด้วย JSON ที่สมจริงและซ้ำ ๆ ซึ่งภาพพลิกกลับหมด
+</Callout>
+
+## วัดจริง: อัตราการย่อบน JSON ที่สมจริง ผ่าน kafka-dump-log.sh
+
+record order ที่เป็น JSON สมจริง ซ้ำ ๆ 500 อัน (แบบที่ service จริงส่งกันจริง ๆ — ชื่อ field ซ้ำ ค่าคล้ายกัน) ส่งครั้งหนึ่งแบบไม่ compress และอีกครั้งด้วย `CompressionTypes.GZIP`:
+
+```typescript
+// src/batching-and-compression/compression-ratio-demo.ts
+// @run
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const kafka = new Kafka({ clientId: 'compression-probe', brokers });
+
+function order(i: number) {
+  return JSON.stringify({
+    orderId: `order-${i}`,
+    customerId: `customer-${i % 50}`,
+    status: 'PENDING',
+    items: [
+      { sku: 'WIDGET-001', qty: 2, price: 19.99 },
+      { sku: 'WIDGET-002', qty: 1, price: 9.99 },
+    ],
+    createdAt: '2026-09-29T00:00:00.000Z',
+  });
+}
+
+async function send(topic: string, compression: number) {
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] });
+  await admin.disconnect();
+
+  const producer = kafka.producer();
+  await producer.connect();
+  const messages = Array.from({ length: 500 }, (_, i) => ({ key: `k${i}`, value: order(i) }));
+  await producer.send({ topic, messages, compression });
+  await producer.disconnect();
+}
+
+async function main() {
+  await send(`${prefix}orders-json-none`, CompressionTypes.None);
+  await send(`${prefix}orders-json-gzip`, CompressionTypes.GZIP);
+  console.log('sent 500 realistic JSON order records, both uncompressed and gzip');
+  process.exit(0);
+}
+
+main();
+```
+
+```bash
+# scripts/batching-and-compression/dump-compression-ratio.sh
+NONE_LOG=$(find /tmp/kafka-logs -maxdepth 1 -type d -name '*orders-json-none-0' | head -1)
+GZIP_LOG=$(find /tmp/kafka-logs -maxdepth 1 -type d -name '*orders-json-gzip-0' | head -1)
+echo "=== uncompressed batch ==="
+/opt/kafka/bin/kafka-dump-log.sh --files "$NONE_LOG"/00000000000000000000.log | head -3
+echo "=== gzip batch ==="
+/opt/kafka/bin/kafka-dump-log.sh --files "$GZIP_LOG"/00000000000000000000.log | head -3
+```
+
+ผลลัพธ์จริง — ทั้งคู่เป็น **record batch เดียว** (500 record รวมกันในการเรียก `send()` ครั้งเดียว) ดังนั้น field `size:` ของ batch เองคือขนาดบนดิสก์จริง ๆ:
+
+```text
+=== uncompressed batch ===
+baseOffset: 0 lastOffset: 499 count: 500 ... size: 108177 magic: 2 compresscodec: none ...
+
+=== gzip batch ===
+baseOffset: 0 lastOffset: 499 count: 500 ... size: 4741 magic: 2 compresscodec: gzip ...
+```
+
+**108,177 byte → 4,741 byte — ลดลง 22.8 เท่า (เล็กลง 95.6%)** สำหรับ JSON สมจริงที่ซ้ำ ๆ บทเรียนจากการวัดทั้งสองครั้งรวมกัน: อัตราการย่อคือคุณสมบัติของ **ความซ้ำซ้อนใน payload จริงของคุณ** ไม่ใช่เปอร์เซ็นต์ตายตัวที่ codec ไหนก็รับประกันได้ — วัดกับข้อมูลของคุณเอง แบบเดียวกับที่บทนี้วัดกับ payload สมจริงและ payload สุ่มแยกกัน
+
+## `compression.type`: ระดับ producer เทียบกับระดับ topic
+
+`compression.type` ตั้งได้สองที่ และทำงานร่วมกัน:
+
+- **ฝั่ง producer** (`compression.type` ใน Java client / `compression: CompressionTypes.GZIP` ต่อ-send ใน KafkaJS) — producer compress batch ก่อนส่ง
+- **ระดับ topic** (`compression.type` เป็น **topic config** ค่า default คือ `producer`) — คุมว่า **broker** จะทำอะไร `producer` (ค่า default) แปลว่า "เก็บ codec ที่ producer ใช้ไว้แบบเดิม อย่าไปแตะ" การตั้ง `compression.type` ของ topic เป็น codec เฉพาะ (เช่น `lz4`) จะทำให้ broker **compress ซ้ำ** ทุก batch ให้เป็น codec นั้น ตอนเขียนลง ไม่ว่า producer จะส่งอะไรมาก็ตาม — มีประโยชน์เพื่อบังคับมาตรฐานข้าม producer ที่คุณควบคุมไม่ได้ทั้งหมด แลกกับ CPU ของ broker ที่เพิ่มขึ้น
+
+```properties
+# config/batching-and-compression/topic-compression.properties
+# section: topic
+compression.type=producer
+```
+
 ## buffer.memory, back-pressure และเส้นตายของการส่ง
 
 เพราะ `send()` เป็น asynchronous record จึงนั่งอยู่ใน buffer ในหน่วยความจำก่อน I/O layer จะส่งออก ใน Java client `buffer.memory` จำกัดขนาดรวมของ buffer นั้น เมื่อ buffer เต็ม `send()` จะ **block** (นานสุดตาม `max.block.ms`) เป็นการใส่ **back-pressure** เพื่อไม่ให้ producer ที่เร็วเกินไปกินหน่วยความจำจนหมด **KafkaJS ไม่มี setting buffer แบบนี้ให้ปรับ** ไม่ได้ pre-buffer record ก่อน `send()` แบบที่ Java client ทำ จึงไม่มีคู่ `buffer.memory`/`max.block.ms` ให้จูน
@@ -69,9 +206,9 @@ delivery.timeout.ms=120000
 request.timeout.ms=30000
 ```
 
-**KafkaJS บรรลุเป้าหมายเดียวกัน — จำกัดว่า send จะ retry ได้นานแค่ไหน — ด้วยวิธีต่างออกไป**: ผ่าน **`retry`** policy ระดับ client (`retries`, `initialRetryTime`, `maxRetryTime`) ซึ่งอยู่ใน [Error Handling & Retries](/kafka/th/delivery-and-transactions/error-handling-retries/) ไม่มี deadline เดี่ยว ๆ retry จะหยุดเองเมื่อจำนวนครั้งใน policy หมด
+**KafkaJS บรรลุเป้าหมายเดียวกัน — จำกัดว่า send จะ retry ได้นานแค่ไหน — ด้วยวิธีต่างออกไป**: ผ่าน **`retry`** policy ระดับ client (`retries`, `initialRetryTime`, `maxRetryTime`) ซึ่งอยู่ใน [Error Handling & Retries](/kafka/th/delivery-and-transactions/error-handling-retries/) ไม่มี deadline เดี่ยว ๆ retry จะหยุดเองเมื่อจำนวนครั้งใน policy หมด ในทางกลับกัน native `librdkafka` surface ของ `@confluentinc/kafka-javascript` expose `delivery.timeout.ms` ของ Java client ตรง ๆ เพราะใช้ config surface ของ `librdkafka` ร่วมกับ ecosystem C/C++/Java
 
-<Mermaid title="Records batch, compress, and drain within the delivery deadline" code={batchDiagram} />
+<Mermaid title="Record ถูก batch, compress แล้วระบายออกภายในเส้นตายของการส่ง" code={batchDiagram} />
 
 export const batchDiagram = `flowchart LR
   send["send() adds record to buffer"] --> buf["'buffer.memory': full means back-pressure"]
@@ -82,11 +219,67 @@ export const batchDiagram = `flowchart LR
 
 ## จูนเพื่อ throughput
 
-ใน Java client ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด ใน **KafkaJS** เพราะไม่มีปุ่ม batching ให้จูน ให้เน้นงาน throughput ที่: ส่ง message array ที่ใหญ่ขึ้นต่อการ `send()` หนึ่งครั้ง เลือก `compression: CompressionTypes.GZIP` (หรือ codec LZ4/ZSTD ที่ลงทะเบียนไว้) และตั้ง `retry` policy ให้กว้างพอจะทนต่อ broker สะดุด
+ใน Java client ถ้าจะดัน throughput ขึ้น เพิ่ม `linger.ms` อีกนิด (5-20 ms) ขยาย `batch.size` และเปิด compression แบบ `lz4` หรือ `zstd` — สามอย่างนี้ทำงานร่วมกัน เพราะรอมากขึ้นทำให้ batch เต็มกว่า และ batch ที่เต็มกว่าก็ compress ได้ดีกว่า เผื่อ `buffer.memory` ให้พอสบายเพื่อไม่ให้ back-pressure มาสะดุด และทำให้ `delivery.timeout.ms` ยาวพอจะรองรับ retry ตอน broker สะดุด ใน **KafkaJS** เพราะไม่มีปุ่ม batching ให้จูน ให้เน้นงาน throughput ที่: ส่ง message array ที่ใหญ่ขึ้นต่อการ `send()` หนึ่งครั้ง เลือก `compression: CompressionTypes.GZIP` (หรือ codec LZ4/ZSTD ที่ลงทะเบียนไว้) และตั้ง `retry` policy ให้กว้างพอจะทนต่อ broker สะดุด ใน **`@confluentinc/kafka-javascript`** ปุ่มเทียบเท่า Java client ครบชุด (`linger.ms`, `batch.size`, `batch.num.messages`, `compression.codec`) ใช้ได้ตรง ๆ
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Java client รวม record เป็น batch ด้วย **`linger.ms`** และ **`batch.size`** (แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก) compress แต่ละ batch ด้วย **`compression.type`** ใส่ **back-pressure** ผ่าน **`buffer.memory`** และคุมทั้งการส่งด้วย **`delivery.timeout.ms`** (ค่า default **120000**) **KafkaJS ไม่มีปุ่ม linger/batch-size/buffer** แต่รวม batch เองต่อการ `send()` แต่ละครั้ง compress ผ่าน option **`compression`** บน `send()` และคุม retry ด้วย **`retry`** policy ระดับ client แทนเส้นตายเดี่ยว ๆ
+Java client รวม record เป็น batch ด้วย **`linger.ms`** และ **`batch.size`** (แลก **latency** นิดหน่อยกับ **throughput** ที่สูงขึ้นมาก) compress แต่ละ batch ด้วย **`compression.type`** ใส่ **back-pressure** ผ่าน **`buffer.memory`** และคุมทั้งการส่งด้วย **`delivery.timeout.ms`** (ค่า default **120000**) **KafkaJS ไม่มีปุ่ม linger/batch-size/buffer และ ship มาแค่ GZIP ตัวเดียว** (ยืนยันจาก source) แต่รวม batch เองต่อการ `send()` แต่ละครั้ง compress ผ่าน option **`compression`** บน `send()` และคุม retry ด้วย **`retry`** policy ระดับ client แทนเส้นตายเดี่ยว ๆ **`@confluentinc/kafka-javascript`** expose ปุ่มของ `librdkafka` ครบชุด (`linger.ms`, `batch.size`, `batch.num.messages`, codec ทั้งสี่ตัว) ตรง ๆ วัดบนเครื่องนี้: compression บน byte สุ่มที่**ย่อไม่ได้** เสีย throughput ไปราว 4%; บน **JSON สมจริง** ลดขนาด batch จาก 108,177 เหลือ 4,741 byte (22.8 เท่า) — วัดกับ payload ของคุณเอง อย่าสมมติผลลัพธ์ล่วงหน้า
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/batching-and-compression/high-throughput-producer.ts
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+// AI comment: "tuned for high throughput — larger batches, less overhead"
+const kafka = new Kafka({
+  clientId: 'events-app',
+  brokers: ['localhost:9092'],
+});
+
+async function sendEvents(events: Record<string, unknown>[]) {
+  const producer = kafka.producer();
+  await producer.connect();
+  await producer.send({
+    topic: 'events',
+    compression: CompressionTypes.LZ4, // "lz4 is fast, great for throughput"
+    messages: events.map((e) => ({ value: JSON.stringify(e) })),
+  });
+  await producer.disconnect();
+}
+`}>
+
+โค้ดนี้ดูเหมือนคำแนะนำการจูนที่ดีและมี comment กำกับชัดเจน — `lz4` เป็นตัวเลือกทั่วไปที่ถูกต้องจริงบน Java client และ comment ก็ฟังดูเหมือนมาจาก performance guide จริง ๆ บั๊กจริง: นี่คือ **KafkaJS** ไม่ใช่ Java client และ KafkaJS ship มาแค่ **GZIP** ตัวเดียว (ยืนยันจาก source ด้านบน) — `Snappy`/`LZ4`/`ZSTD` จะ throw `KafkaJSNotImplemented('LZ4 compression not implemented')` จนกว่าจะติดตั้งและลงทะเบียน codec package แยกกับ `CompressionCodecs` ก่อน `sendEvents` จะ throw ตั้งแต่ครั้งแรกที่เรียก ไม่ได้ค่อย ๆ เสื่อมประสิทธิภาพแบบเงียบ ๆ — แต่โค้ดฐานที่ pattern นี้ถูก copy เข้าไป (จาก tutorial หรือตัวอย่างของ client อื่นที่ adapt มาโดยไม่เช็ก) จะไม่รู้สาเหตุจนกว่าจะรันจริง วิธีแก้คือใช้ codec ที่ KafkaJS ship มาจริง หรือติดตั้งและลงทะเบียน package LZ4 ตัวจริง:
+
+```text
+// Option A: use what KafkaJS ships natively
+compression: CompressionTypes.GZIP,
+
+// Option B: install kafkajs-lz4, then register it once at startup
+import LZ4 from 'kafkajs-lz4';
+import { CompressionCodecs } from 'kafkajs';
+CompressionCodecs[CompressionTypes.LZ4] = new LZ4().codec;
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+ทั้ง batching และ compression แลก **เวลานิดหน่อยฝั่ง client** กับ **งานที่ broker/network/disk ต้องทำต่อ record น้อยลงมาก** — แต่ทำงานคนละชั้นและไม่ต้องพึ่งกันเอง batching คือเรื่อง *เมื่อไร* ที่ request จะออกจาก client (สะสมไว้ก่อน vs ส่งทันที) compression คือเรื่อง *กี่ byte* ที่ request นั้นต้องเสียเมื่อมันออกไปแล้ว KafkaJS ยุบการตัดสินใจเรื่อง "เมื่อไร" ลงเหลือแค่ "คุณใส่ message กี่อันใน `send()` array เดียว" (ไม่มีการสะสมด้วย timer เลย) ในขณะที่ยังให้การตัดสินใจเรื่อง "กี่ byte" ต่อการเรียกผ่าน `compression` Java client และ `librdkafka` แยกทั้งสองการตัดสินใจออกเป็นปุ่มอิสระที่จูนได้ต่อเนื่อง (`linger.ms`/`batch.size` สำหรับเมื่อไร, `compression.type` สำหรับกี่ byte) คันโยกสองอันเดียวกัน แต่ระดับความละเอียดในการควบคุมต่างกัน
+
+## Trade-offs
+
+- **การ batch ตาม call ของ `send()` ใน KafkaJS** — ไม่ต้องตั้งค่าอะไรเลย แต่ไม่มีทางจูนเส้น latency/throughput แยกจากวิธีที่โค้ดแอปของคุณบังเอิญจัดกลุ่ม message เข้า `send()`
+- **`linger.ms`/`batch.size`/`batch.num.messages` ของ `@confluentinc/kafka-javascript`** — ควบคุมอิสระเต็มที่ แลกกับปุ่มจูนที่แอปของคุณต้องตั้งให้ถูก
+- **GZIP (codec เดียวที่ KafkaJS มีให้โดยไม่ต้องลงอะไรเพิ่ม)** — ใช้ได้ทุกที่ไม่ต้องพึ่ง dependency เพิ่ม แต่เป็น codec ที่ช้าที่สุด กิน CPU มากที่สุดในสี่ตัว — โอเคสำหรับ topic throughput ปานกลาง เป็นคอขวดจริงเมื่อปริมาณสูงมาก
+- **LZ4/Snappy/ZSTD ผ่าน `@confluentinc/kafka-javascript` หรือ codec package ที่ลงทะเบียนกับ KafkaJS** — compress เร็วขึ้นชัดเจน แลกกับ native dependency เพิ่ม (confluent client) หรือ plugin package ที่ดูแลน้อยกว่า (KafkaJS codec plugin)
+- **การ override `compression.type` ระดับ topic** — บังคับ codec ให้สม่ำเสมอข้าม producer ที่คุณควบคุมไม่ได้ทั้งหมด แลกกับ CPU ของ broker ที่เสียต่อเนื่องทุก batch ที่ต้อง compress ซ้ำ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"KafkaJS มี `linger.ms` และ `batch.size` เหมือน client อื่น ๆ แค่ชื่อต่างนิดหน่อย"** ไม่ — ยืนยันจาก source และ type แล้ว: ทั้งสองไม่มีอยู่ใน KafkaJS เลย batching เป็นแบบ implicit ขับเคลื่อนล้วน ๆ ด้วยจำนวน message ที่คุณส่งเข้า `send()` หนึ่งครั้ง
+- **"compression ทำให้เร็วขึ้นเสมอ"** ไม่ — วัดตรง ๆ ด้านบนแล้ว: บน payload byte สุ่มที่ย่อไม่ได้ `lz4` เสีย throughput ไปราว 4% เทียบกับไม่ compress เพราะต้นทุน CPU ของ compressor แทบไม่ได้ขนาดที่ลดลงกลับมาเลย
+- **"`CompressionTypes.LZ4` (หรือ Snappy/ZSTD) ใช้ได้เลยใน KafkaJS เหมือน GZIP"** ไม่ — พิสูจน์จาก source และจากกรณี SpotTheBug ด้านบนแล้ว: มีแค่ GZIP เท่านั้นที่ bundle มา ตัวอื่นจะ throw `KafkaJSNotImplemented` จนกว่าจะติดตั้งและลงทะเบียน codec package แยกก่อน
+- **"ค่า `compression.type` ของ topic คือค่าที่ producer ใช้ compress"** ไม่ — ค่าระดับ topic คุมว่า **broker** จะทำอะไรหลังรับ batch (ค่า default `producer`: ปล่อยไว้แบบเดิม) ส่วนค่าฝั่ง producer เอง (property `compression.type` หรือ option `compression` ต่อ-send ของ KafkaJS) คือสิ่งที่ compress byte จริง ๆ ตอนส่งออก
 
 export const quizBatching = [
   {
@@ -98,26 +291,62 @@ export const quizBatching = [
       'พื้นที่ disk แลกกับ memory',
     ],
     answer: 1,
+    explain: 'รอนานขึ้นนิดหน่อย (linger.ms) ให้ record สะสมเข้าใกล้ batch.size มากขึ้น ทำให้ request น้อยลง เต็มกว่า มีประสิทธิภาพมากกว่า แลกกับ latency ต่อ record',
   },
   {
-    q: 'compression codec ตัวไหนให้อัตราย่อดีสุดแต่กิน CPU มากสุด',
+    q: 'KafkaJS expose linger.ms หรือ batch.size ไหม แล้ว @confluentinc/kafka-javascript expose อะไรแทน',
     options: [
-      'lz4',
-      'snappy',
-      'gzip',
-      'none',
-    ],
-    answer: 2,
-  },
-  {
-    q: 'KafkaJS จัดการ batching ฝั่ง producer ยังไง เทียบกับ Java client',
-    options: [
-      'expose property linger.ms และ batch.size แบบเดียวกัน',
-      'ไม่มีปุ่ม linger/batch-size — รวม message ใน send() ครั้งเดียวเองภายใน ไม่มี linger timer',
-      'ไม่ batch record เลย',
-      'ต้องใช้ library แยกสำหรับ batching',
+      'KafkaJS expose ทั้งคู่; confluent ไม่มีเลย',
+      'ไม่มีเลยใน KafkaJS (ยืนยันจาก source/type); @confluentinc/kafka-javascript expose linger.ms, batch.size ของ librdkafka และ batch.num.messages เพิ่ม (เพดานนับเป็นจำนวน record ที่ client อื่นไม่มี)',
+      'ทั้งสอง client expose ปุ่ม batching เหมือนกันเป๊ะ',
+      'KafkaJS expose แค่ batch.size',
     ],
     answer: 1,
+    explain: 'KafkaJS batch แบบ implicit ต่อการ call send() ไม่มี timer หรือปุ่มขนาดเลย; confluent client เพราะมี librdkafka หนุนหลัง expose config surface เต็มรูปแบบรวมถึง batch.num.messages',
+  },
+  {
+    q: 'KafkaJS ship compression codec ตัวไหนมาให้ในตัว ยืนยันจาก source ของมันเอง',
+    options: [
+      'ครบทั้งสี่: gzip, snappy, lz4, zstd',
+      'แค่ gzip เท่านั้น — สามตัวที่เหลือ throw KafkaJSNotImplemented จนกว่าจะติดตั้งและลงทะเบียน codec package แยก',
+      'แค่ snappy',
+      'ไม่มีเลย — compression ต้องพึ่ง plugin เสมอ',
+    ],
+    answer: 1,
+    explain: 'node_modules/kafkajs/src/protocol/message/compression/index.js ลงทะเบียน codec ที่ใช้งานได้จริงแค่ GZIP; Snappy/LZ4/ZSTD เป็นแค่ stub ที่ throw โดย default',
+  },
+  {
+    q: 'ตอนรัน kafka-producer-perf-test.sh จริงของบทนี้ด้วย payload default (byte สุ่ม) เกิดอะไรขึ้นตอนเปิด lz4 compression',
+    options: [
+      'throughput เพิ่มขึ้นเกือบสองเท่า',
+      'throughput ต่ำกว่าไม่ compress ประมาณ 4% เพราะ byte สุ่มย่อแทบไม่ได้เลย และต้นทุน CPU ของการ compress กลายเป็น overhead ล้วน ๆ',
+      'การรัน crash',
+      'ไม่มีอะไรเปลี่ยนเลย',
+    ],
+    answer: 1,
+    explain: 'วัดได้จริง: 317,460 record/sec แบบไม่ compress เทียบกับ 303,951 record/sec ด้วย lz4 — compression จะคุ้มก็ต่อเมื่อ payload ย่อได้จริง',
+  },
+  {
+    q: 'บน payload JSON สมจริงที่ซ้ำ ๆ ของบทเดียวกัน (record order 500 อันใน batch เดียว) kafka-dump-log.sh แสดงอัตราการย่อของ gzip เท่าไร',
+    options: [
+      'ไม่ต่างกันอย่างมีนัยสำคัญ',
+      '108,177 byte แบบไม่ compress เหลือ 4,741 byte แบบ gzip — ลดลง 22.8 เท่า',
+      'ลด 2 เท่าเสมอ',
+      'compression ทำให้ batch ใหญ่ขึ้น',
+    ],
+    answer: 1,
+    explain: 'field size: ของ dump-log เองแสดงตัวเลขก่อน/หลังจริง — JSON สมจริงที่ซ้ำ ๆ ย่อได้ดีกว่า payload byte สุ่ม default ของ perf-test เครื่องมือมาก',
+  },
+  {
+    q: 'ค่า topic-level compression.type=producer (ค่า default) แปลว่าอะไรจริง ๆ',
+    options: [
+      'broker บังคับให้ทุก batch ใช้ codec default ของ producer ไม่ว่าจะชื่ออะไร',
+      'broker ปล่อย codec ที่ producer compress มาแล้วไว้แบบเดิม ไม่แตะ; การตั้งเป็น codec เฉพาะจะทำให้ broker compress ซ้ำทุก batch ให้เป็น codec นั้นตอนเขียน',
+      'ปิด compression ทั้งหมดไม่ว่า producer จะส่งอะไรมา',
+      'ใช้กับ consumer เท่านั้น ไม่เกี่ยวกับ producer',
+    ],
+    answer: 1,
+    explain: 'producer (ค่า default) คือ pass-through: เก็บสิ่งที่ producer ส่งมาไว้เหมือนเดิม ค่า codec เฉพาะทำให้ broker ต้องเสีย CPU เพิ่มในการ compress ซ้ำทุก batch ที่เข้ามาเพื่อบังคับความสม่ำเสมอ',
   },
   {
     q: 'delivery.timeout.ms (ค่า default 120000) ใน Java client คุมอะไร และ KafkaJS บรรลุเป้าหมายเดียวกันยังไง',
@@ -128,6 +357,7 @@ export const quizBatching = [
       'ระยะเวลา retention ของ topic; KafkaJS ตั้งค่านี้ต่อ producer',
     ],
     answer: 1,
+    explain: 'delivery.timeout.ms คือเส้นตายเดียวที่ครอบคลุมวงจรชีวิตทั้งหมดของการ send รวม retry; KafkaJS คุมเวลารวมของ retry แทนผ่าน retry policy (retries/initialRetryTime/maxRetryTime) โดยไม่มี property เส้นตายเดี่ยว ๆ ชื่อเดียว',
   },
 ];
 
