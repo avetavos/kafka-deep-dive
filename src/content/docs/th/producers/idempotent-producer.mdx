@@ -1,6 +1,6 @@
 ---
 title: 'Idempotent Producer'
-description: 'idempotence กัน retry ไม่ให้สร้าง duplicate อย่างไรด้วย producer id epoch และ sequence number ทำไมถึงเป็น default ใน Java client แต่ต้อง opt-in เองใน KafkaJS และทำไมถึงไม่เหมือน transactions'
+description: 'idempotence กัน retry ไม่ให้สร้าง duplicate อย่างไรด้วย producer id, epoch และ sequence number — พิสูจน์บน segment file จริงด้วย kafka-dump-log.sh — ทำไมถึงเป็น default ใน Java client แต่ต้อง opt-in เองใน KafkaJS, enable.idempotence ต้องการอะไรจริง ๆ และทำไมถึงไม่เหมือน transactions'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -16,7 +17,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ปัญหา duplicate ที่ retry สร้างขึ้น
 
-ถ้าไม่มี idempotence การ retry อาจสร้าง record ซ้ำเงียบ ๆ producer ส่ง record broker เขียนสำเร็จ แต่ acknowledge หายระหว่างทางกลับ producer timeout แล้ว retry และ broker ก็เขียน **record เดิมเป็นครั้งที่สอง** ตอนนี้เรามีสองสำเนา แถมแยกไม่ออกด้วย
+ถ้าไม่มี idempotence การ retry อาจสร้าง record ซ้ำเงียบ ๆ producer ส่ง record broker เขียนสำเร็จ แต่ acknowledge หายระหว่างทางกลับ producer timeout แล้ว retry และ broker ก็เขียน **record เดิมเป็นครั้งที่สอง** ตอนนี้เรามีสองสำเนา แถมแยกไม่ออกด้วย (บทก่อนหน้าพิสูจน์เรื่องนี้ไปแล้วจริง ๆ — duplicate ห้าชุดจริงจาก `send()` ครั้งเดียว ด้วย `idempotent: false`)
 
 idempotence แก้เรื่องนี้: broker assign **producer id (PID)** และ **epoch** ให้แต่ละ producer และ producer ก็ stamp ทุก record ด้วย **sequence number ที่เพิ่มขึ้นเรื่อย ๆ** ต่อ partition เมื่อ record มาถึง broker เช็ค sequence number: ถ้าเคยเห็นเลขนี้สำหรับ PID และ partition นั้นแล้ว จะ **acknowledge แต่ไม่เขียน** record ซ้ำอีก
 
@@ -35,11 +36,102 @@ retries=2147483647
 max.in.flight.requests.per.connection=5
 ```
 
-**KafkaJS** ต้อง opt in เองที่ producer แล้ว client จะบังคับใช้ข้อกำหนดที่เทียบเท่ากันภายใน — คุณไม่ต้องตั้ง `acks` หรือ in-flight limit แยกเอง:
+**KafkaJS** ต้อง opt in เองที่ producer:
 
 ```typescript
-// idempotent: true implies acks: -1 (all) internally, and caps in-flight requests
-const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 5 })
+const producer = kafka.producer({ idempotent: true })
+```
+
+## producer id, epoch และ sequence number ตัวจริง บนดิสก์
+
+นี่ไม่ใช่แค่แนวคิดนามธรรม — เป็นข้อมูลจริงใน header ของ record batch บนดิสก์ ส่ง 3 record ด้วย idempotent producer ของ KafkaJS แล้วอ่าน segment file ตรง ๆ ด้วย `kafka-dump-log.sh --print-data-log`:
+
+```typescript
+// src/idempotent-producer/send-three.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}orders-idem-demo`;
+
+const kafka = new Kafka({ clientId: 'idem-demo', brokers });
+
+async function main() {
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] });
+  await admin.disconnect();
+
+  const producer = kafka.producer({ idempotent: true });
+  await producer.connect();
+  for (let i = 0; i < 3; i++) {
+    const [meta] = await producer.send({
+      topic,
+      messages: [{ key: `order-${i}`, value: `payload-${i}` }],
+    });
+    console.log(`sent order-${i} -> offset ${meta.baseOffset}`);
+  }
+  await producer.disconnect();
+  process.exit(0);
+}
+
+main();
+```
+
+```bash
+# scripts/idempotent-producer/dump-idempotent-log.sh
+# Relies on the harness's own topic-prefix convention (module-lesson-<name>),
+# matching the ts fence above run via --run before this fence runs via --cli.
+LOGDIR=$(find /tmp/kafka-logs -maxdepth 1 -type d -name '*orders-idem-demo-0' | head -1)
+LOGFILE=$(find "$LOGDIR" -name '*.log' | head -1)
+/opt/kafka/bin/kafka-dump-log.sh --print-data-log --files "$LOGFILE"
+```
+
+ผลลัพธ์จริง ตัดให้สั้นลง — `baseSequence`/`lastSequence` หนึ่งค่าต่อ record ทุกอันใช้ `producerId` เดียวกัน:
+
+```text
+baseOffset: 0 ... producerId: 0 producerEpoch: 0 baseSequence: 0 lastSequence: 0
+| offset: 0 sequence: 0 key: order-0 payload: payload-0
+baseOffset: 1 ... producerId: 0 producerEpoch: 0 baseSequence: 1 lastSequence: 1
+| offset: 1 sequence: 1 key: order-1 payload: payload-1
+baseOffset: 2 ... producerId: 0 producerEpoch: 0 baseSequence: 2 lastSequence: 2
+| offset: 2 sequence: 2 key: order-2 payload: payload-2
+```
+
+ทุก record จาก producer session นี้แปะ `producerId: 0` (PID ที่ Kafka assign ให้ connection นี้ตอน `InitProducerId` รัน) และ `producerEpoch: 0` เหมือนกัน; `sequence` เพิ่มขึ้นทีละหนึ่งพอดีต่อ record ต่อ partition นี่คือกลไกตัวจริงที่การพิสูจน์ duplicate-จาก-retry ในบทก่อนอาศัยอยู่: เมื่อความพยายามที่ถูก retry มาถึงพร้อม `sequence` ที่ broker เคยบันทึกไว้แล้วสำหรับ `(producerId, partition)` นั้น มันจะถูกทิ้งแทนที่จะถูก append
+
+<Mermaid title="Broker แยก duplicate จาก retry ด้วย sequence number" code={idempotentDiagram} />
+
+export const idempotentDiagram = `flowchart LR
+  send1["Send seq=7 (PID 100, epoch 3)"] --> write["Broker writes seq=7"]
+  write --> lostack["Ack lost on the way back"]
+  lostack --> retry["Producer retries seq=7"]
+  retry --> check["Broker: already saw seq=7 for this PID"]
+  check --> dedupe["Acknowledge but do NOT write again"]`;
+
+## `enable.idempotence` ต้องการอะไรจริง ๆ — ยืนยันกับ official config reference
+
+อ้างจาก `kafka.apache.org/43/configuration/producer-configs/` ตรง ๆ เรื่อง `enable.idempotence`:
+
+> "enabling idempotence requires `max.in.flight.requests.per.connection` to be less than or equal to 5 (with message ordering preserved for any allowable value), `retries` to be greater than 0, and `acks` must be 'all'."
+
+และเรื่อง `max.in.flight.requests.per.connection`:
+
+> "if this configuration is set to be greater than 1 and `enable.idempotence` is set to false, there is a risk of message reordering after a failed send due to retries" — และ idempotence ต้องการค่านี้ **ไม่เกิน 5** "since brokers retain a maximum of 5 batches per producer"
+
+นั่นคือ **เพดานที่ 5** ไม่ใช่ข้อกำหนดว่าต้องเป็น 1 เป๊ะ ๆ — Java client (และ cache sequence number ของ broker เอง) ยอมให้มี batch in-flight ได้ถึงห้าตัวต่อ connection โดยยังรับประกัน ordering ได้ เพราะ broker เก็บประวัติมากพอที่จะตรวจจับ batch ที่มาผิดลำดับหรือซ้ำภายในหน้าต่างนั้น
+
+<Callout title="คำแก้ไขที่ยืนยันจาก source ของ KafkaJS เอง: เพดานนี้ไม่ได้ถูกบังคับฝั่ง client">
+คงง่ายที่จะสมมติว่า KafkaJS บังคับเพดาน 5-batch แบบเดียวกัน (หรือถึงขั้นบีบ `maxInFlightRequests` ให้เหลือ `1`) ทันทีที่คุณส่ง `idempotent: true` แต่ไม่ใช่เลย อ่านตรงจาก source ของ `kafkajs@2.2.4` (`node_modules/kafkajs/src/producer/index.js`): สิ่งเดียวที่ `idempotent: true` เปลี่ยนคือ default ของ retry (`retries: Number.MAX_SAFE_INTEGER`) กับการตรวจว่า retry ไม่ถูกปิด — ไม่มี code path ไหนอ่านหรือบีบ `maxInFlightRequests` ตาม `idempotent` เลย `maxInFlightRequests` ยังคงเป็น option `Kafka.producer({ maxInFlightRequests })` ของ connection pool ที่แยกจากกันจากบทก่อนหน้า default เป็น `null` (ไม่จำกัด) ถ้าอยากได้ margin ความปลอดภัยแบบเดียวกับที่ default ของ Java client ให้ **คุณต้องตั้ง `maxInFlightRequests: 5` เอง** — KafkaJS จะไม่ทำให้คุณ และจะไม่ห้ามคุณตั้งสูงกว่านั้นด้วย
+</Callout>
+
+```typescript
+// idempotent: true does NOT imply or clamp maxInFlightRequests in KafkaJS —
+// verified from source. Set the connection-pool cap yourself if you want it.
+const producer = kafka.producer({ idempotent: true })
+const kafka2 = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
+const producerWithCap = kafka2.producer({ idempotent: true, maxInFlightRequests: 5 })
 ```
 
 ## idempotence ต้องการอะไร และรับประกันอะไร
@@ -50,18 +142,9 @@ idempotence ไม่ได้ยืนได้ด้วยตัวเอง �
 - **`retries > 0`** — retry คือต้นเหตุของ duplicate ตั้งแต่แรก ถ้าไม่มี retry ก็ไม่มีอะไรให้ dedupe
 - **`max.in.flight.requests.per.connection <= 5`** — ยอมให้มี batch in-flight ได้ถึงห้าตัว **โดยยังรักษา ordering** ไว้ เพราะ broker ติดตาม sequence number และปฏิเสธอะไรที่มาผิดลำดับ
 
-เงื่อนไขเหล่านี้เป็นข้อกำหนดระดับ protocol ไม่ใช่แค่เรื่องจุกจิกของ Java client เท่านั้น: ใน KafkaJS การส่ง `idempotent: true` ทำให้ client บังคับใช้การรับประกันที่เทียบเท่ากันภายใน นั่นคือเหตุผลที่คุณไม่ต้องตั้ง `acks` เองบน idempotent producer ของ KafkaJS
+ใน Java client ทั้งสามข้อนี้ถูก **บังคับเป็น config constraint จริง** (ตั้งค่าขัดกับ idempotence จะ throw `ConfigException` ตอนสร้าง producer) ใน **KafkaJS** มีแค่ `acks` กับ `retries` เท่านั้นที่ client บังคับจริงตอน `idempotent: true` — `maxInFlightRequests` ปล่อยให้เป็นหน้าที่คุณทั้งหมด ตามคำแก้ไขด้านบน
 
 เมื่อเงื่อนไขเหล่านี้เป็นจริง เราจะได้ **exactly-once delivery ต่อ partition ตอน retry**: ไม่ว่า record จะถูก retry กี่ครั้ง ก็ถูกเขียนลง log **ครั้งเดียว** ตัว **epoch** คือสิ่งที่ทำให้ปลอดภัยข้ามการ restart ของ producer และ network partition — epoch ใหม่กว่าจะ **fence** producer instance เก่าที่อาจเป็น zombie ทำให้ write ค้างเก่าถูกปฏิเสธ
-
-<Mermaid title="The broker dedupes a retried record by its sequence number" code={idempotentDiagram} />
-
-export const idempotentDiagram = `flowchart LR
-  send1["Send seq=7 (PID 100, epoch 3)"] --> write["Broker writes seq=7"]
-  write --> lostack["Ack lost on the way back"]
-  lostack --> retry["Producer retries seq=7"]
-  retry --> check["Broker: already saw seq=7 for this PID"]
-  check --> dedupe["Acknowledge but do NOT write again"]`;
 
 ## idempotence ไม่ใช่ transactions
 
@@ -70,8 +153,58 @@ export const idempotentDiagram = `flowchart LR
 การรับประกันที่แข็งกว่านั้น — การ write แบบ atomic ข้าม partition และ exactly-once processing จริง ๆ — คือสิ่งที่ **transactions** ให้ ซึ่งสร้าง **ทับบน** idempotent producer อีกที โมดูล Delivery Semantics และ Transactions จะครอบคลุม `transactionalId`, `producer.transaction()` และ `txn.commit()` ตอนนี้จำเส้นแบ่งไว้: idempotence กำจัด duplicate จาก retry ส่วน transactions เพิ่ม atomicity
 
 <Callout title="สรุปหนึ่งบรรทัด">
-idempotent producer stamp record ด้วย **producer id**, **epoch** และ **sequence number** เพื่อให้ broker ทิ้ง **duplicate** จาก retry ให้ผล **exactly-once ต่อ partition** วิธีนี้ต้องการ **`acks=all`**, **`retries > 0`** และ **`max.in.flight.requests.per.connection <= 5`** เป็น **default ใน Java client** แต่ใน **KafkaJS คุณต้อง opt in เอง** ด้วย `idempotent: true` — และ **ไม่ใช่** สิ่งเดียวกับ **transactions** เต็มรูปแบบ
+idempotent producer stamp record ด้วย **producer id**, **epoch** และ **sequence number** (พิสูจน์แล้วด้านบน ตรงบนดิสก์จริง) เพื่อให้ broker ทิ้ง **duplicate** จาก retry ให้ผล **exactly-once ต่อ partition** Java client ต้องการ **`acks=all`**, **`retries > 0`** และ **`max.in.flight.requests.per.connection <= 5`** — และบังคับทั้งสามข้อจริง **KafkaJS บังคับแค่สองข้อแรกเท่านั้น** เพดาน in-flight เป็นหน้าที่คุณต้องตั้งเอง เป็น **default ใน Java client** แต่ใน **KafkaJS คุณต้อง opt in เอง** ด้วย `idempotent: true` — และ **ไม่ใช่** สิ่งเดียวกับ **transactions** เต็มรูปแบบ
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/idempotent-producer/payment-producer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+
+// AI comment: "idempotent producer, tuned for max throughput"
+const producer = kafka.producer({
+  idempotent: true,
+  maxInFlightRequests: 20, // "higher = faster, and idempotent handles ordering for us"
+});
+
+async function chargeCard(paymentId: string, amountCents: number) {
+  await producer.send({
+    topic: 'payments',
+    messages: [{ key: paymentId, value: JSON.stringify({ amountCents }) }],
+  });
+}
+`}>
+
+โค้ดนี้อ่านดูน่าเชื่อมาก: ตั้ง `idempotent: true` ไว้แล้ว เลยน่าจะให้ KafkaJS "handles ordering for us" ไม่ว่า `maxInFlightRequests` จะสูงแค่ไหน — comment ก็บอกแบบนั้นด้วย บั๊กจริง ยืนยันจาก source ของ `kafkajs@2.2.4` และจาก official config reference ด้านบน: idempotence ใน KafkaJS **ไม่** บีบหรือตรวจสอบ `maxInFlightRequests` เลย และตัว broker เองก็เก็บแค่ **5** batch ต่อ producer สำหรับ track sequence เท่านั้น ดัน `maxInFlightRequests` ไปที่ `20` เท่ากับคุณกำลังพึ่ง margin ความปลอดภัยที่หมดฤทธิ์ไปแล้วหลัง batch in-flight ตัวที่ 5 — retry ที่ตกนอกหน้าต่างนั้นคือวิธีจริง มีเอกสารรองรับ ที่จะได้ `OutOfOrderSequenceException` หรือ `UnknownProducerIdException` จาก broker แทนที่จะได้การรับประกันที่ comment สัญญาไว้ วิธีแก้คือบรรทัดเดียวที่ Java client จะบังคับให้อัตโนมัติ:
+
+```text
+const producer = kafka.producer({
+  idempotent: true,
+  maxInFlightRequests: 5, // <-- the real ceiling; KafkaJS will not enforce this for you
+});
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+idempotence ย้ายการตรวจจับ duplicate จาก "record นี้หน้าตาเหมือนอันเดิมไหม?" (การเทียบเนื้อหา ซึ่งเปราะและแพง) ไปเป็น "ฉัน apply พิกัด `(producerId, partition, sequence)` นี้ไปแล้วหรือยัง?" (การเทียบเลขจำนวนเต็มที่ broker ทำได้ในเวลาคงที่ ติดตามต่อ partition จำกัดแค่ batch ล่าสุดไม่กี่ตัว) โดยพื้นฐานแล้วมันคือ **ระบบพิกัด** ไม่ใช่ตัวกรองเนื้อหา — record สองอันที่ `key`/`value` เหมือนกันทุก byte แต่ sequence number ต่างกัน คือ record คนละอันสำหรับ broker และการ retry จริงของความพยายามเดิมก็ถูกจำได้จากพิกัดที่ตรงกับอันที่เคยเห็นเท่านั้น ไม่เคยเทียบ payload เลย
+
+## Trade-offs
+
+- **`idempotent: true`, `maxInFlightRequests` default (`null`, ไม่จำกัด)** — ตรงกับพฤติกรรม default จริงของ KafkaJS ที่ยืนยันแล้ว สะดวก แต่สละ margin ความปลอดภัยเรื่อง ordering/duplicate-detection ที่ Java client จะบังคับให้เงียบ ๆ
+- **`idempotent: true, maxInFlightRequests: 5`** — ตรงกับเพดานจริงของ Java client เป๊ะ ทำให้ sequence cache 5-batch ของ broker ยัง track batch ที่ in-flight ได้ครบ เป็นตัวเลือกที่ปลอดภัย เจตนาชัด สำหรับอะไรก็ตามที่ durability สำคัญ
+- **`idempotent: true, maxInFlightRequests: 1`** — serialize request ต่อ connection เข้มงวดที่สุด mental model ง่ายที่สุดและไม่มีความเสี่ยงเกินหน้าต่าง tracking ของ broker เลย แลกกับต้นทุนด้าน throughput จริง (ไม่มี pipelining)
+- **`idempotent: false`** (default ของ KafkaJS) — ไม่มีกลไก PID/epoch/sequence เลย ถูกที่สุด แต่ทุก retry คือ duplicate เงียบ ๆ ที่อาจเกิดขึ้นได้ (พิสูจน์แล้วในบทก่อน)
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`idempotent: true` ใน KafkaJS บีบหรือตรวจสอบ `maxInFlightRequests` อัตโนมัติเหมือน Java client"** ไม่ — พิสูจน์จาก source แล้ว: KafkaJS ไม่มีการบีบหรือตรวจสอบแบบนั้นเลย คุณต้องตั้งเพดานเอง
+- **"idempotent producer ต้องการ `max.in.flight.requests.per.connection` เป็น 1 เป๊ะ ๆ"** ไม่ — ยืนยันกับ official config reference แล้ว: ข้อกำหนดจริงคือ **`<= 5`** เพราะ broker เก็บได้สูงสุด 5 batch ต่อ producer สำหรับ track sequence `1` คือค่าปลอดภัยที่เข้มงวดที่สุด ไม่ใช่ค่าปลอดภัยค่าเดียว
+- **"idempotence กับ transactions คือ feature เดียวกัน แค่ชื่อต่างกัน"** ไม่ — idempotence รับประกันแค่ว่า record ลงครั้งเดียวต่อ partition ตอน retry ไม่มีแนวคิดเรื่อง write แบบ atomic ข้าม partition หรือ consumer offset เลย นั่นคือสิ่งที่ transactions เพิ่มเข้ามาทับ
+- **"producer id ใน dump-log output เป็น UUID สุ่ม ๆ"** ไม่ — มันคือเลขจำนวนเต็มเล็ก ๆ ที่ถูก assign เรียงลำดับ (`producerId: 0`, `1`, `9`, ... ในการรันของคอร์สนี้เอง) ที่แจกโดย handler `InitProducerId` ของ broker ต่อ producer session หนึ่งครั้ง คู่กับ `epoch` ที่เพิ่มขึ้นทุกครั้งที่ producer restart เพื่อ fence instance เก่าที่ค้างอยู่
 
 export const quizIdempotent = [
   {
@@ -83,6 +216,7 @@ export const quizIdempotent = [
       'partition ถูก rebalance',
     ],
     answer: 1,
+    explain: 'idempotence มีไว้เพื่อหยุดการ retry ระดับ network ของ record ที่เขียนไปแล้วไม่ให้ถูก append ซ้ำเป็นครั้งที่สอง',
   },
   {
     q: 'broker รู้จัก duplicate จาก retry ได้อย่างไร',
@@ -93,6 +227,7 @@ export const quizIdempotent = [
       'ด้วย timestamp ของ record อย่างเดียว',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรงบนดิสก์ด้วย kafka-dump-log.sh แล้ว: ทุก record batch แปะ producerId และ sequence number; broker ปฏิเสธ sequence ที่ซ้ำสำหรับ producerId/partition เดียวกัน แทนที่จะเทียบเนื้อหา payload',
   },
   {
     q: 'idempotence เปิดเป็น default ใน KafkaJS ไหม',
@@ -103,16 +238,40 @@ export const quizIdempotent = [
       'เฉพาะฝั่ง consumer เท่านั้น',
     ],
     answer: 1,
+    explain: 'ยืนยันจาก source ของ kafkajs ในบทก่อนแล้ว: idempotent = false คือ default ใน constructor ตรงข้ามกับ default ของ Java client ตั้งแต่ Kafka 3.0',
+  },
+  {
+    q: 'ตาม official reference kafka.apache.org/43/configuration/producer-configs/ enable.idempotence ต้องการอะไรจริง ๆ สำหรับ max.in.flight.requests.per.connection',
+    options: [
+      'ต้องเป็น 1 เป๊ะ ๆ เสมอ',
+      'ไม่เกิน 5 (ordering ยังรักษาไว้ได้ทุกค่าที่อนุญาต) เพราะ broker เก็บได้สูงสุด 5 batch ต่อ producer',
+      'ไม่มีข้อจำกัดเลย',
+      'ต้องเท่ากับจำนวน partition ของ topic พอดี',
+    ],
+    answer: 1,
+    explain: 'ถ้อยคำจริงใน config reference คือเพดานที่ 5 ไม่ใช่ข้อกำหนดว่าต้องเป็น 1 เป๊ะ ๆ — sequence-tracking cache ของ broker คือสิ่งที่กำหนดขอบเขตนี้',
+  },
+  {
+    q: 'KafkaJS บังคับเพดาน 5-batch นี้อัตโนมัติไหมตอนตั้ง idempotent: true',
+    options: [
+      'ใช่ เหมือน Java client เป๊ะ ซึ่งจะ throw ConfigException ถ้าฝ่าฝืน',
+      'ไม่ — ยืนยันจาก source ของ kafkajs@2.2.4: idempotent: true กระทบแค่ default ของ retry กับการตรวจสอบเท่านั้น maxInFlightRequests ไม่ถูกแตะเลยและยัง default เป็น null (ไม่จำกัด)',
+      'เฉพาะตอนตั้ง transactionalId ด้วยเท่านั้น',
+      'เฉพาะ KafkaJS เวอร์ชันหลัง 3.0',
+    ],
+    answer: 1,
+    explain: 'นี่คือคำแก้ไขที่บทนี้ทำกับสมมติฐานตามธรรมชาติ: KafkaJS ไม่บีบหรือตรวจสอบ maxInFlightRequests ตาม idempotent เลย คุณต้องตั้งเอง',
   },
   {
     q: 'idempotence ต่างจาก transactions อย่างไร',
     options: [
       'เป็น feature เดียวกันเป๊ะ',
-      'idempotence ให้ exactly-once ต่อ partition ตอน retry ส่วน transactions เพิ่มการ write แบบ atomic ข้าม partition',
+      'idempotence ให้ exactly-once ต่อ partition ตอน retry ส่วน transactions เพิ่มการ write แบบ atomic ข้าม partition และผูก consumer offset commit เข้าไปด้วย',
       'transactions อ่อนกว่า idempotence',
       'idempotence ใช้ได้กับ consumer เท่านั้น',
     ],
     answer: 1,
+    explain: 'transactions สร้างทับบน idempotent producer เพื่อเพิ่ม atomicity ข้ามหลาย partition/topic และผูก write ของ producer เข้ากับการ commit offset ของ consumer — idempotence อย่างเดียวทำไม่ได้ทั้งสองอย่าง',
   },
 ];
 
