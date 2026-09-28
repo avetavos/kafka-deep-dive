@@ -1,6 +1,6 @@
 ---
 title: 'Consumer Groups & Rebalancing'
-description: 'How consumer groups share partitions, what a rebalance is, and the new KIP-848 consumer rebalance protocol that is generally available in Kafka 4.x for the Java client.'
+description: 'How consumer groups share partitions, what a rebalance is, and KIP-848 — the new broker-driven consumer rebalance protocol — proven live against a real broker with both the classic and consumer protocols.'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -47,28 +48,226 @@ export const groupDiagram = `flowchart TB
 
 ## Rebalancing
 
-When a consumer joins, leaves, or dies — or partitions are added — the group must **rebalance**: redistribute partitions among the current members. The classic protocol does this with a **stop-the-world** step: every consumer stops processing, gives up its partitions, and waits for a new assignment. On large groups that pause hurts.
+When a consumer joins, leaves, or dies — or partitions are added — the group must **rebalance**: redistribute partitions among the current members. Under the **classic** protocol this is a **stop-the-world** step: every member gives up all of its partitions and waits for a brand-new assignment, even members whose own assignment doesn't end up changing. On large groups that pause hurts.
 
-## KIP-848: the new rebalance protocol (Java client)
+## Correcting the record: KIP-848 and JavaScript clients
 
-Kafka 4.0 ships the **next-generation consumer rebalance protocol (KIP-848)** as **generally available** for the **Java client**. It moves assignment logic to the broker-side **group coordinator** and makes rebalances **incremental** — only the partitions that actually move are revoked, and the rest keep processing. The result is shorter, less disruptive rebalances, especially for large groups.
+<Callout title="Correction — this used to be wrong in this course">
+An earlier version of this page said support for KIP-848 in JavaScript clients "will arrive as it lands upstream." That was stale even when it shipped: `librdkafka` reached **KIP-848 general availability in v2.12.0** (8 Oct 2025, release notes: *"the next generation consumer group rebalance protocol … is production-ready … `group.protocol` configuration property dictates whether to use the new `consumer` protocol or older `classic` protocol. It defaults to `classic` if not provided."*), and **`@confluentinc/kafka-javascript`** — the exact client this page names — is built directly on `librdkafka` and has carried that support ever since (current npm version at review time, `1.10.1`, bundles `librdkafka` v2.15.1). It is **not** a future feature. It just isn't the default.
+</Callout>
+
+Kafka 4.0 shipped the **next-generation consumer rebalance protocol (KIP-848)** as **generally available**. It moves assignment logic to the broker-side **group coordinator** and makes rebalances **incremental** — only the partitions that actually move are revoked, and the rest keep processing.
 
 ```properties
-# Java-client opt-in: the new consumer group protocol (KIP-848), GA in Kafka 4.0
+# section: consumer
+# Client opt-in: the new consumer group protocol (KIP-848), GA since Kafka 4.0.
+# @confluentinc/kafka-javascript takes this as a TOP-LEVEL rdkafka key, NOT nested
+# under kafkaJS:{} -- see "Reading AI-generated code" below for the exact error
+# you get if you put it in the wrong place.
 group.protocol=consumer
-# The classic (older) protocol is still available:
+# The classic (older) protocol is still available, and is still the CLIENT default:
 # group.protocol=classic
 ```
 
-**KafkaJS consumers — the ones this course's examples use — currently speak the classic group protocol only; there is no `group.protocol` setting to flip.** That's not a lost benefit, though: KIP-848's redesign lives mostly on the **broker-side coordinator**, so a KRaft 4.x cluster still benefits from the new coordinator's efficiency even when talking to classic-protocol consumers like KafkaJS's. Support for the new protocol in JavaScript clients (e.g. Confluent's `@confluentinc/kafka-javascript`) will arrive as it lands upstream.
+## Proving `group.protocol=consumer` with a real client and a real broker
+
+This ran against `apache/kafka:4.3.1` (single-broker KRaft) with `@confluentinc/kafka-javascript@1.10.1`:
+
+```typescript
+// src/consumer-groups-and-rebalancing/kip848-consumer.ts
+// @run
+import pkg from '@confluentinc/kafka-javascript';
+const { KafkaJS } = pkg;
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}orders`;
+
+const kafka = new KafkaJS.Kafka({ kafkaJS: { brokers } });
+
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const consumer = kafka.consumer({
+  'group.protocol': 'consumer', // KIP-848 opt-in: top-level key, not under kafkaJS:{}
+  kafkaJS: { groupId: `${prefix}kip848-group`, fromBeginning: true },
+});
+await consumer.connect();
+await consumer.subscribe({ topic });
+
+const producer = kafka.producer();
+
+let done = false;
+const run = consumer.run({
+  eachMessage: async ({ message }) => {
+    if (done) return;
+    done = true;
+    console.log('consumed with group.protocol=consumer:', message.value?.toString());
+    await consumer.disconnect();
+    await producer.disconnect().catch(() => {});
+    process.exit(0);
+  },
+});
+
+await new Promise((r) => setTimeout(r, 2000)); // let JoinGroup/assignment settle first
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'hello-kip848' }] });
+
+void run;
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 25000);
+```
+
+The real, trimmed CLI output — **`kafka-consumer-groups.sh` has no `--describe` protocol column**, but `--list --type` does, and it is the honest way to see which protocol a group actually negotiated:
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list --type classic,consumer
+GROUP                            TYPE
+kip848-group2                    Consumer
+classic-protocol-group           Classic
+```
+
+A group that never set `group.protocol` (or set it to `classic`) shows up as **`Classic`**; a group that set `group.protocol: 'consumer'` shows up as **`Consumer`** — proven directly, not assumed.
+
+## Classic (eager) vs KIP-848 (incremental): measured, not assumed
+
+Two consumers (A, B) were started in a group on a 6-partition topic, a producer sent a message every 30ms, and a third consumer (C) joined and then left. Every message's exact processing timestamp was logged. On **this Mac**, local broker, tiny workload:
+
+**Classic protocol (KafkaJS, round-robin, always eager):** when C left the group, *both* remaining members re-joined — including B, whose final partition assignment (`[1,3,5]`) was **identical** before and after:
+
+```text
+[A] REBALANCING t=...286034
+[A] GROUP_JOIN   t=...286072  memberAssignment={"orders":[0,2,4]}  duration=38
+[B] REBALANCING t=...286066
+[B] GROUP_JOIN   t=...286072  memberAssignment={"orders":[1,3,5]}  duration=6
+
+# gap between the LAST message consumed before REBALANCING and the FIRST after:
+A: 45ms stop-the-world pause
+B: 14ms stop-the-world pause  (even though B's assignment never changed!)
+```
+
+**KIP-848 consumer protocol (`@confluentinc/kafka-javascript`, `group.protocol=consumer`):** across the *same* two membership changes (a member joining, then leaving), partitions `0` and `1` stayed on consumer A **uninterrupted for the entire ~18-second run** — no gap larger than ordinary producer jitter (~150ms, seen throughout, not just at the rebalance) — while partitions `2`–`5` moved between the other members one at a time:
+
+```text
+A partition 0: consumed continuously from t=...464489 to t=...482256 (never revoked)
+A partition 1: consumed continuously from t=...464520 to t=...482286 (never revoked)
+A partition 5: revoked ~469171 -> picked up by C at ~470366 (~1s later, matches
+                group.consumer.assignment.interval.ms=1000, the broker default)
+A partition 2: revoked ~474155 -> picked up by C at ~475518
+```
+
+That is the concrete difference "incremental" buys you: under classic, **every** member stops and rejoins on **any** membership change; under KIP-848's consumer protocol, a member whose partitions aren't moving **keeps consuming through the rebalance**.
+
+<Callout title="These numbers are from one Mac">
+45ms and 14ms are not a promise about your production cluster — they scale with partition count, member count, and rejoin/session-timeout tuning. The qualitative result (classic = every member pauses; KIP-848 consumer protocol = only affected partitions move) is the durable claim; the millisecond figures are this run, on this machine, once.
+</Callout>
+
+## KafkaJS's classic protocol, honestly: there is no cooperative-sticky
+
+It would be convenient if "classic vs KIP-848" mapped to "eager vs cooperative" inside a single client, letting you soften classic's stop-the-world with a cooperative-sticky assignor before ever touching `group.protocol`. **KafkaJS 2.2.4 does not offer that option.** Its entire assignor registry is one assignor:
+
+```text
+$ node -e "console.log(require('kafkajs').PartitionAssigners)"
+{ roundRobin: [Function: assigner] }
+```
+
+`kafka-consumer-groups.sh --describe` and this course's own probe both confirm every KafkaJS group negotiates `groupProtocol: "RoundRobinAssigner"` — eager, stop-the-world, full-group rejoin on every membership change, full stop. If you need cooperative-sticky-style incremental rebalancing on a JavaScript client today, the real options are: (a) accept classic's eager rebalances (fine for small groups), or (b) move to `@confluentinc/kafka-javascript` with `group.protocol: 'consumer'` (KIP-848, broker-driven, incremental — proven above). There is no cooperative-sticky assignor to configure inside KafkaJS; claiming otherwise is exactly the kind of confident-but-wrong detail AI code generation produces from stale training data.
+
+## `session.timeout.ms` / `heartbeat.interval.ms` move to the broker under KIP-848
+
+Under the classic protocol, `sessionTimeout` and `heartbeatInterval` are **client-side** KafkaJS consumer options (defaults `30000` / `3000`ms) — the client decides its own liveness cadence, and a network partition or a busy client can lie about being alive for the whole session timeout. KIP-848 moves this to broker-controlled config, verified directly against a running 4.3.1 broker:
+
+```bash
+# scripts/consumer-groups-and-rebalancing/kip848-broker-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all \
+  | grep -E "group\.consumer\.(session|heartbeat)" || true
+```
+
+```text
+group.consumer.heartbeat.interval.ms=5000     sensitive=false synonyms={DEFAULT_CONFIG:...}
+group.consumer.session.timeout.ms=45000       sensitive=false synonyms={DEFAULT_CONFIG:...}
+group.consumer.min.session.timeout.ms=45000
+group.consumer.max.session.timeout.ms=60000
+```
+
+Those are **real key names, verified against the running broker**, not guessed from a KIP wiki page: `group.consumer.session.timeout.ms` (default **45s**, not classic's 30s) and `group.consumer.heartbeat.interval.ms` (default **5s**, not classic's 3s). A client using the consumer protocol can still request a session timeout inside the broker's configured `min`/`max` window, but the **broker**, not the client, is the source of truth for how long a silent member is tolerated.
+
+## Which protocol is the default in Kafka 4.3.1?
+
+Two different defaults, verified separately, and easy to conflate:
+
+- **Client-side default: `classic`.** A consumer that never sets `group.protocol` negotiates `Classic` — proven above (`default-protocol-group` showed up as `Classic` in `--list --type` with no `group.protocol` key set at all), and it matches `librdkafka`'s own release note ("It defaults to `classic` if not provided").
+- **Broker-side: all three protocols are enabled by default,** so a client that *does* opt in succeeds without any broker reconfiguration:
+
+```text
+group.coordinator.rebalance.protocols=classic,consumer,share
+  synonyms={STATIC_BROKER_CONFIG:...=classic,consumer,share, DEFAULT_CONFIG:...=classic,consumer,streams}
+```
+
+One more honest finding this course didn't have before: on this same broker, `group.coordinator.rebalance.protocols` itself logs as **deprecated in 4.3.1** —
+
+```text
+WARN The config `group.coordinator.rebalance.protocols` is deprecated and will be
+removed in Kafka 5.0. ... all protocols will always be enabled and controlled solely
+by feature versions (group.version, streams.version, share.version) via kafka-features.sh.
+```
+
+So: nothing to configure on the broker to make KIP-848 available in 4.3.1 (it already is), but the client still has to ask for it, and by default it doesn't.
 
 <Callout title="If you learned Kafka a few years ago">
-The old advice was "avoid rebalances, they stop the world." For **Java-client** consumers, KIP-848 (`group.protocol=consumer`, GA in Kafka 4.0) makes rebalances **incremental and broker-driven** — untouched partitions keep flowing. Once activated, a group can only be downgraded to Kafka 3.4.1 or newer. **KafkaJS consumers still use the classic protocol today**, so this specific improvement does not yet apply to the examples in this course.
+The old advice was "avoid rebalances, they stop the world." That is still exactly true for the **classic** protocol — proven above, every member pauses on every membership change. KIP-848's **consumer** protocol (broker-driven, incremental, GA since Kafka 4.0) fixes it for clients that opt in with `group.protocol: 'consumer'` — which, as of `@confluentinc/kafka-javascript` 1.10.1, includes JavaScript. **KafkaJS still only speaks classic** (no `group.protocol` setting exists in it at all), so the examples elsewhere in this course that use KafkaJS are still subject to stop-the-world rebalances.
 </Callout>
 
-<Callout title="The one-line takeaway">
-A **consumer group** splits a topic\'s partitions among its members — one partition per consumer, so partition count caps parallelism — while separate groups each read the whole stream. Membership changes trigger a **rebalance**; Kafka 4.0's **KIP-848** protocol makes this far smoother for **Java-client** consumers (`group.protocol=consumer`, broker-driven and **incremental** instead of stop-the-world) — **KafkaJS consumers still run the classic protocol** as of today.
-</Callout>
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/consumer-groups-and-rebalancing/opt-in-kip848.ts
+import pkg from '@confluentinc/kafka-javascript';
+const { KafkaJS } = pkg;
+
+const kafka = new KafkaJS.Kafka({ kafkaJS: { brokers: ['localhost:9092'] } });
+
+const consumer = kafka.consumer({
+  kafkaJS: {
+    groupId: 'orders-group',
+    groupProtocol: 'consumer', // "opting in" to KIP-848
+  },
+});
+
+await consumer.connect();
+`}>
+
+The exact, real error thrown at `consumer.connect()`:
+
+```text
+KafkaJSError: The 'groupProtocol' property is not supported.
+    at #kafkaJSToConsumerConfig (.../kafkajs/_consumer.js:502:13)
+    ...
+  code: -186,
+  type: 'ERR__INVALID_ARG'
+```
+
+`@confluentinc/kafka-javascript` exposes two config surfaces: a `kafkaJS: {...}` block that mimics KafkaJS's own option names (`groupId`, `sessionTimeout`, `autoCommit`, ...), and the **raw `librdkafka` config keys** as top-level properties on the same object (`'group.protocol'`, `'max.in.flight'`, ...). `group.protocol` is a `librdkafka`-native key with no `kafkaJS:{}` equivalent — the compatibility layer explicitly rejects it if you nest it. This is a realistic AI-generated bug: an assistant that has seen a hundred `kafkaJS: { ... }` blocks reasonably (but wrongly) guesses every new option belongs there. The fix is the one-line move shown earlier in this page: `kafka.consumer({ 'group.protocol': 'consumer', kafkaJS: { groupId: '...' } })`.
+
+</SpotTheBug>
+
+## Mental Model
+
+Think of a consumer group's rebalance as **"who owns the lease on each partition, and how much do we disrupt existing leases to update it."** Classic protocol: every lease is torn up and reissued on any membership change, because assignment is computed client-side by whichever member becomes group leader, and the safest way to ship a client-computed assignment is to have everyone stop first. KIP-848 moves assignment computation to the broker's group coordinator, which already knows the full membership and can compute a **diff** — so it only revokes what actually needs to move, and tells each member individually. Same goal (one partition, one owner), fundamentally different mechanism for getting there.
+
+## Trade-offs
+
+- **Classic protocol** — simple, works with any client that speaks it (including unmaintained KafkaJS), but every rebalance is stop-the-world for the *whole* group regardless of how small the actual membership change was. Fine for small, stable groups; painful for large groups with frequent scaling/deploys.
+- **KIP-848 consumer protocol** — incremental, broker-driven, meaningfully shorter disruption windows for unaffected partitions (proven above) — but it requires a client that implements it (KafkaJS does not), a Kafka 4.0+ broker, and it is a newer code path with less production mileage than classic.
+- **Broker-side session config (KIP-848) vs client-side (`classic`)** — broker-side means one place to tune liveness detection for every member instead of trusting each client's local timer, but it also means the broker's `group.consumer.min/max.session.timeout.ms` window constrains what a client can even ask for.
+
+## Common Misconceptions
+
+- **"KIP-848 isn't available for JavaScript yet."** Wrong as of `librdkafka` 2.12.0 (Oct 2025) via `@confluentinc/kafka-javascript` — proven above. It's just not the default, and KafkaJS specifically never gained it.
+- **"KafkaJS has a cooperative-sticky assignor, I just need to configure it."** No — verified directly against the installed package: KafkaJS 2.2.4 ships exactly one assignor, round-robin. There is nothing to configure.
+- **"More consumers in a group always means more parallelism."** No — partition count is the ceiling; extra consumers beyond the partition count sit fully idle (see the quiz below).
+- **"`kafka-consumer-groups.sh --describe` shows me the group's protocol."** It doesn't have a protocol column — use `--list --type classic,consumer` instead, as proven above.
 
 export const quizGroups = [
   {
@@ -80,6 +279,7 @@ export const quizGroups = [
       'None; partitions are read by the broker',
     ],
     answer: 1,
+    explain: 'Kafka assigns each partition within a group to exactly one member; that is what makes partition count the parallelism ceiling.',
   },
   {
     q: 'You have a topic with 4 partitions and start 6 consumers in one group. What happens?',
@@ -90,26 +290,51 @@ export const quizGroups = [
       'The group fails to start',
     ],
     answer: 1,
+    explain: 'Kafka never auto-creates partitions to satisfy consumer count, and it never lets two members of the same group share one partition — the extra members simply get nothing.',
   },
   {
-    q: 'What improved about rebalancing in Kafka 4.0 with KIP-848, and does it apply to KafkaJS consumers today?',
+    q: 'How do you opt a `@confluentinc/kafka-javascript` consumer into the KIP-848 protocol correctly?',
     options: [
-      'Rebalances were removed entirely, for every client',
-      'Rebalances became incremental and broker-driven for Java-client consumers; KafkaJS consumers still use the classic protocol',
-      'Consumers now share partitions, in every client',
-      'Offsets are no longer tracked, in every client',
+      "kafka.consumer({ kafkaJS: { groupProtocol: 'consumer' } })",
+      "kafka.consumer({ 'group.protocol': 'consumer', kafkaJS: { groupId: '...' } })",
+      'Set it as an environment variable KAFKA_GROUP_PROTOCOL',
+      'It is on by default, no config needed',
     ],
     answer: 1,
+    explain: "group.protocol is a top-level librdkafka config key, not a kafkaJS:{} option — the wrong form throws a real KafkaJSError('...not supported'), proven above; and the client default is classic, not consumer.",
   },
   {
-    q: 'How do two different consumer groups reading the same topic relate?',
+    q: 'A group has 3 members under the classic protocol. Member C leaves gracefully. What happens to member B, whose final partition assignment turns out to be unchanged?',
     options: [
-      'They share offsets and compete for records',
-      'They are independent — each gets a full copy of the stream and tracks its own offsets',
-      'Only one group can read a topic at a time',
-      'The second group must wait for the first to finish',
+      'B is unaffected and keeps consuming without interruption',
+      "B still pauses and re-joins the group (stop-the-world), even though its assignment ends up identical",
+      'B is removed from the group along with C',
+      'B automatically switches to the KIP-848 protocol',
     ],
     answer: 1,
+    explain: 'Measured directly: B showed a REBALANCING/GROUP_JOIN cycle and a real (if short, ~14ms on this Mac) consumption gap even though its post-rebalance assignment [1,3,5] was identical to its pre-rebalance one — that is what "stop-the-world" means under classic.',
+  },
+  {
+    q: 'Under KIP-848\'s consumer protocol, what happened to consumer A\'s partitions 0 and 1 while two other membership changes occurred during the same run?',
+    options: [
+      'They were revoked and reassigned on every membership change, like classic',
+      'They kept being consumed with no interruption for the whole ~18s run, while only the affected partitions moved between other members',
+      'Consumer A was removed from the group',
+      'Partitions 0 and 1 were deleted',
+    ],
+    answer: 1,
+    explain: "That is the measured, concrete meaning of \"incremental\": partitions not involved in a reassignment are never revoked, unlike classic's blanket stop-the-world.",
+  },
+  {
+    q: 'On this course\'s Kafka 4.3.1 broker, what is the default value of `group.protocol` that a client negotiates if it never sets the option?',
+    options: [
+      'consumer (KIP-848)',
+      'classic',
+      'share',
+      'streams',
+    ],
+    answer: 1,
+    explain: "Verified via kafka-consumer-groups.sh --list --type: a consumer with no group.protocol key shows up as Classic, matching librdkafka's own release note that it defaults to classic.",
   },
 ];
 
