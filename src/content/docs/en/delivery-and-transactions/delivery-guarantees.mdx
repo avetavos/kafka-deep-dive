@@ -147,7 +147,7 @@ Both proofs above ran on this course's own single-broker probe (this Mac). The e
 
 ## Proof: `min.insync.replicas` greater than the replication factor — what we actually found (not what is usually assumed)
 
-The commonly repeated rule is "if `min.insync.replicas` is set higher than the replication factor, every `acks=all` write fails with `NotEnoughReplicasException`." The [Replication & ISR](/kafka/en/topics-and-partitions/replication-and-isr/) lesson describes the same mechanism for a **live ISR shrink** (a healthy multi-replica partition losing a follower). We tested the **structurally-impossible** case directly — a topic created with `replication-factor=1` and `min.insync.replicas=2`, so the ISR (size 1, the leader itself) can never reach the required size — against this course's real Kafka 4.3.1 broker:
+The commonly repeated rule is "if `min.insync.replicas` is set higher than the replication factor, every `acks=all` write fails with `NotEnoughReplicasException`." That is true only when the shortfall happens on a topic whose **replication factor is at least `min.insync.replicas`** — proven on a real 3-broker cluster with a genuine ISR shrink in [Acks and Durability](/kafka/en/producers/acks-and-durability/) (`producers` module), which captured the broker's actual `NotEnoughReplicasException` text, **"Messages are rejected since there are fewer in-sync replicas than required."** We tested the **structurally-impossible** case here — a topic created with `replication-factor=1` and `min.insync.replicas=2`, so the ISR (size 1, the leader itself) can never reach the required size — against this course's real Kafka 4.3.1 broker:
 
 ```bash
 # scripts/delivery-guarantees/insync-check.sh
@@ -167,10 +167,10 @@ Completed updating config for topic insync-check.
 console-producer exit code: 0
 ```
 
-The write **succeeded** — no `NotEnoughReplicasException`, no non-zero exit code — even though `--under-min-isr-partitions` confirms the broker itself flags this exact partition as under-replicated (`Isr: 1` against a required `2`). The [kafka.apache.org config reference](https://kafka.apache.org/43/configuration/topic-configs) documents the exception for when "the in-sync replica count drops below this threshold," but does not specifically describe the case where the replication factor can never satisfy the threshold at all; on this broker, in that specific case, the broker accepted the write rather than blocking it forever. We repeated this with `min.insync.replicas=5` (further from RF=1) and got the same result. This is a real, reproducible finding on Kafka 4.3.1 KRaft, and it **contradicts the common assumption** — the operational takeaway is not "the broker will protect you from this misconfiguration," it's: **monitor `--under-min-isr-partitions` (or the `UnderMinIsrPartitionCount` JMX metric) directly**, because a structurally-impossible `min.insync.replicas` will not necessarily announce itself by rejecting writes.
+The write **succeeded** — no `NotEnoughReplicasException`, no non-zero exit code — even though `--under-min-isr-partitions` confirms the broker itself flags this exact partition as under-replicated (`Isr: 1` against a required `2`). The [kafka.apache.org config reference](https://kafka.apache.org/43/configuration/topic-configs) documents the exception for when "the in-sync replica count drops below this threshold," but does not specifically describe the case where the replication factor can never satisfy the threshold at all; on this broker, in that specific case, the broker accepted the write rather than blocking it forever. We repeated this with `min.insync.replicas=5` (further from RF=1) and got the same result. **Why**: `min.insync.replicas` enforcement lives entirely in the code path that waits for **followers** to catch up — a replication-factor-1 partition has no followers, so there is no "wait for enough replicas" step to ever fail. This is exactly the trap [KIP-579](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/148641915/KIP-579+new+exception+on+min.insync.replicas+replication.factor) proposed a dedicated `InconsistentReplicationFactorException` for — verified against this Kafka 4.3.1 broker, the write is still silently accepted today, no such exception exists yet. The operational takeaway is not "the broker will protect you from this misconfiguration," it's: **monitor `--under-min-isr-partitions` (or the `UnderMinIsrPartitionCount` JMX metric) directly**.
 
-<Callout title="This lesson vs. Replication & ISR">
-[Replication & ISR](/kafka/en/topics-and-partitions/replication-and-isr/) is correct for the scenario it describes — a **live shrink** from a healthy ISR (e.g. RF=3, min.insync.replicas=2, one follower falls behind or a broker dies). What we tested here is different: a topic that is under-replicated **from the moment it's created**, which this course's port budget (a single broker) can only reproduce structurally, not as a live shrink — proving an actual live-shrink rejection needs a multi-broker cluster, which is outside this lesson's single-broker docker budget. If you need to see a live ISR shrink and its rejection behavior firsthand, that is the scenario to reproduce with a 3-broker compose.
+<Callout title="This lesson vs. Acks and Durability">
+[Acks and Durability](/kafka/en/producers/acks-and-durability/) (`producers` module) proves the **other half** of this same story on a real 3-broker cluster: when replication factor **is** at least `min.insync.replicas` and the ISR genuinely shrinks (a follower is stopped), `acks=all` **does** reject with a real `NotEnoughReplicasException`. Put together: the exception is real and does fire — but only for a live shrink on an adequately-replicated topic, never for the structurally-impossible case tested here. This lesson's single-broker port budget can only reproduce the structural case; see that lesson for the live-shrink proof rather than re-running a 3-broker compose here.
 </Callout>
 
 ## The high-watermark: what "committed" actually means
@@ -263,15 +263,15 @@ export const quizGuarantees = [
     explain: 'Real output: console-producer exit code 0 (success) even though kafka-topics.sh --describe --under-min-isr-partitions listed the topic as under-replicated.',
   },
   {
-    q: 'How does this lesson\'s finding relate to the Replication & ISR lesson\'s description of min.insync.replicas rejecting writes?',
+    q: 'How does this lesson\'s structural-shortfall finding relate to Acks and Durability\'s real NotEnoughReplicasException?',
     options: [
       'They directly contradict each other with no explanation',
-      'Replication & ISR describes a live ISR shrink from a healthy multi-replica state (needs a multi-broker cluster to verify); this lesson tested the different, structurally-impossible RF=1 case on a single broker and got a different, real result',
-      'Replication & ISR is simply wrong and should be deleted',
+      'Acks and Durability proves a live ISR shrink on an adequately-replicated 3-broker topic really does throw NotEnoughReplicasException; this lesson tested the different, structurally-impossible RF=1 case on a single broker and got the opposite real result -- both are real, for different scenarios',
+      'Acks and Durability is simply wrong and should be corrected',
       'min.insync.replicas has no effect in either scenario',
     ],
     answer: 1,
-    explain: 'The lesson explicitly separates the two scenarios and states the single-broker port budget here could only test the structural case, not a live shrink.',
+    explain: 'The exception is real and does fire -- but only for a live shrink on an adequately-replicated topic (proven with a 3-broker cluster elsewhere), never for the structurally-impossible RF < min.insync.replicas case tested here.',
   },
   {
     q: 'What does the high-watermark mark, in terms of acks and min.insync.replicas?',

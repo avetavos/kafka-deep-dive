@@ -147,7 +147,7 @@ high-watermark after restart: acks0-burst:0:299
 
 ## พิสูจน์: `min.insync.replicas` มากกว่า replication factor — สิ่งที่เจอจริง (ไม่ใช่สิ่งที่มักสันนิษฐานกัน)
 
-กฎที่พูดกันบ่อย ๆ คือ "ถ้า `min.insync.replicas` ตั้งสูงกว่า replication factor ทุก `acks=all` write จะพัง `NotEnoughReplicasException`" บท [Replication & ISR](/kafka/th/topics-and-partitions/replication-and-isr/) อธิบาย mechanism เดียวกันนี้สำหรับ **ISR shrink สด ๆ** (partition หลาย replica ที่ปกติดี แต่ follower หลุดไป) เราทดสอบกรณีที่ **เป็นไปไม่ได้โดยโครงสร้าง** โดยตรง — topic ที่สร้างด้วย `replication-factor=1` และ `min.insync.replicas=2` ดังนั้น ISR (ขนาด 1 คือ leader เอง) ไม่มีทางถึงขนาดที่ต้องการได้เลย — กับ broker Kafka 4.3.1 จริงของคอร์สนี้
+กฎที่พูดกันบ่อย ๆ คือ "ถ้า `min.insync.replicas` ตั้งสูงกว่า replication factor ทุก `acks=all` write จะพัง `NotEnoughReplicasException`" นั่นจริงก็ต่อเมื่อ shortfall เกิดบน topic ที่ **replication factor อย่างน้อยเท่ากับ `min.insync.replicas`** — พิสูจน์บน cluster 3-broker จริงด้วย live ISR shrink จริงใน [Acks and Durability](/kafka/th/producers/acks-and-durability/) (module `producers`) ซึ่งจับข้อความ `NotEnoughReplicasException` จริงของ broker ได้ — **"Messages are rejected since there are fewer in-sync replicas than required."** เราทดสอบกรณีที่ **เป็นไปไม่ได้โดยโครงสร้าง** ตรงนี้ — topic ที่สร้างด้วย `replication-factor=1` และ `min.insync.replicas=2` ดังนั้น ISR (ขนาด 1 คือ leader เอง) ไม่มีทางถึงขนาดที่ต้องการได้เลย — กับ broker Kafka 4.3.1 จริงของคอร์สนี้
 
 ```bash
 # scripts/delivery-guarantees/insync-check.sh
@@ -167,10 +167,10 @@ Completed updating config for topic insync-check.
 console-producer exit code: 0
 ```
 
-write **สำเร็จ** — ไม่มี `NotEnoughReplicasException` ไม่มี exit code ที่ไม่ใช่ 0 — ทั้งที่ `--under-min-isr-partitions` ยืนยันว่า broker เองก็ flag partition นี้ว่า under-replicated (`Isr: 1` ในขณะที่ต้องการ `2`) [เอกสาร kafka.apache.org](https://kafka.apache.org/43/configuration/topic-configs) อธิบาย exception ไว้สำหรับตอนที่ "จำนวน in-sync replica ตกลงมาต่ำกว่า threshold นี้" แต่ไม่ได้พูดถึงกรณีที่ replication factor ไม่มีทางถึง threshold ได้เลยตั้งแต่ต้นโดยเฉพาะ บน broker ตัวนี้ ในกรณีเฉพาะนี้ broker ยอมรับ write แทนที่จะบล็อกไปตลอดกาล เราทำซ้ำด้วย `min.insync.replicas=5` (ห่างจาก RF=1 มากขึ้น) แล้วได้ผลเหมือนเดิม นี่คือ finding จริง ทำซ้ำได้ บน Kafka 4.3.1 KRaft และมัน**ขัดกับข้อสันนิษฐานทั่วไป** — ข้อสรุปเชิงปฏิบัติไม่ใช่ "broker จะป้องกันคุณจากการตั้งค่าผิดนี้" แต่คือ **monitor `--under-min-isr-partitions` (หรือ JMX metric `UnderMinIsrPartitionCount`) โดยตรง** เพราะ `min.insync.replicas` ที่เป็นไปไม่ได้โดยโครงสร้างจะไม่ประกาศตัวเองด้วยการปฏิเสธ write เสมอไป
+write **สำเร็จ** — ไม่มี `NotEnoughReplicasException` ไม่มี exit code ที่ไม่ใช่ 0 — ทั้งที่ `--under-min-isr-partitions` ยืนยันว่า broker เองก็ flag partition นี้ว่า under-replicated (`Isr: 1` ในขณะที่ต้องการ `2`) [เอกสาร kafka.apache.org](https://kafka.apache.org/43/configuration/topic-configs) อธิบาย exception ไว้สำหรับตอนที่ "จำนวน in-sync replica ตกลงมาต่ำกว่า threshold นี้" แต่ไม่ได้พูดถึงกรณีที่ replication factor ไม่มีทางถึง threshold ได้เลยตั้งแต่ต้นโดยเฉพาะ บน broker ตัวนี้ ในกรณีเฉพาะนี้ broker ยอมรับ write แทนที่จะบล็อกไปตลอดกาล เราทำซ้ำด้วย `min.insync.replicas=5` (ห่างจาก RF=1 มากขึ้น) แล้วได้ผลเหมือนเดิม **ทำไม**: การบังคับใช้ `min.insync.replicas` อยู่ในโค้ดพาธที่รอ **follower** ตามให้ทันเท่านั้น — partition ที่ replication-factor เป็น 1 ไม่มี follower เลย จึงไม่มีขั้นตอน "รอ replica ให้พอ" ที่จะล้มเหลวได้ นี่คือกับดักที่ [KIP-579](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/148641915/KIP-579+new+exception+on+min.insync.replicas+replication.factor) เสนอ `InconsistentReplicationFactorException` เฉพาะทางไว้แก้ — verify กับ broker Kafka 4.3.1 ตัวนี้แล้ว write ยังถูกยอมรับเงียบ ๆ อยู่จนถึงวันนี้ ยังไม่มี exception แบบนั้น ข้อสรุปเชิงปฏิบัติไม่ใช่ "broker จะป้องกันคุณจากการตั้งค่าผิดนี้" แต่คือ **monitor `--under-min-isr-partitions` (หรือ JMX metric `UnderMinIsrPartitionCount`) โดยตรง**
 
-<Callout title="บทนี้เทียบกับ Replication & ISR">
-[Replication & ISR](/kafka/th/topics-and-partitions/replication-and-isr/) ถูกต้องสำหรับสถานการณ์ที่มันอธิบาย — **shrink สด ๆ** จาก ISR ที่แข็งแรง (เช่น RF=3, min.insync.replicas=2 follower ตัวหนึ่งตามไม่ทันหรือ broker ล่ม) สิ่งที่เราทดสอบตรงนี้ต่างออกไป: topic ที่ under-replicated **ตั้งแต่ตอนสร้าง** ซึ่ง port budget ของคอร์สนี้ (broker เดียว) ทำได้แค่จำลองแบบโครงสร้าง ไม่ใช่ shrink สด ๆ — การพิสูจน์การปฏิเสธ write จาก live shrink จริง ๆ ต้องใช้ cluster หลาย broker ซึ่งอยู่นอกเหนือ docker budget แบบ single-broker ของบทนี้ ถ้าต้องการเห็น live ISR shrink กับพฤติกรรมปฏิเสธของมันด้วยตัวเอง นั่นคือสถานการณ์ที่ควรจำลองด้วย compose แบบ 3-broker
+<Callout title="บทนี้เทียบกับ Acks and Durability">
+[Acks and Durability](/kafka/th/producers/acks-and-durability/) (module `producers`) พิสูจน์ **อีกครึ่งหนึ่ง** ของเรื่องเดียวกันนี้บน cluster 3-broker จริง: เมื่อ replication factor **มากกว่าหรือเท่ากับ** `min.insync.replicas` และ ISR shrink จริง (follower ถูกหยุด) `acks=all` **จะ** ปฏิเสธด้วย `NotEnoughReplicasException` จริง รวมกันแล้ว: exception นี้มีจริงและ fire จริง — แต่เฉพาะ live shrink บน topic ที่ replicate เพียงพอเท่านั้น ไม่ใช่กรณีที่เป็นไปไม่ได้โดยโครงสร้างที่ทดสอบตรงนี้ port budget แบบ single-broker ของบทนี้ทำได้แค่จำลองกรณีโครงสร้าง ดูบทนั้นสำหรับ live-shrink proof แทนที่จะรัน 3-broker compose ซ้ำที่นี่
 </Callout>
 
 ## High-watermark: "committed" จริง ๆ แปลว่าอะไร
@@ -263,15 +263,15 @@ export const quizGuarantees = [
     explain: 'Real output: console-producer exit code 0 (สำเร็จ) ทั้งที่ kafka-topics.sh --describe --under-min-isr-partitions แสดง topic นี้เป็น under-replicated',
   },
   {
-    q: 'finding ของบทนี้เกี่ยวข้องกับที่บท Replication & ISR อธิบายเรื่อง min.insync.replicas ปฏิเสธ write ยังไง',
+    q: 'finding เรื่อง shortfall โครงสร้างของบทนี้เกี่ยวข้องกับ NotEnoughReplicasException จริงของ Acks and Durability ยังไง',
     options: [
       'ขัดแย้งกันตรง ๆ โดยไม่มีคำอธิบาย',
-      'Replication & ISR อธิบาย live ISR shrink จาก multi-replica ที่แข็งแรง (ต้องใช้ cluster หลาย broker ถึงจะ verify ได้); บทนี้ทดสอบกรณี RF=1 ที่เป็นไปไม่ได้โดยโครงสร้างซึ่งต่างออกไป บน broker เดียว แล้วได้ผลจริงที่ต่างกัน',
-      'Replication & ISR ผิดเฉย ๆ ควรลบทิ้ง',
+      'Acks and Durability พิสูจน์ว่า live ISR shrink บน topic 3-broker ที่ replicate เพียงพอ throw NotEnoughReplicasException จริง; บทนี้ทดสอบกรณี RF=1 ที่เป็นไปไม่ได้โดยโครงสร้างซึ่งต่างออกไป บน broker เดียว แล้วได้ผลจริงตรงข้าม — ทั้งสองจริงทั้งคู่ คนละสถานการณ์',
+      'Acks and Durability ผิดเฉย ๆ ควรแก้ไข',
       'min.insync.replicas ไม่มีผลในทั้งสองกรณี',
     ],
     answer: 1,
-    explain: 'บทนี้แยกสองสถานการณ์ให้ชัดเจน และระบุว่า port budget แบบ single-broker ตรงนี้ทำได้แค่ทดสอบกรณีโครงสร้าง ไม่ใช่ live shrink',
+    explain: 'exception นี้มีจริงและ fire จริง — แต่เฉพาะ live shrink บน topic ที่ replicate เพียงพอ (พิสูจน์ด้วย cluster 3-broker ที่อื่น) ไม่ใช่กรณี RF < min.insync.replicas ที่เป็นไปไม่ได้โดยโครงสร้างที่ทดสอบตรงนี้',
   },
   {
     q: 'high-watermark คือเส้นแบ่งของอะไร ในแง่ของ acks กับ min.insync.replicas',

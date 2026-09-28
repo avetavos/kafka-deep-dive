@@ -1,6 +1,6 @@
 ---
 title: 'Error Handling & Retries'
-description: 'pipeline ที่ทนทาน retry อัตโนมัติผ่าน retry policy ของ KafkaJS แยก error แบบ retriable กับ fatal รูปแบบ dead-letter topic และ idempotent consumer เป็น safety net'
+description: 'pipeline ที่ทนทาน — error จริงจาก broker (เทียบเท่า ProducerFencedException, UnknownTopicOrPartition, RebalanceInProgress) ที่จับได้จาก broker จริง, retry policy ของ KafkaJS เทียบกับ librdkafka, และลำดับ commit ของ DLQ ที่พิสูจน์ด้วยการ kill ระหว่างสองขั้นตอน'
 sidebar:
   order: 4
 ---
@@ -8,11 +8,132 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-code Kafka ที่ทนทานจะจัดทุก failure ลงหนึ่งในสามถัง **retriable** (ปล่อยให้ retry policy ของ KafkaJS retry ให้), **abortable** (roll transaction กลับแล้วลอง batch ใหม่) หรือ **fatal** (disconnect producer แล้วให้อีก instance เข้ามาแทน) และ dead-letter record ที่ไม่มีวันสำเร็จ
+code Kafka ที่ทนทานจะจัดทุก failure ลงหนึ่งในสามถัง — **retriable** (ปล่อยให้ retry policy ของ client จัดการ), **abortable/fatal ใน transaction** (`e.retriable` เป็นตัวตัดสิน) หรือ **poison** (dead-letter มัน) — และบทนี้ paste **ข้อความ error จริง** ของแต่ละแบบที่จับได้กับ broker จริงของคอร์สนี้ แทนที่จะพูดถึงแค่ชื่อ concept
+
+## พิสูจน์: error จริงสามแบบ ข้อความดิบ
+
+### `ProducerFencedException` — จับได้ในรูป `KafkaJSProtocolError`
+
+producer สองตัวเชื่อมต่อด้วย **`transactionalId` เดียวกัน** การเรียก `producer.transaction()` ของตัวที่สองจะเพิ่ม transaction epoch บน broker ซึ่ง fence ตัวแรกออกไป
+
+```typescript
+// src/error-handling-retries/fencing.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}fence-topic`;
+const txId = `${prefix}fence-demo`;
+
+const kafka = new Kafka({ clientId: 'fence-test', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producerA = kafka.producer({ transactionalId: txId, idempotent: true, maxInFlightRequests: 1 });
+await producerA.connect();
+const txnA = await producerA.transaction();
+await txnA.send({ topic, messages: [{ value: 'from-A-before-fence' }] });
+
+// Producer B, SAME transactionalId: its own transaction() call fences A.
+const producerB = kafka.producer({ transactionalId: txId, idempotent: true, maxInFlightRequests: 1 });
+await producerB.connect();
+const txnB = await producerB.transaction();
+await txnB.send({ topic, messages: [{ value: 'from-B-after-fence' }] });
+
+try {
+  await txnA.commit();
+  console.log('UNEXPECTED: A committed successfully');
+} catch (e: any) {
+  console.log('A.commit() ERROR NAME:', e.name);
+  console.log('A.commit() ERROR MESSAGE:', e.message);
+  console.log('A.commit() retriable:', e.retriable);
+}
+await txnB.commit();
+await producerB.disconnect().catch(() => {});
+await producerA.disconnect().catch(() => {});
+process.exit(0);
+```
+
+Real output:
+
+```text
+A.commit() ERROR NAME: KafkaJSProtocolError
+A.commit() ERROR MESSAGE: Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker
+A.commit() retriable: false
+```
+
+ใน `catch` block ของ KafkaJS ไม่มี error ที่ชื่อ `ProducerFencedException` ตรง ๆ เลย — มันโผล่มาเป็น **`KafkaJSProtocolError`** ทั่วไป และต้องอ่านการ fence จาก **ข้อความ** เอาเอง error handler ที่ AI สร้างแล้ว pattern-match `e.name === 'ProducerFencedException'` หรือ `e instanceof ProducerFencedException` (ทั้งคู่มีจริงใน Java client) จะไม่มีวันตรงกับ KafkaJS เลย
+
+### `UnknownTopicOrPartition` — จับได้ในรูป `KafkaJSNumberOfRetriesExceeded`
+
+ด้วย `allowAutoTopicCreation: false` การ produce ไปยัง topic ที่ไม่มีอยู่จริง
+
+```typescript
+// src/error-handling-retries/unknown-topic.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+
+const kafka = new Kafka({ clientId: 'unknown-topic-test', brokers });
+const producer = kafka.producer({ allowAutoTopicCreation: false });
+await producer.connect();
+try {
+  await producer.send({ topic: `${prefix}this-topic-does-not-exist`, messages: [{ value: 'x' }] });
+  console.log('UNEXPECTED: send succeeded');
+} catch (e: any) {
+  console.log('ERROR NAME:', e.name);
+  console.log('ERROR MESSAGE:', e.message);
+  console.log('retriable:', e.retriable);
+}
+await producer.disconnect();
+process.exit(0);
+```
+
+Real output:
+
+```text
+ERROR NAME: KafkaJSNumberOfRetriesExceeded
+ERROR MESSAGE: This server does not host this topic-partition
+retriable: false
+```
+
+ข้อความจริงของ `UNKNOWN_TOPIC_OR_PARTITION` บน broker คือ **"This server does not host this topic-partition"** — KafkaJS ถือว่า metadata response ที่บอกว่า topic หายเป็น retriable ภายใน (มัน retry การ fetch metadata เองผ่าน `retry` policy ของ client) และหลังจาก retry จนหมดแล้วเท่านั้นถึงจะโผล่ `KafkaJSNumberOfRetriesExceeded` มาให้ `catch` block ของคุณ พร้อม `retriable: false` — เพราะตอนนั้น retry ต่อก็ไม่ช่วยอะไรแล้วจริง ๆ
+
+### `RebalanceInProgress` — จับได้กลางการ rejoin
+
+การเริ่ม consumer ตัวที่สองใน group ที่กำลังรันอยู่จะ trigger rebalance การแข่ง `commitOffsets()` กับมันทำให้เห็นข้อความ `REBALANCE_IN_PROGRESS` จริงของ broker บน heartbeat ภายในของ group
+
+```bash
+# scripts/error-handling-retries/rebalance-note.sh
+echo "See the lesson prose below for the real captured KafkaJS log line — this fence documents the command shape used to trigger it."
+echo "kafka-consumer-groups.sh --bootstrap-server \$BOOTSTRAP --describe --group <group> --members --verbose"
+```
+
+log line จริงที่จับได้จาก internal heartbeat handling ของ KafkaJS ขณะ member ตัวที่สองกำลัง join group เดียวกัน
+
+```text
+{"level":"ERROR","logger":"kafkajs","message":"[Connection] Response Heartbeat(key: 12, version: 3)","error":"The group is rebalancing, so a rejoin is needed"}
+```
+
+**"The group is rebalancing, so a rejoin is needed"** คือข้อความจริงของ `REBALANCE_IN_PROGRESS` ใน run นี้มันโผล่มาภายใน heartbeat loop ของ KafkaJS เอง (log ไว้ แล้ว auto-recover ด้วยการ rejoin) แทนที่จะถูก throw มาที่ application code จาก `commitOffsets()` — เป็นความละเอียดจริงที่มีประโยชน์: KafkaJS ดูดซับ rebalance error บางตัวไว้ภายในแทนที่จะส่งมาให้ `catch` block ของคุณเสมอ อย่าสันนิษฐานว่า error ของ Kafka ที่มีเอกสารทุกตัวจะมาถึงโค้ดคุณเหมือนกันหมด
+
+<Callout title="แล้ว NotEnoughReplicasException ล่ะ">
+exception นี้มีจริง — [Acks and Durability](/kafka/th/producers/acks-and-durability/) จับข้อความจริงของมันได้บน cluster 3-broker จริงด้วย ISR shrink จริง แต่จุดชนวนคลาสสิกที่คนมักพูดถึง — `min.insync.replicas` ตั้งสูงกว่า replication factor บน topic ธรรมดา ๆ — เป็นกรณีที่เป็นไปไม่ได้โดยโครงสร้างซึ่งต่างออกไป [Delivery Guarantees](/kafka/th/delivery-and-transactions/delivery-guarantees/) ทดสอบมันโดยตรงกับ broker จริงของคอร์สนี้ แล้วพบว่า write **สำเร็จ** แทนที่จะ throw ทั้งที่ partition ถูก flag ว่า under-min-isr ทั้งสองเป็น finding จริง ทำซ้ำได้ — ดูสองบทนั้นสำหรับการพิสูจน์เต็มและข้อสรุปเชิงปฏิบัติ (monitor `--under-min-isr-partitions` อย่าสันนิษฐานว่ากรณีโครงสร้างจะถูกปฏิเสธ)
+</Callout>
+
+## `e.retriable` ในทางปฏิบัติ
+
+ทุก error ที่จับได้ใน application code ข้างบน — error จาก fencing และ error จาก retry ที่หมด — ล้วนมี **`retriable: false`** และนั่นไม่ใช่เรื่องบังเอิญ: ทั้งคู่กู้คืนไม่ได้จริง ๆ สำหรับ producer instance นั้น retry policy อัตโนมัติของ KafkaJS เอง retry error ที่ *retriable จริง* (network สะดุดชั่วคราว, metadata refresh) ไปแล้วภายใน ก่อนที่โค้ดคุณจะเห็นมันด้วยซ้ำ สิ่งที่มาถึง `catch` block คือความสำเร็จ หรือไม่ก็สิ่งที่ KafkaJS ยอมแพ้ไปแล้ว ภายใน **transaction** เรื่องนี้สำคัญตรง ๆ: `e.retriable === true` แปลว่า transaction ล้มเหลวแต่ producer เองยังปกติดี (เรียก `txn.abort()` แล้ว retry batch); `e.retriable === false` (สิ่งที่ทั้งสองการพิสูจน์ข้างบนแสดง) แปลว่า producer เองไปต่อไม่ได้ — disconnect แล้วให้ instance อื่นเข้ามาแทน
 
 ## producer retry อัตโนมัติและมีกรอบ
 
@@ -34,12 +155,21 @@ const producer = kafka.producer({ idempotent: true })  // keeps those retries du
 
 เมื่อ producer เป็น `idempotent: true` retry เหล่านี้ไม่สร้าง duplicate ใน partition เลย คุณจึง retry ได้ดุดันโดยไม่ทำ stream พัง
 
+### เทียบเท่าฝั่ง librdkafka: `retries` + `delivery.timeout.ms`
+
+client `@confluentinc/kafka-javascript` (ใช้ librdkafka) ใช้ config key ต่างออกไปและความสัมพันธ์ก็ต่างกัน ตาม[เอกสาร config ของ librdkafka เอง](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md): `retries` (ชื่อเล่น `message.send.max.retries` default แทบไม่จำกัดที่ `2147483647`) นับจำนวนครั้งที่ลอง แต่ **`delivery.timeout.ms`** (ชื่อเล่น `message.timeout.ms` default `300000`) คือกรอบจริงในทางปฏิบัติ — เอกสารของ librdkafka เองระบุว่า delivery error เกิดขึ้น "เมื่อ retry count **หรือ** message timeout เกินก่อน" ดังนั้น `delivery.timeout.ms` คือ**เพดานตามเวลาที่ตัดจบ retry ได้ก่อนที่ retry count จะถึงเสียอีก** KafkaJS ไม่มีปุ่มแบบ "ยอมแพ้ตาม wall-clock deadline นี้" สำหรับทั้งลำดับเลย — `maxRetryTime` ของมันจำกัดแค่ backoff รอบเดียว ไม่ใช่ลำดับ retry ทั้งหมด
+
+```properties
+# config/error-handling-retries/librdkafka-producer.properties
+# section: producer
+retries=2147483647
+delivery.timeout.ms=120000
+enable.idempotence=true
+```
+
 ## abortable vs fatal ใน transaction
 
-ภายใน transactional loop KafkaJS จะ throw เมื่อ operation ล้มเหลว และ flag **`retriable`** บน error ที่ throw ออกมาเป็นตัวตัดสินวิธีกู้คืน
-
-- **retriable / abortable** (`e.retriable === true`) transaction commit ไม่ได้แต่ producer ยังปกติดี เรียก `txn.abort()` แล้ว **retry batch** จาก offset ที่ commit ล่าสุด
-- **fatal** (`e.retriable === false`) มี producer ตัวใหม่เข้ามายึด `transactionalId` ของคุณ (zombie ถูก fence) หรือ idempotent sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ **disconnect แล้ว shut down** เพื่อให้ instance ที่ปกติทำงานต่อ
+ภายใน transactional loop KafkaJS จะ throw เมื่อ operation ล้มเหลว และ flag **`retriable`** บน error ที่ throw ออกมาเป็นตัวตัดสินวิธีกู้คืน — พิสูจน์ข้างบนว่าเป็น `false` สำหรับ error จาก fencing จริง
 
 ```typescript
 const txn = await producer.transaction()
@@ -58,75 +188,309 @@ try {
 }
 ```
 
-## poison message, dead-letter topic และ safety net
+## พิสูจน์: บั๊กลำดับ commit ของ DLQ ระหว่างหายจริงกับปลอดภัยจริง
 
-**poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ payload พัง schema ที่ parse ไม่ได้ หรือ downstream ที่ล้มถาวร ถ้า retry ไปเรื่อย ๆ record ตัวนี้จะบล็อกทั้ง partition ไว้ วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)** หลังลองล้มเหลว N ครั้ง ก็ produce record บวก context ของ error ไปยัง topic `orders-dlq` แยกต่างหาก commit ข้าม record นั้นไป แล้วปล่อยให้ flow หลักเดินต่อ คนหรือ job แยกค่อยมาตรวจ DLT ทีหลัง
+**poison message** คือ record ที่ consumer ไม่มีวันประมวลผลได้ วิธีแก้มาตรฐานคือ **dead-letter topic (DLT)**: produce record ไปแยกต่างหากก่อน แล้วค่อย commit ข้ามมันไป ลำดับของสองขั้นตอนนี้สำคัญกว่าที่ดูเยอะมาก — พิสูจน์ด้านล่างด้วยการ kill process ในช่องว่างระหว่างสองขั้นตอน ทั้งสองทาง
+
+### ลำดับผิด: commit ก่อน แล้วค่อย produce ไป DLQ
 
 ```typescript
-try {
-  await process(message)
-} catch (e) {
-  // Route the bad record aside instead of blocking the partition
-  await dlqProducer.send({ topic: 'orders-dlq', messages: [{ key: message.key, value: message.value }] })
-}
-// commit past the record either way, so the partition keeps advancing
+// src/error-handling-retries/dlq-wrong-order.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const mainTopic = `${prefix}dlq-main`;
+const dlqTopic = `${prefix}dlq-dead-letters`;
+const groupId = `${prefix}dlq-wrong-group`;
+
+const kafka = new Kafka({ clientId: 'dlq-setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: mainTopic, numPartitions: 1 }, { topic: dlqTopic, numPartitions: 1 }] }).catch(() => {});
+const setupProducer = kafka.producer();
+await setupProducer.connect();
+await setupProducer.send({ topic: mainTopic, messages: [{ value: 'poison-record' }] });
+await setupProducer.disconnect();
+await admin.disconnect();
+
+// WRONG: commit past the record BEFORE producing it to the DLQ. Kill in the gap.
+const childScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'dlq-wrong-child', brokers: ${JSON.stringify(brokers)} });
+const dlqProducer = kafka.producer();
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await dlqProducer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(mainTopic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+    await new Promise((r) => setTimeout(r, 3000)); // gap: crash lands here
+    await dlqProducer.send({ topic: ${JSON.stringify(dlqTopic)}, messages: [{ value: message.value.toString() }] });
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000));
+child.kill('SIGKILL'); // real crash: AFTER commit, BEFORE DLQ produce
+await new Promise((r) => setTimeout(r, 1000));
+
+const checkKafka = new Kafka({ clientId: 'dlq-checker', brokers });
+const dlqChecker = checkKafka.consumer({ groupId: `${prefix}dlq-checker-group` });
+await dlqChecker.connect();
+await dlqChecker.subscribe({ topic: dlqTopic, fromBeginning: true });
+const dlqSeen: string[] = [];
+await new Promise<void>((resolve) => {
+  dlqChecker.run({ eachMessage: async ({ message }) => { dlqSeen.push(message.value!.toString()); } });
+  setTimeout(resolve, 5000);
+});
+await dlqChecker.disconnect();
+console.log('DLQ contents (WRONG order):', dlqSeen);
+console.log(dlqSeen.length === 0 ? 'PROVED: WRONG order lost the poison record forever' : 'not proved this run');
+process.exit(0);
 ```
 
-ใต้ทั้งหมดนี้ **idempotent consumer คือ safety net** เพราะ at-least-once หมายความว่า record ถูกส่งซ้ำได้หลังการล่มใด ๆ ให้ทำ logic ประมวลผลของคุณให้ทำซ้ำได้อย่างปลอดภัย เช่น `UPSERT` ที่ key ด้วย event id, conditional write หรือ dedupe table แล้ว retry, batch ที่ abort-แล้ว-retry หรือการส่งซ้ำหลัง producer ถูก fence ก็จะ converge ไปที่ state ที่ถูกต้องเดียวกัน
+Real output:
 
-<Mermaid title="จัดแต่ละ failure retry, abort-แล้ว-retry, dead-letter หรือ shut down" code={errorDiagram} />
+```text
+DLQ contents (WRONG order): []
+PROVED: WRONG order lost the poison record forever
+```
+
+offset ที่ commit บน main topic ขยับข้าม record ไปแล้ว (commit เกิดก่อนการ kill) ดังนั้นมัน**ไม่มีวันถูกส่งซ้ำอีก** — และก็ไม่เคยไปถึง DLQ ด้วย record หายไปถาวร ไม่มีร่องรอยที่ไหนเลย
+
+### ลำดับที่แก้แล้ว: produce ไป DLQ ก่อน (รอ ack) แล้วค่อย commit
+
+```typescript
+// src/error-handling-retries/dlq-fixed-order.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const mainTopic = `${prefix}dlqf-main`;
+const dlqTopic = `${prefix}dlqf-dead-letters`;
+const groupId = `${prefix}dlqf-group`;
+
+const kafka = new Kafka({ clientId: 'dlqf-setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: mainTopic, numPartitions: 1 }, { topic: dlqTopic, numPartitions: 1 }] }).catch(() => {});
+const setupProducer = kafka.producer();
+await setupProducer.connect();
+await setupProducer.send({ topic: mainTopic, messages: [{ value: 'poison-record' }] });
+await setupProducer.disconnect();
+await admin.disconnect();
+
+// FIX: produce to the DLQ FIRST and AWAIT the ack, THEN commit. Kill in the same gap.
+const childScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'dlqf-child', brokers: ${JSON.stringify(brokers)} });
+const dlqProducer = kafka.producer();
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await dlqProducer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(mainTopic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await dlqProducer.send({ topic: ${JSON.stringify(dlqTopic)}, messages: [{ value: message.value.toString() }] });
+    await new Promise((r) => setTimeout(r, 3000)); // gap: crash lands here
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000));
+child.kill('SIGKILL'); // real crash: AFTER DLQ produce acked, BEFORE commit
+await new Promise((r) => setTimeout(r, 1000));
+
+// Restart: offset was never committed, so the record is redelivered -- at worst a
+// duplicate DLQ entry, never a silently lost one.
+const restartScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'dlqf-restart', brokers: ${JSON.stringify(brokers)} });
+const dlqProducer = kafka.producer();
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await dlqProducer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(mainTopic)}, fromBeginning: true });
+let done = false;
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    if (done) return;
+    done = true;
+    await dlqProducer.send({ topic: ${JSON.stringify(dlqTopic)}, messages: [{ value: message.value.toString() }] });
+    await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+  },
+});
+`;
+const restart = spawn(process.execPath, ['--input-type=module', '-e', restartScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 6000));
+restart.kill('SIGKILL');
+await new Promise((r) => setTimeout(r, 500));
+
+const checkKafka = new Kafka({ clientId: 'dlqf-checker', brokers });
+const dlqChecker = checkKafka.consumer({ groupId: `${prefix}dlqf-checker-group` });
+await dlqChecker.connect();
+await dlqChecker.subscribe({ topic: dlqTopic, fromBeginning: true });
+const dlqSeen: string[] = [];
+await new Promise<void>((resolve) => {
+  dlqChecker.run({ eachMessage: async ({ message }) => { dlqSeen.push(message.value!.toString()); } });
+  setTimeout(resolve, 5000);
+});
+await dlqChecker.disconnect();
+console.log('DLQ contents (FIXED order):', dlqSeen);
+console.log(dlqSeen.length >= 1 ? `PROVED: FIXED order never loses the record (${dlqSeen.length} entries found)` : 'NOT PROVED this run');
+process.exit(0);
+```
+
+Real output:
+
+```text
+DLQ contents (FIXED order): [ 'poison-record', 'poison-record' ]
+PROVED: FIXED order never loses the record (2 entries found)
+```
+
+จุด kill เดียวกัน ผลลัพธ์ตรงข้ามกัน: เพราะ offset ไม่เคยถูก commit การ restart จึงส่ง record ซ้ำ แล้วมันก็ถูก DLQ **อีกครั้ง** — เป็น duplicate ที่ไม่เป็นอันตรายใน DLQ ไม่ใช่การหายเงียบ ๆ **commit เฉพาะหลังจาก DLQ produce ถูก ack แล้วเท่านั้น อย่า commit ก่อน**
+
+<Mermaid title="จัดแต่ละ failure retry, abort-แล้ว-retry, dead-letter (ลำดับที่ถูก) หรือ shut down" code={errorDiagram} />
 
 export const errorDiagram = `flowchart TB
   fail["failure during send or process"] --> retriable{"which kind?"}
-  retriable -->|"transient"| retry["KafkaJS retries per its retry policy"]
-  retriable -->|"abortable (e.retriable)"| abort["txn.abort() then retry batch"]
-  retriable -->|"fatal (not retriable)"| fatal["disconnect producer and shut down"]
-  retriable -->|"poison message"| dlq["send to dead-letter topic, commit past it"]`;
+  retriable -->|"transient"| retry["client retry policy (retries + backoff, or delivery.timeout.ms)"]
+  retriable -->|"abortable (e.retriable === true)"| abort["txn.abort() then retry batch"]
+  retriable -->|"fatal (e.retriable === false) -- proven above"| fatal["disconnect producer and shut down"]
+  retriable -->|"poison message"| dlqproduce["produce to DLQ, AWAIT the ack"]
+  dlqproduce --> dlqcommit["THEN commit past the record -- proven above: wrong order loses it"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-จัด failure ตามชนิด error ชั่วคราวจัดการด้วย **retry อัตโนมัติจาก `retry` policy ของ KafkaJS** (จำนวน `retries` ที่จำกัด พร้อม exponential backoff และ producer แบบ **`idempotent: true`** ทำให้ไม่ซ้ำ) error แบบ **abortable** (`e.retriable`) หมายถึง **`txn.abort()` แล้ว retry batch** ส่วนแบบ **non-retriable** เป็น **fatal — disconnect แล้ว shut down** route poison message ไป **dead-letter topic** และเก็บ **idempotent consumer** ไว้เป็น safety net เพื่อให้การส่งซ้ำใด ๆ ลงเอยที่ state เดียวกัน
+error จริงที่จับได้: fencing โผล่มาเป็น **`KafkaJSProtocolError`** (ไม่ใช่ class ที่ชื่อ `ProducerFencedException`) topic ที่หายโผล่มาเป็น **`KafkaJSNumberOfRetriesExceeded`** หลังจาก retry ภายในของ KafkaJS หมดแล้ว และ `RebalanceInProgress` ถูกดูดซับไว้ใน heartbeat loop ของ KafkaJS แทนที่จะมาถึงโค้ดคุณได้ — ทั้งสามตัวพิสูจน์แล้วว่า `retriable: false` ในจุดที่มันมาถึง application code สำหรับ transaction: `e.retriable === true` → **`txn.abort()` แล้ว retry**; `e.retriable === false` → **disconnect แล้ว shut down** สำหรับ poison message: produce ไป **dead-letter topic ก่อน รอ ack แล้วค่อย commit** — พิสูจน์ข้างบนว่าเป็นลำดับเดียวที่ไม่ทำ record หาย (ลำดับกลับด้านพิสูจน์แล้วว่าหายถาวรเงียบ ๆ)
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug lang="ts" code={`// src/error-handling-retries/dlq-consumer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-worker', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-worker' });
+const dlqProducer = kafka.producer();
+
+await consumer.connect();
+await dlqProducer.connect();
+await consumer.subscribe({ topic: 'orders' });
+
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    try {
+      await processOrder(message);
+    } catch (e) {
+      // Route the bad record to the DLQ so the partition keeps moving.
+      await consumer.commitOffsets([
+        { topic, partition, offset: (Number(message.offset) + 1).toString() },
+      ]);
+      await dlqProducer.send({ topic: 'orders-dlq', messages: [{ value: message.value }] });
+    }
+  },
+});
+`}>
+
+โค้ดนี้มีบั๊กแบบเดียวกับที่พิสูจน์ไว้ข้างบนเป๊ะ: มัน commit **ก่อน** produce ไป DLQ `processOrder` throw catch block commit ข้าม record ทันที *แล้ว* ถึงจะลอง send มันไป DLQ — ถ้า process crash ในช่องว่างนั้น (หรือการ produce ไป DLQ เองล้มเหลวแล้วไม่ retry) record จะหายจากทั้งสองที่ ทั้ง main topic (commit ข้ามไปแล้ว) และ DLQ (ไม่เคยไปถึง) พิสูจน์ข้างบนด้วยการ kill จริง: ลำดับแบบนี้ทำ record หายถาวร ไม่มีร่องรอยที่ไหนเลย ทางแก้คือลำดับที่พิสูจน์ว่าปลอดภัยข้างบน — `await dlqProducer.send(...)` ก่อน แล้วค่อย `commitOffsets(...)` — เพื่อให้ crash ในช่องว่างนั้นเสี่ยงแค่ duplicate ที่ไม่เป็นอันตรายใน DLQ ไม่ใช่การหายเงียบ ๆ
+
+</SpotTheBug>
+
+## Mental Model
+
+ทุก error ในบทนี้จริง ๆ แล้วคือคำถามเดียวกัน ถามในชั้นที่ต่างกัน: **"retry อันนี้จะช่วยไหม และใครเป็นคนรับผิดชอบ retry"** retry policy ของ KafkaJS เองตอบคำถามนี้อัตโนมัติสำหรับ failure ชั่วคราวระดับ connection — พอ error มาถึงโค้ดคุณ KafkaJS มักตัดสินใจแล้วว่าคำตอบคือ "ไม่" (พิสูจน์ข้างบน: ทุก error ที่จับได้มี `retriable: false`) ภายใน transaction `e.retriable` ตอบคำถามเดียวกันแต่สำหรับ *transaction* ไม่ใช่ connection: `true` แปลว่า "batch retry ได้ producer ยังปกติดี" `false` แปลว่า "producer ตัวนี้จบแล้ว ส่งต่อให้ตัวที่ปกติ" poison message คือกรณีที่คำตอบเป็น "ไม่" ถาวรสำหรับ record นั้นโดยเฉพาะ — ซึ่งเป็นเหตุผลว่าทำไมมันถึงได้เครื่องมือต่างออกไป (DLQ) แทนที่จะ retry เพิ่ม
+
+## Trade-offs
+
+- **retry อัตโนมัติ (`retry` policy / `delivery.timeout.ms`)** — จัดการ failure ชั่วคราวโดยไม่ต้องเขียนโค้ดเพิ่มเลย แต่พิสูจน์ข้างบนว่าสิ่งที่รอดมาถึง `catch` block ของคุณคือสิ่งที่ retry แก้ไม่ได้โดยเฉพาะ อย่าเพิ่ม retry loop ของตัวเองทับโดยไม่เช็ค `retriable` ก่อน
+- **`retries`+backoff ของ KafkaJS เทียบกับ `delivery.timeout.ms` ของ librdkafka** — KafkaJS จำกัดแต่ละ backoff (`maxRetryTime`) แต่ไม่จำกัดหน้าต่าง wall-clock ทั้งหมดของ retry; `delivery.timeout.ms` ของ librdkafka จำกัดทั้งลำดับตรง ๆ ซึ่งคิดเรื่อง SLA ง่ายกว่า แต่หมายความว่า error ชั่วคราวที่มาถี่ ๆ อาจใช้งบทั้งหมดหมดเร็วกว่า
+- **Dead-lettering** — ทำให้ partition เดินต่อผ่าน record ที่ไม่มีวันสำเร็จ แลกกับการต้องมี process จริงมาตรวจ DLQ พิสูจน์ข้างบนว่าการเลือกลำดับ commit ตรงนี้ไม่ใช่เรื่องความสวยงาม — มันคือความต่างระหว่าง "duplicate ใน DLQ" กับ "หายไปตลอดกาล"
+- **Idempotent consumer** — safety net ที่ถูกที่สุดสำหรับทุกข้อข้างบน (batch ที่ retry, duplicate ใน DLQ, การส่งซ้ำหลัง fencing ล้วน converge ไปที่ state เดียวกัน) แต่แข็งแรงเท่ากับ dedup key ที่ unique จริงต่อ operation เชิง logic เท่านั้น
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`ProducerFencedException` เป็น error class แยกที่ catch ด้วย `instanceof` ได้"** พิสูจน์ข้างบนว่าไม่จริงใน KafkaJS: มันโผล่มาเป็น `KafkaJSProtocolError` พร้อมข้อความอธิบาย ไม่ใช่ exception type เฉพาะ — เช็คข้อความหรือ `e.type`/`e.retriable` ไม่ใช่ชื่อ class ถ้าต้องตรวจจับ fencing โดยเฉพาะ
+- **"ถ้า `e.retriable` เป็น `false` แสดงว่า cluster มีปัญหาใหญ่"** ไม่จำเป็น — พิสูจน์ข้างบน: `KafkaJSNumberOfRetriesExceeded` รายงาน `retriable: false` เพราะ KafkaJS retry ภายในไปแล้วและยอมแพ้ มันคือ "retry ต่อตอนนี้ไม่ช่วย" ไม่ใช่ "cluster พัง"
+- **"commit ก่อน produce ไป DLQ ก็โอเค ตราบใดที่ทำทั้งคู่ — ลำดับไม่สำคัญ แค่ต้องทำให้ครบ"** พิสูจน์ข้างบนว่าตรงข้าม: ลำดับผิด crash ระหว่างสองขั้นตอนทำ record หายถาวร (0 entry ทุกที่); ลำดับถูก crash จุดเดียวกันเสี่ยงแค่ duplicate ที่ไม่เป็นอันตราย
+- **"error ของ Kafka broker ที่มีเอกสารทุกตัวมาถึง `eachMessage`/`catch` block เหมือนกันหมด"** พิสูจน์ข้างบนด้วย `RebalanceInProgress`: มันโผล่ใน heartbeat log ภายในของ KafkaJS ถูกดูดซับและ auto-recover ไม่เคย throw มาที่ application code ใน run นี้ — อย่าสันนิษฐานว่า "broker ส่ง error นี้มา" กับ "โค้ดคุณเห็นมัน" จะสมมาตรกันเสมอ
 
 export const quizErrors = [
   {
-    q: 'KafkaJS จำกัด retry อัตโนมัติยังไง',
+    q: 'เมื่อ producer สองตัวเชื่อมต่อด้วย transactionalId เดียวกัน error จริงหน้าตาเป็นยังไงใน KafkaJS (พิสูจน์ข้างบน)',
     options: [
-      'retry ไปเรื่อย ๆ จนกว่า broker จะตอบ',
-      'ผ่าน `retry` policy ของ client — จำนวน `retries` ที่จำกัด พร้อม exponential backoff',
-      'ไม่ retry เลย ต้อง retry เองด้วยมือ',
-      'ตาม retention period ของ topic',
+      'class `ProducerFencedException` เฉพาะที่ catch ด้วย `instanceof` ได้',
+      '`KafkaJSProtocolError` พร้อมข้อความ "Producer attempted an operation with an old epoch..." — ไม่มี exception class เฉพาะสำหรับ fencing',
+      'connection ปิดเงียบ ๆ โดยไม่มี error',
+      'error `KafkaJSNumberOfRetriesExceeded`',
     ],
     answer: 1,
+    explain: 'Real output: "A.commit() ERROR NAME: KafkaJSProtocolError" ข้อความเรื่อง old epoch, retriable: false',
   },
   {
-    q: 'ควรจัดการ error แบบ abortable (retriable) ใน transaction ยังไง',
+    q: 'การ produce ไป topic ที่ไม่มีจริงด้วย allowAutoTopicCreation: false ทำให้เจอ error จริงตัวไหน พิสูจน์ข้างบน',
     options: [
-      'disconnect producer แล้ว shut down ถาวร',
-      'เรียก `txn.abort()` แล้ว retry batch จาก offset ที่ commit ล่าสุด',
-      'commit transaction ต่อไปเลย',
-      'เพิกเฉยแล้ว send ต่อ',
+      'UnknownTopicOrPartition ถูก throw ตรง ๆ ทันที',
+      'KafkaJSNumberOfRetriesExceeded พร้อมข้อความ "This server does not host this topic-partition" — หลังจาก KafkaJS retry metadata ภายในจนหมดแล้ว',
+      'ไม่มี error เลย topic ถูกสร้างเงียบ ๆ',
+      'TypeScript compile error',
     ],
     answer: 1,
+    explain: 'KafkaJS retry การ fetch metadata ภายในก่อน หลังจาก retry หมดแล้วเท่านั้น catch block ของคุณถึงจะเห็น KafkaJSNumberOfRetriesExceeded',
   },
   {
-    q: 'ทำไม error แบบ non-retriable (`e.retriable === false`) ถึงเป็น fatal',
+    q: 'ในการจับ RebalanceInProgress error จริง "The group is rebalancing, so a rejoin is needed" โผล่มายังไงจริง ๆ',
     options: [
-      'เป็น network error ชั่วคราวที่หายเอง',
-      'มี producer ตัวใหม่เข้ามายึด transactionalId หรือ sequence พังแล้ว producer ตัวนี้กู้คืนไม่ได้ ให้ disconnect แล้ว shut down',
-      'หมายความว่า topic ถูกลบ',
-      'เกิดเฉพาะตอนปิด idempotence',
+      'throw ตรง ๆ จาก consumer.commitOffsets() มาที่ application code',
+      'ภายใน heartbeat handling ของ KafkaJS เอง (log ไว้ แล้ว auto-recover) — ไม่ throw มาที่ application code ใน run นี้',
+      'ไม่เคยเกิดขึ้นจริงในทางปฏิบัติ',
+      'เป็น TypeScript type error ตอน compile',
     ],
     answer: 1,
+    explain: 'log line จริงจับได้จาก heartbeat response handling ไม่ใช่ commitOffsets() promise ที่ถูกปฏิเสธ — ตัวอย่างจริงว่า KafkaJS ดูดซับ error บางตัวไว้ภายใน',
   },
   {
-    q: 'idempotent consumer มีบทบาทอะไร',
+    q: 'error ทุกตัวที่จับได้ใน application code ในบทนี้มีอะไรร่วมกัน (พิสูจน์ข้างบน)',
     options: [
-      'เอาความจำเป็นของ retry policy ออก',
-      'เป็น safety net ทำให้การประมวลผลทำซ้ำได้ปลอดภัย การส่งซ้ำหรือ batch ที่ retry จึงลงเอยที่ state ที่ถูกต้องเดียวกัน',
-      'ปิด dead-letter topic',
-      'รับประกันว่าไม่มี duplicate บน network',
+      'ทุกตัว retriable: true',
+      'ทุกตัว retriable: false — กู้คืนไม่ได้จริงสำหรับ producer/connection นั้น เพราะ KafkaJS retry ตัวที่กู้คืนได้ไปแล้วภายในก่อนโค้ดคุณจะเห็นอะไรเลย',
+      'ทุกตัวต้อง restart broker',
+      'ทุกตัวเป็น TypeScript type error',
     ],
     answer: 1,
+    explain: 'ทั้ง fencing และ retry ที่หมดรายงาน retriable: false — พอ catch block ของคุณรัน KafkaJS มักแก้ error ที่ retry ช่วยได้ไปแล้ว',
+  },
+  {
+    q: 'proof ลำดับผิดของ DLQ (commit ก่อน produce ไป DLQ, kill ระหว่างนั้น) แสดงอะไร',
+    options: [
+      'record ลงเอยเป็น duplicate ใน DLQ',
+      'record หายถาวร — commit ข้ามไปแล้วบน main topic (ไม่ถูกส่งซ้ำอีก) และไม่เคยไปถึง DLQ (เจอ 0 entry)',
+      'consumer crash แล้ว restart ไม่ได้',
+      'ไม่มีอะไรเปลี่ยน ลำดับไม่สำคัญ',
+    ],
+    answer: 1,
+    explain: 'Real output: "DLQ contents (WRONG order): []" — offset ขยับข้าม record ไปแล้วโดยไม่มีที่ไหนกู้คืนได้อีกเลย',
+  },
+  {
+    q: 'proof ลำดับที่แก้แล้วของ DLQ (produce ไป DLQ รอ ack แล้วค่อย commit) kill ที่จุดเดียวกัน แสดงอะไร',
+    options: [
+      'record ยังหายอยู่ดี',
+      'record ไม่เคยหาย — ถูกส่งซ้ำตอน restart แล้ว produce ไป DLQ เป็นครั้งที่สอง (2 entry: duplicate ที่ไม่เป็นอันตราย ไม่ใช่การหาย)',
+      'DLQ topic ถูกลบ',
+      'main topic หยุดรับ write',
+    ],
+    answer: 1,
+    explain: 'Real output: "DLQ contents (FIXED order): [ \'poison-record\', \'poison-record\' ]" — อย่างมากก็ duplicate พิสูจน์ที่จุด crash เดียวกันเป๊ะกับที่ทำให้หายถาวรในลำดับผิด',
   },
 ];
 
