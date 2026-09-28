@@ -1,6 +1,6 @@
 ---
 title: 'แนวคิด Log Abstraction'
-description: 'commit log แบบ append-only ที่เป็นหัวใจของ Kafka offset ที่เรียงตามลำดับ ทำไม append ถึงเร็ว และ replay ทำงานยังไง'
+description: 'commit log แบบ append-only ที่เป็นหัวใจของ Kafka ไฟล์ segment จริงบนดิสก์ dump ผลจริงจาก kafka-dump-log.sh sparse index และทำไม append ถึงเร็ว'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -27,9 +28,124 @@ record: [ev0]  [ev1]  [ev2]  [ev3]  [ev4]  [ev5]
 
 เพราะการเขียนไปลงท้ายเสมอ Kafka เลยเปลี่ยนการเก็บ message ให้กลายเป็น **sequential disk I/O** ซึ่งเร็วกว่า random I/O ที่ store แบบแก้ค่าได้ต้องใช้อย่างมาก ไม่มีการ update ตรงที่เดิม ไม่ต้องหา page มาเขียนทับ มีแค่ append แล้วเลื่อนไปข้างหน้า
 
+## พิสูจน์: ไฟล์จริงบนดิสก์
+
+log ของ partition ไม่ใช่สิ่งนามธรรมสิ่งเดียว แต่เป็น directory ของไฟล์จริง แบ่งเป็น **segment** สร้าง topic 1 partition แล้ว produce 8 record ที่มี key เข้าไป จากนั้น list directory นั้นข้างใน broker container
+
+```bash
+# scripts/the-log-abstraction/segment-files.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic log-demo --partitions 1 --replication-factor 1 \
+  --config index.interval.bytes=4096
+
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic log-demo \
+  --property parse.key=true --property key.separator=: <<'RECORDS'
+k1:order-101 created
+k2:order-102 created
+k1:order-101 paid
+k3:order-103 created
+k2:order-102 shipped
+k1:order-101 shipped
+k3:order-103 paid
+k3:order-103 shipped
+RECORDS
+
+echo "=== ls -la <log.dirs>/log-demo-0 ==="
+ls -la /tmp/kafka-logs/log-demo-0
+```
+
+output จริงไม่ได้แก้ไข จาก `log.dirs` จริงของ broker คอร์สนี้เองสำหรับ partition นี้
+
+```text
+=== ls -la <log.dirs>/log-demo-0 ===
+total 20
+drwxr-xr-x  2 appuser appuser     4096 Sep 28 23:00 .
+drwxr-xr-x 57 appuser appuser     4096 Sep 28 23:00 ..
+-rw-r--r--  1 appuser appuser 10485760 Sep 28 23:00 00000000000000000000.index
+-rw-r--r--  1 appuser appuser      263 Sep 28 23:00 00000000000000000000.log
+-rw-r--r--  1 appuser appuser 10485756 Sep 28 23:00 00000000000000000000.timeindex
+-rw-r--r--  1 appuser appuser        8 Sep 28 23:00 leader-epoch-checkpoint
+-rw-r--r--  1 appuser appuser       43 Sep 28 23:00 partition.metadata
+```
+
+ไฟล์จริง 5 ไฟล์ **segment ที่ active** อันเดียว (log เล็กพอที่จะยังไม่เคย roll ไป segment ที่สอง)
+
+- **`00000000000000000000.log`** — ตัว segment เอง byte ของ record จริง ๆ ตั้งชื่อตาม **base offset** (offset แรกที่ segment นี้เก็บ คือ `0` ในที่นี้ เลยมีเลขศูนย์นำ 20 ตัว)
+- **`00000000000000000000.index`** — **offset index** แบบ sparse map จาก offset → ตำแหน่ง byte ในไฟล์ `.log` (พิสูจน์ข้างล่างว่าไม่ได้มี 1 entry ต่อ 1 record)
+- **`00000000000000000000.timeindex`** — sparse map จาก timestamp → offset ใช้กับการค้นหาตาม timestamp (`kafka-console-consumer.sh --offset` ตาม timestamp, retention ตามเวลา)
+- **`leader-epoch-checkpoint`** — บันทึกว่า **leader epoch** ไหนคุมอยู่ ณ offset ไหน ใช้ตรวจและ truncate ข้อมูลที่ diverge หลัง unclean leader change
+- **`partition.metadata`** — topic ID ของ partition นั้น เพื่อให้ broker บอกได้ว่า log directory นี้เป็นของ topic ไหน แม้ topic จะถูกสร้างใหม่ภายหลัง
+
+<Callout title="ทั้ง .index และ .timeindex ถูก pre-allocate ที่ 10 MiB">
+สังเกตว่าไฟล์ index ทั้งสองแสดง `10485760` และ `10485756` byte ทั้งที่มี log data จริงแค่ 263 byte Kafka pre-allocate ไฟล์ index แต่ละไฟล์ไว้ที่ `log.index.size.max.bytes` (default 10 MiB) เป็นพื้นที่ sparse/ว่างเปล่าส่วนใหญ่ มีแค่ prefix ที่ใช้จริงเท่านั้นที่ถูกเขียน นี่คือ `ls -la` artifact จริง แม้จะดูน่าแปลกใจนิดหน่อย ควรรู้ไว้เพื่อไม่ให้เข้าใจผิดว่า "index ใหญ่มาก"
+</Callout>
+
+## พิสูจน์: dump segment — field จริงของ record batch v2
+
+`kafka-dump-log.sh --print-data-log` decode byte จริงของ `.log`
+
+```bash
+# scripts/the-log-abstraction/dump-log.sh
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/log-demo-0/00000000000000000000.log --print-data-log
+```
+
+output จริงไม่ได้แก้ไข สำหรับ 8 record เดียวกับที่ produce ข้างบน
+
+```text
+Dumping /tmp/kafka-logs/log-demo-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 7 count: 8 baseSequence: 0 lastSequence: 7 producerId: 1 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1790636428911 size: 263 magic: 2 compresscodec: none crc: 3117226911 isvalid: true
+| offset: 0 CreateTime: 1790636428907 keySize: 2 valueSize: 17 sequence: 0 headerKeys: [] key: k1 payload: order-101 created
+| offset: 1 CreateTime: 1790636428911 keySize: 2 valueSize: 17 sequence: 1 headerKeys: [] key: k2 payload: order-102 created
+| offset: 2 CreateTime: 1790636428911 keySize: 2 valueSize: 14 sequence: 2 headerKeys: [] key: k1 payload: order-101 paid
+| offset: 3 CreateTime: 1790636428911 keySize: 2 valueSize: 17 sequence: 3 headerKeys: [] key: k3 payload: order-103 created
+| offset: 4 CreateTime: 1790636428911 keySize: 2 valueSize: 17 sequence: 4 headerKeys: [] key: k2 payload: order-102 shipped
+| offset: 5 CreateTime: 1790636428911 keySize: 2 valueSize: 17 sequence: 5 headerKeys: [] key: k1 payload: order-101 shipped
+| offset: 6 CreateTime: 1790636428911 keySize: 2 valueSize: 14 sequence: 6 headerKeys: [] key: k3 payload: order-103 paid
+| offset: 7 CreateTime: 1790636428911 keySize: 2 valueSize: 17 sequence: 7 headerKeys: [] key: k3 payload: order-103 shipped
+```
+
+นี่คือสองชั้นเป๊ะ ๆ และทั้งสองเป็นของจริง
+
+- **บรรทัดที่ขึ้นต้นด้วย `baseOffset:`** — นี่คือ **record batch** (on-disk record format ของ Kafka คือ v2, `magic: 2`) header ที่ใช้ร่วมกันของทุก record ข้างใน — `baseOffset`/`lastOffset` (ช่วง offset ของ batch คือ `0`..`7` ในที่นี้ ทั้ง 8 record ลงมา batch เดียวเพราะ console producer flush พร้อมกัน), `producerId`/`producerEpoch`/`baseSequence` (บัญชีของ idempotent producer — [idempotent-producer.mdx](/kafka/en/producers/idempotent-producer/) อธิบายว่ามันป้องกันอะไร), `position: 0` (byte offset ของ batch เองในไฟล์ `.log`), `size: 263` (ตรงกับขนาดไฟล์จาก `ls -la` ข้างบน ยืนยันว่า batch นี้ **คือ** ทั้งไฟล์ในตอนนี้) และ `crc` (checksum ของ batch)
+- **บรรทัด `| offset:` หนึ่งบรรทัดต่อ record** ข้างใน batch นั้น แต่ละบรรทัดมี `offset`, `keySize`/`valueSize` และ `key`/`payload` ที่ decode แล้ว (แสดงเพราะใส่ `--print-data-log` ถ้าไม่ใส่ `kafka-dump-log.sh` จะ print แค่ header ของ batch)
+
+## พิสูจน์: index เป็นแบบ sparse ไม่ใช่ 1 entry ต่อ 1 record
+
+คำกล่าวอ้างในตำราคือ "index ทำให้ lookup เร็ว" สิ่งที่ตำรามักไม่บอกให้ชัดคือ **มัน sparse แค่ไหน** dump ไฟล์ `.index` เอง (ไม่ใส่ `--print-data-log` เพราะเป็น binary format offset→position คนละแบบ) และตรวจความสอดคล้องภายในแยกต่างหาก
+
+```bash
+# scripts/the-log-abstraction/index-entries.sh
+echo "=== index entries ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/log-demo-0/00000000000000000000.index
+
+echo "=== index sanity check ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/log-demo-0/00000000000000000000.index --index-sanity-check
+```
+
+output จริง
+
+```text
+=== index entries ===
+Dumping /tmp/kafka-logs/log-demo-0/00000000000000000000.index
+offset: 0 position: 0
+Mismatches in :/tmp/kafka-logs/log-demo-0/00000000000000000000.index
+  Index offset: 0, log offset: 7
+
+=== index sanity check ===
+Dumping /tmp/kafka-logs/log-demo-0/00000000000000000000.index
+/tmp/kafka-logs/log-demo-0/00000000000000000000.index passed sanity check.
+```
+
+**มี index entry แค่อันเดียวสำหรับ 8 record** — `offset: 0, position: 0` entry แรกที่บังคับทุก segment ต้องมี นี่คือหลักฐาน topic นี้ถูกสร้างด้วย `index.interval.bytes=4096` (config ที่คุมว่าต้อง append **log data** กี่ byte ก่อน index จะได้ entry ใหม่ — default ก็คือ `4096` เหมือนกัน) และ segment ทั้งหมดมีแค่ 263 byte เลยไม่เคยข้าม threshold หลัง entry แรก บรรทัด "mismatch" คือ diagnostic ของ tool เองที่เทียบ **offset สูงสุดที่ถูก index** (`0`) กับ **offset สูงสุดที่มีอยู่จริงใน log** (`7`) ไม่ใช่ความเสียหาย มันคือหน้าตาปกติของ sparse index บน segment เล็ก ๆ และ `--index-sanity-check` (ที่ตรวจ ordering ภายในและ invariant ความยาวไฟล์ของ index ไม่ใช่ "1 entry ต่อ 1 record") ผ่านสะอาด
+
+<Callout title="ทำไม sequential append กับ sparse index ถึงสำคัญทั้งคู่สำหรับการอ่าน">
+การอ่านที่ offset หนึ่ง **ไม่** scan ทั้ง index หาตัวที่ตรงเป๊ะ — มัน **binary search ใน index หา offset ที่ถูก index ที่ใหญ่ที่สุดซึ่ง ≤ offset เป้าหมาย** seek ไฟล์ `.log` ไปที่ **position** นั้น แล้ว scan ไปข้างหน้าทีละ record จากจุดนั้น sparse index (1 entry ต่อ `index.interval.bytes` ไม่ใช่ต่อ record) ทำให้ตัว index เล็กพอจะ memory-map และ binary search ได้ถูก ในขณะที่ linear scan สั้น ๆ ท้ายสุดก็ยังถูกเพราะไม่มีทางข้าม record เกินกว่า `index.interval.bytes` ไปได้ นี่ก็เป็นเหตุผลที่ append แบบ sequential สำคัญมากกว่าแค่ความเร็วในการเขียน index กับ log โตไปพร้อมกันที่ท้ายสุด ทั้ง write path และ lookup path นี้เลยยังเป็น disk operation แบบ contiguous ง่าย ๆ ไม่ใช่ random-access
+</Callout>
+
 ## การอ่านอิงตำแหน่ง ไม่ทำลายข้อมูล
 
-consumer อ่านด้วยการบอกว่า "ขอ record เริ่มจาก offset N" แล้ว Kafka ก็ stream ให้ตามลำดับ offset ของ consumer คือ **cursor ที่คุมเอง** ไม่ใช่สิ่งที่ broker ไปแก้ตอนส่ง นี่แหละคือกลไกทั้งหมด
+consumer อ่านด้วยการบอกว่า "ขอ record เริ่มจาก offset N" แล้ว Kafka ก็ stream ให้ตามลำดับ ด้วย path index → position → scan ที่พิสูจน์แล้วข้างบนเป๊ะ offset ของ consumer คือ **cursor ที่คุมเอง** ไม่ใช่สิ่งที่ broker ไปแก้ตอนส่ง นี่แหละคือกลไกทั้งหมด
 
 - เลื่อน cursor **ถอยหลัง** เพื่อ **replay** ประมวลผล event ของเมื่อวานใหม่หลังแก้ bug เสร็จ
 - เลื่อน **ไปข้างหน้า** เพื่อข้าม
@@ -53,11 +169,45 @@ export const logDiagram = `flowchart LR
 
 ## ลำดับเป็นแบบต่อ log
 
-log อันเดียวให้ **ลำดับสมบูรณ์** คือ offset 4 มาหลัง offset 3 เสมอ guarantee เรื่องลำดับนี้เป็นรากฐานของความถูกต้อง แต่เป็นจริง **ภายใน partition เดียว** ไม่ใช่ทั้ง topic module ถัดไปจะแกะความต่างตรงนี้ให้ เพราะกำหนดวิธีที่คุณออกแบบ key และ scale throughput ตอนนี้ขอแค่จำไอเดียหลักไว้ log มีลำดับ, append-only และอ่านตามตำแหน่ง
+log อันเดียวให้ **ลำดับสมบูรณ์** คือ offset 4 มาหลัง offset 3 เสมอ guarantee เรื่องลำดับนี้เป็นรากฐานของความถูกต้อง แต่เป็นจริง **ภายใน partition เดียว** ไม่ใช่ทั้ง topic module ถัดไปจะแกะความต่างตรงนี้ให้ เพราะกำหนดวิธีที่คุณออกแบบ key และ scale throughput ตอนนี้ขอแค่จำไอเดียหลักไว้ log มีลำดับ, append-only และอ่านตามตำแหน่ง พิสูจน์แล้วข้างบนถึงระดับ byte จริง
+
+<Callout title="binary layout ของ segment/index และ record batch v2 ลึกกว่านี้อยู่ตรงไหน">
+บทนี้พิสูจน์แค่รูปร่าง (ไฟล์, sparse index, batch header, field ต่อ record) ด้วย `ls -la`/`kafka-dump-log.sh` จริง ส่วน binary layout เต็ม ๆ ทีละ byte รวมถึง compaction กับ cleaner thread และ page cache/zero-copy `sendfile` อยู่ใน [Storage and Segments](/kafka/en/kafka-internals/storage-and-segments/)
+</Callout>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-primitive หลักของ Kafka คือ **log แบบ append-only** record ถูก append ไปท้ายและได้ **offset** ที่เพิ่มขึ้น ทำให้เขียนแบบ **sequential** ได้เร็ว การอ่าน **อิงตำแหน่ง** โดย consumer เป็นเจ้าของ cursor เอง ซึ่งนี่แหละคือสิ่งที่ทำให้ **replay** และการอ่านหลาย consumer แบบอิสระเป็นไปได้ log อันเดียว **มีลำดับสมบูรณ์ตาม offset**
+primitive หลักของ Kafka คือ **log แบบ append-only** พิสูจน์แล้วข้างบนว่าเป็นไฟล์จริง `.log` segment เก็บ **record batch** (format v2, `baseOffset`/`producerId`/`magic: 2`/`crc`) และ `.index` แบบ **sparse** (1 entry ต่อ `index.interval.bytes` ของ log data ไม่ใช่ต่อ record — พิสูจน์แล้วว่ามี entry `offset: 0` เดียวครอบคลุม 8 record) การอ่าน **อิงตำแหน่ง** binary search sparse index, seek, แล้ว scan ไปข้างหน้า consumer เป็นเจ้าของ cursor เอง ซึ่งนี่แหละคือสิ่งที่ทำให้ **replay** และการอ่านหลาย consumer แบบอิสระเป็นไปได้ log อันเดียว **มีลำดับสมบูรณ์ตาม offset**
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug lang="properties" code={`# config/the-log-abstraction/high-interval.properties
+# section: topic
+# "Reduce index overhead by writing fewer index entries"
+index.interval.bytes=104857600
+segment.bytes=1073741824
+`}>
+
+ดูเหมือนเป็นการปรับ performance ที่สมเหตุสมผล `index.interval.bytes` ที่ใหญ่ขึ้น (100 MiB ในที่นี้ เทียบกับ default จริง 4096 ที่พิสูจน์แล้วข้างบน) แปลว่า index entry น้อยลง ไฟล์ `.index` เลยเล็กลง bug คือสิ่งที่ trade-off นี้ต้องจ่าย sparse index ที่พิสูจน์แล้วข้างบนหมายความว่าทุก lookup จบด้วย **linear scan ไปข้างหน้า** จากตำแหน่งที่ index ใกล้ที่สุดอยู่แล้ว ตั้ง `index.interval.bytes` เป็น 100 MiB บน `segment.bytes` 1 GiB (default เหมือนกัน แสดงไว้ตรงนี้ด้วย) แล้ว lookup ส่วนใหญ่จะเจอแค่ entry **เดียว** ที่จุดเริ่มของ segment บังคับให้ scan ผ่าน record มากถึง 100 MiB เพื่อหา offset หรือ timestamp เป้าหมาย trade-off จริงคือขนาดไฟล์ index (เล็กลง memory-map ถูกกว่า) แลกกับความยาวการ scan ทุกครั้งที่อ่าน (ยาวขึ้น) config นี้ดันไปสุดโต่งจนจะเห็นเป็น seek `--from-beginning` ที่ช้าและ time-based lookup ที่ช้าบน topic ที่มี traffic จริง ตรงข้ามกับ "ลด overhead" เป๊ะ ๆ default `4096` ที่พิสูจน์แล้วข้างบนคือจุดสมดุลที่คิดมาแล้ว การขยายควรเป็นการตัดสินใจที่วัดผลแล้วต่อ topic ไม่ใช่ "entry น้อยกว่าดีกว่าเสมอ" แบบเหมารวม
+
+</SpotTheBug>
+
+## Mental Model
+
+ลองนึกถึงไฟล์ `.log` เป็น **หน้าสมุดบัญชีจริง** และ `.index` เป็น **สารบัญบาง ๆ ที่เขียนด้วยมือ** จดไว้ทุก ๆ สองสามหน้า ไม่ใช่ทุกบรรทัด เวลาจะหา "บรรทัดที่ 4200" คุณเช็คสารบัญหาเลขหน้าที่ใกล้ที่สุด **ที่มาก่อนหรือเท่ากับ** เลขนั้น เปิดตรงนั้นเลย แล้วอ่านต่อไปอีกนิดหน่อย ไม่เคย scan ทั้งสมุดบัญชี และสารบัญก็ไม่ต้องใหญ่เท่าตัวสมุดบัญชีเอง นี่คือสิ่งที่ sparse index ที่พิสูจน์แล้วข้างบนทำเป๊ะ ๆ และนี่คือเหตุผลที่ "append-only" กับ "sparse index" ไม่ใช่สองฟีเจอร์แยกกัน อันที่สองทำงานได้อย่างมีประสิทธิภาพก็เพราะอันแรก guarantee ว่าข้อมูลใหม่จะลงที่ท้ายสุดที่คาดเดาได้และโตขึ้นเรื่อย ๆ เท่านั้น
+
+## Trade-offs
+
+- **Sparse index (`index.interval.bytes`)** — ไฟล์ index เล็ก ถือใน memory และ binary search ถูก แลกกับ scan สั้น ๆ ไปข้างหน้าทุกครั้งที่ lookup (พิสูจน์แล้วข้างบน default `4096` byte ทำให้ scan สั้น ตัวอย่าง SpotTheBug แสดงว่าตั้งสูงเกินไปจะเป็นยังไง)
+- **ขนาด segment (`segment.bytes`)** — segment ใหญ่ขึ้นแปลว่าไฟล์น้อยลงและ allocate ไฟล์ index น้อยลง แต่ segment จะลบหรือถูกเช็ค retention ไม่ได้จนกว่าจะ **roll** (ปิด) segment ที่ไม่เคยเต็มจะเปิดค้างไว้ (และไม่ถูกเก็บกวาดโดย time-based retention ข้างในมัน) ไม่มีกำหนด นี่เป็นปุ่มควบคุมเชิง operation จริง ไม่ใช่แค่เรื่อง performance
+- **record แบบ append-only, แก้ไม่ได้** — นี่คือสิ่งที่ทำให้ sequential I/O และ sparse index เป็นไปได้ทั้งคู่ แต่แปลว่า "แก้ไข" record ไม่มีอยู่จริง การแก้ข้อมูลผิดคือการเขียน record ใหม่ที่ถูกต้อง (และสำหรับ topic ที่มี key พึ่ง [compaction](/kafka/en/topics-and-partitions/retention-and-compaction/) แทนการ update ตรงที่เดิม)
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ไฟล์ `.index` มี 1 entry ต่อ 1 record นั่นแหละที่ทำให้ lookup เร็ว"** ผิด พิสูจน์แล้วข้างบน 8 record ให้ index entry เดียวคือ `offset: 0` lookup เร็วเพราะ index เล็กพอจะ binary search ถูก และ scan ที่ตามมาสั้นเพราะ `index.interval.bytes` จำกัดมันไว้ ไม่ใช่เพราะทุก record ถูก index แยกกัน
+- **"ไฟล์ `.index`/`.timeindex` ใหญ่บนดิสก์ (10 MiB ที่เห็นข้างบน) แปลว่า Kafka เก็บ index data เยอะ"** ผิด พิสูจน์แล้วข้างบนว่าทั้งสองไฟล์ถูก pre-allocate ตาม `log.index.size.max.bytes` ไม่ว่าจะใช้จริงเท่าไหร่ ส่วนที่ใช้จริงตรงนี้มีแค่ entry เดียว
+- **"Kafka log ก็แค่ไฟล์ที่ `tail -f` แล้วอ่านได้เลย"** ผิด พิสูจน์แล้วข้างบน `.log` เก็บ record batch แบบ binary (format v2) ต้องใช้ `kafka-dump-log.sh` (หรือ deserializer ของ client เอง) ถึงจะ decode ได้ `cat`/`tail` ดิบ ๆ อ่านไม่รู้เรื่อง
+- **"sequential write กับ sparse index เป็นสอง optimization ที่แยกอิสระจากกัน"** ผิด ความ sparse ของ index จะค้นหาได้ถูกก็เพราะ record ใหม่ append ที่ท้ายสุดที่คาดเดาได้และโตขึ้นเรื่อย ๆ เท่านั้น ถ้า record เขียนที่ไหนก็ได้ index offset→position แบบ sparse จะหา neighborhood ที่ถูกต้องให้ scan จากไม่ได้เลย
 
 export const quizLog = [
   {
@@ -69,6 +219,7 @@ export const quizLog = [
       'Kafka บีบอัด record แต่ละตัวด้วย algorithm ที่กิน CPU หนัก',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน segment .log เป็นไฟล์ append-only ธรรมดา kafka-dump-log.sh แสดง record batch เรียงต่อกันตาม position ไม่เคยถูกเขียนทับ',
   },
   {
     q: 'เกิดอะไรขึ้นกับ record เมื่อ consumer อ่านไปแล้ว',
@@ -79,6 +230,7 @@ export const quizLog = [
       'offset ของตัวเองถูก reset เป็นศูนย์',
     ],
     answer: 1,
+    explain: 'ไฟล์ .log บนดิสก์ไม่ถูกแตะต้องจากการอ่านเลย มีแค่ offset ที่ commit ของ consumer (group) เองที่เปลี่ยน',
   },
   {
     q: 'replay ใน Kafka ทำงานยังไง',
@@ -89,6 +241,7 @@ export const quizLog = [
       'replay ทำใน Kafka ไม่ได้',
     ],
     answer: 1,
+    explain: 'replay ก็แค่เลื่อน read cursor กลับไปที่ offset ก่อนหน้า path binary-search-then-scan เดียวกับที่พิสูจน์แล้วข้างบนก็รันใหม่จากจุดนั้น',
   },
   {
     q: 'log อันเดียวของ Kafka ให้ ordering guarantee แบบไหน',
@@ -99,6 +252,29 @@ export const quizLog = [
       'เรียงตามขนาด record เท่านั้น',
     ],
     answer: 1,
+    explain: 'offset ถูกกำหนดเรียงลำดับต่อ partition (พิสูจน์แล้วข้างบน 0..7 ใน batch เดียวบน partition เดียว) topic ที่มีหลาย partition ไม่มี global order เดียว',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบน 8 record ที่ produce ด้วย index.interval.bytes=4096 ทำให้ไฟล์ .index มีกี่ entry และทำไม',
+    options: [
+      '8 entry หนึ่งต่อหนึ่ง record เพราะทุก record ต้องถูก index แยกกัน',
+      'entry เดียว เพราะ 263 byte ของ segment ไม่เคยข้าม threshold 4096 byte หลัง entry แรกที่บังคับ',
+      '0 entry เพราะ index จะเติมก็ต่อเมื่อ segment roll แล้วเท่านั้น',
+      '4096 entry หนึ่งต่อหนึ่ง byte ที่ตั้งไว้',
+    ],
+    answer: 1,
+    explain: 'kafka-dump-log.sh บนไฟล์ .index print แค่บรรทัดเดียว "offset: 0 position: 0" sparse index จะเพิ่ม entry ทุก ๆ index.interval.bytes ของ log data เท่านั้น',
+  },
+  {
+    q: 'kafka-dump-log.sh --index-sanity-check ตรวจอะไร ตามหลักฐานข้างบน',
+    options: [
+      'ว่ามี index entry 1 อันต่อ 1 record ใน log',
+      'โครงสร้างภายในและ ordering invariant ของไฟล์ index เอง ผ่านสะอาดแม้จะมีแค่ entry เดียวสำหรับ 8 record',
+      'ว่าไฟล์ index กับไฟล์ log มีขนาดเท่ากัน',
+      'ว่าทุก record ใน log มี checksum ที่ถูกต้อง',
+    ],
+    answer: 1,
+    explain: 'sanity check ผ่าน ("passed sanity check") ไม่ขึ้นกับความ sparse เลย มันตรวจว่าไฟล์ index เองมีรูปแบบถูกต้อง ไม่ได้ตรวจว่ามัน dense',
   },
 ];
 
