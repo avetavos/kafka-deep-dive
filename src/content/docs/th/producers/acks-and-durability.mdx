@@ -1,6 +1,6 @@
 ---
 title: 'Acks กับ Durability'
-description: 'acks=0 acks=1 และ acks=all แลก latency กับ durability อย่างไร min.insync.replicas หนุนค่าที่แข็งที่สุดอย่างไร และ setup producer ที่ทนทานใน KafkaJS'
+description: 'acks=0, acks=1 และ acks=all แลก latency กับ durability อย่างไร "committed" หมายถึงอะไรจริง ๆ (high watermark), NotEnoughReplicasException จริงจาก ISR ที่หดตัวจริง, edge case ที่จริงและน่าประหลาดใจตอน min.insync.replicas เกิน replication factor ของ topic เอง และ delivery.timeout.ms (librdkafka) เทียบกับ retry object ของ KafkaJS'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -40,13 +41,13 @@ acks=all
 await producer.send({ topic: 'orders', acks: -1, messages })
 ```
 
+## "committed" หมายถึงอะไรจริง ๆ: high watermark
+
+`acks=all` ที่รอ "ทุก in-sync replica" จริง ๆ แล้วคือการรอให้ **high watermark (HW)** ของ partition เลื่อนผ่าน offset ของ record คุณ HW คือ offset ที่ **ทุก** in-sync replica replicate ไปถึงแล้ว — เป็นเส้นแบ่งระหว่าง "เขียนแล้ว" กับ **"committed"**: consumer ที่อ่านด้วย isolation level แบบ default จะเห็นแค่ record ที่ไม่เกิน HW เท่านั้น และมีแค่ record ที่ offset ไม่เกิน HW เท่านั้นที่รอดผ่านการเลือก leader ใหม่โดยไม่เปลี่ยนแปลง [Replication and ISR](/kafka/th/topics-and-partitions/replication-and-isr/) ครอบคลุมว่า HW เลื่อนอย่างไรและ ISR set ที่หนุนมันหดและขยายยังไงแบบเต็ม ๆ บทนี้ต้องการแค่เส้นแบ่ง: **`acks=all` คือคำสัญญาเกี่ยวกับ HW และ `min.insync.replicas` คือสิ่งที่ทำให้คำสัญญานั้นบังคับใช้ได้จริง ไม่ใช่แค่ความหวัง** — สองหัวข้อถัดไปพิสูจน์ทั้งการบังคับใช้และช่องว่างจริงในนั้น
+
 ## acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย
 
 `acks=all` ลำพังหมายถึง "ทุก replica ที่ **in-sync** อยู่ตอนนั้น" ถ้าตอนนั้นมีแค่ leader ที่ in-sync คำว่า "all" ก็คือ leader ตัวเดียว — เท่ากับกลับไปเป็น `acks=1` ค่าฝั่ง broker `min.insync.replicas` ปิดช่องนี้ โดยตั้ง **จำนวนขั้นต่ำ** ของ in-sync replica ที่ต้องมีอยู่ถึงจะรับ write ได้เลย
-
-ด้วย `min.insync.replicas=2` บน topic ที่มี replication factor 3 producer ที่ใช้ `acks=all` ต้องมี replica in-sync อย่างน้อย **สอง** ตัว ถ้าเหลือแค่ตัวเดียว broker จะ **ปฏิเสธ** การ write (error `NotEnoughReplicas`) แทนที่จะรับ record ที่อาจหายได้ การปฏิเสธนี่แหละคือจุดสำคัญ — เรายอมให้ fail ดัง ๆ ดีกว่าเสียข้อมูลเงียบ ๆ
-
-รวมทั้งหมดเข้าด้วยกัน producer ของ **KafkaJS** ที่ทนทานจะจับคู่ option `acks` ต่อการ send (หรือ idempotent producer ที่มีผลเท่ากับ `acks: -1` โดยอัตโนมัติ — บทถัดไปจะพูดถึงเรื่องนี้) กับ topic ที่ตั้ง `min.insync.replicas=2`:
 
 ```typescript
 const producer = kafka.producer({ idempotent: true }) // implies acks: -1 internally
@@ -57,22 +58,189 @@ await producer.send({
 })
 ```
 
-<Mermaid title="Durability climbs from acks=0 to acks=all with min.insync.replicas" code={acksDiagram} />
+## Edge case ที่จริงและน่าประหลาดใจ: min.insync.replicas > replication factor ไม่ทำให้ write ถูกปฏิเสธ
+
+คำกล่าวอ้างตามตำราคือ "min.insync.replicas ที่มากกว่าที่มีอยู่จริงจะทำให้ broker ปฏิเสธการ write" นั่นเป็นจริงเมื่อการขาดแคลนเกิดบน topic ที่ **replication factor อย่างน้อยเท่ากับ min.insync.replicas** (พิสูจน์ในหัวข้อถัดไป บน cluster 3 broker จริง) แต่ **ไม่จริง** — ยืนยันตรง ๆ ซ้ำแล้วซ้ำเล่ากับ broker จริง — เมื่อ replication factor ของ topic **เอง** ต่ำกว่า min.insync.replicas อยู่แล้ว เช่นบน cluster single-broker:
+
+```bash
+# scripts/acks-and-durability/rf1-silent-success.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists \
+  --topic orders-durable --partitions 1 --replication-factor 1 --config min.insync.replicas=2
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --topic orders-durable
+
+echo "=== under-min-isr-partitions (the broker DOES flag it) ==="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --under-min-isr-partitions
+
+echo "=== produce with acks=all anyway ==="
+echo "test-message" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic orders-durable --producer-property acks=all
+echo "console-producer exit code: $?"
+```
+
+ผลลัพธ์จริง ไม่ได้แก้ไขอะไรเลย — `ReplicationFactor: 1`, `Isr: 1` (ขนาด 1 ต่ำกว่า `min.insync.replicas=2`), partition นี้ **ถูก** แสดงใน `--under-min-isr-partitions` (broker รู้) และ write ก็ยังสำเร็จ:
+
+```text
+Topic: orders-durable	TopicId: hXfSTO0GQQuNwexIyVVZCg	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=2
+	Topic: orders-durable	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+
+=== under-min-isr-partitions (the broker DOES flag it) ===
+	Topic: orders-durable	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+
+=== produce with acks=all anyway ===
+console-producer exit code: 0
+```
+
+<Callout title="ทำไม: ไม่มีอะไรให้รอเลย">
+การบังคับใช้ `min.insync.replicas` ของ broker อยู่ใน code path ที่รอ **follower** ตามให้ทัน (`DelayedProduce` ในคำศัพท์ของ broker เอง) บน partition ที่ replication-factor เป็น 1 ไม่มี follower เลย — การ append ในเครื่องของ leader เองก็ **คือ** replica set ทั้งหมดอยู่แล้ว จึงไม่มีขั้นตอน "รอ replica ให้พอ" ให้ fail partition นี้ under-replicated จริง ถาวร เทียบกับ `min.insync.replicas` ของมันเอง (รายการ `--under-min-isr-partitions` พิสูจน์ว่า broker ติดตามข้อเท็จจริงนี้) แต่ไม่มีส่วนไหนของ produce path ปกติเช็กข้อเท็จจริงนั้นเลย — มันเป็นแค่ **สัญญาณ monitoring** ไม่ใช่ตัวกันตอน write เมื่อ replication factor เองคือคอขวด `min.insync.replicas > replication.factor` คือกับดักการตั้งค่าผิดแบบเงียบ ๆ ที่จริง: [KIP-579](https://cwiki.apache.org/confluence/spaces/KAFKA/pages/148641915/KIP-579+new+exception+on+min.insync.replicas+replication.factor) เสนอ `InconsistentReplicationFactorException` เฉพาะสำหรับกรณีนี้ — ยืนยันกับ broker Kafka 4.3.1 ของคอร์สนี้เองแล้ว write ยังถูกยอมรับเงียบ ๆ อยู่จนถึงวันนี้
+</Callout>
+
+## NotEnoughReplicasException จริง — พิสูจน์บน ISR ที่หดตัวจริง
+
+การบังคับใช้ **ทำงานจริง** — พิสูจน์บน cluster 3-broker จริง (`replication.factor=3`, `min.insync.replicas=3`, compose 3-broker ชั่วคราวของคอร์สนี้เอง ที่ถูกปิดทันทีหลังพิสูจน์เสร็จ) write หนึ่งครั้งสำเร็จตอนทั้งสาม replica in-sync ครบ จากนั้น follower ตัวหนึ่งถูกหยุด (`docker stop`) ทำให้ ISR หดเหลือ 2 (ต่ำกว่า `min.insync.replicas=3`) ในขณะที่ controller quorum เสียงข้างมาก 2-ใน-3 ยังแข็งแรงอยู่:
+
+```text
+# kafka-topics.sh --describe --topic orders-rf3, after stopping one follower:
+Topic: orders-rf3	PartitionCount: 1	ReplicationFactor: 3	Configs: min.insync.replicas=3
+	Topic: orders-rf3	Partition: 0	Leader: 2	Replicas: 2,3,1	Isr: 2,3	Elr: 1	LastKnownElr:
+```
+
+จากนั้น KafkaJS producer ส่งไปยัง partition นั้นด้วย `acks: -1`:
+
+```typescript
+// src/acks-and-durability/rf3-not-enough-replicas.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'acks-rf3-probe', brokers: ['localhost:9092'], requestTimeout: 8000 });
+
+async function main() {
+  const producer = kafka.producer({ retry: { retries: 2, initialRetryTime: 300, maxRetryTime: 1000 } });
+  await producer.connect();
+  try {
+    const res = await producer.send({
+      topic: 'orders-rf3',
+      acks: -1,
+      timeout: 5000,
+      messages: [{ key: 'k', value: 'after-kill-kafkajs' }],
+    });
+    console.log('unexpected success:', JSON.stringify(res));
+  } catch (err: any) {
+    console.log('send() threw:', err.name, '-', err.message);
+    console.log('retriable:', err.retriable);
+  }
+  await producer.disconnect();
+}
+
+main();
+```
+
+ผลลัพธ์จริง ไม่ได้แก้ไขอะไรเลย — ข้อความ error จริงจาก broker, exception ที่ KafkaJS ห่อไว้ และ `retriable: false` หลังงบ retry หมด:
+
+```text
+{"level":"ERROR", ..., "error":"Messages are rejected since there are fewer in-sync replicas than required", "correlationId":2, ...}
+{"level":"ERROR","message":"[Producer] Failed to send messages: Messages are rejected since there are fewer in-sync replicas than required","retryCount":0,"retryTime":307}
+{"level":"ERROR","message":"[Producer] Failed to send messages: Messages are rejected since there are fewer in-sync replicas than required","retryCount":1,"retryTime":520}
+{"level":"ERROR","message":"[Producer] Failed to send messages: Messages are rejected since there are fewer in-sync replicas than required","retryCount":2,"retryTime":1000}
+send() threw: KafkaJSNumberOfRetriesExceeded - Messages are rejected since there are fewer in-sync replicas than required
+retriable: false
+```
+
+**"Messages are rejected since there are fewer in-sync replicas than required" คือข้อความ `NotEnoughReplicasException` ตัวจริงของ broker เอง ตรงตัวเป๊ะ** KafkaJS retry ไป 3 ครั้ง (แต่ละครั้งเจอ error เดิมเป๊ะ เพราะ follower ยังไม่กลับมา) แล้วยอมแพ้ด้วย `KafkaJSNumberOfRetriesExceeded`, `retriable: false` — นี่คือความล้มเหลวจากการตั้งค่าจริง ๆ ไม่ใช่แค่ชั่วคราว และ flag retriable ของ KafkaJS เองก็บอกถูกต้องแบบนั้นเมื่องบ retry หมดแล้ว
+
+<Mermaid title="Durability ไต่จาก acks=0 ไปถึง acks=all พร้อม min.insync.replicas — และช่องว่างจริงหนึ่งจุด" code={acksDiagram} />
 
 export const acksDiagram = `flowchart LR
   p["Producer send()"] --> a0["acks=0: no wait, lowest latency"]
   p --> a1["acks=1: leader writes and replies"]
   p --> aa["acks=all: all in-sync replicas confirm"]
-  aa --> misr["'min.insync.replicas=2' must be met or write is rejected"]
-  misr --> safe["Durable: survives a broker failure"]`;
+  aa --> misr{"'min.insync.replicas' met?"}
+  misr -- "yes, RF >= minIsr" --> safe["Durable: survives a broker failure"]
+  misr -- "ISR short, RF >= minIsr" --> reject["Real NotEnoughReplicasException"]
+  misr -- "RF < minIsr (e.g. single broker)" --> trap["Silent trap: write still succeeds, proven above"]`;
+
+## Retry ของ producer และเส้นตายของ durability: delivery.timeout.ms เทียบกับ retry object ของ KafkaJS
+
+ความล้มเหลวแบบ `NotEnoughReplicasException` คือสิ่งที่งบ retry มีไว้เพื่อทนผ่านพอดี — follower สะดุดสั้น ๆ, broker restart ระหว่าง rolling upgrade Java client (และ native `librdkafka` surface ของ `@confluentinc/kafka-javascript` ซึ่งใช้ config เดียวกันนี้) คุมทั้งหน้าต่าง retry ด้วยเส้นตายเดียว `delivery.timeout.ms` (ค่า default `120000` ที่บทก่อนครอบคลุมไปแล้ว): พอเลยเส้นตายนั้น การ send จะ fail ถาวร ไม่ว่าจะ `retriable` หรือไม่
+
+KafkaJS ไม่มี property เส้นตายเดี่ยว ๆ แต่ object `retry` ระดับ client คุม retry ด้วย **จำนวนครั้งและ backoff** แทนที่จะเป็นเส้นตายตามนาฬิกา:
+
+```typescript
+const kafka = new Kafka({
+  clientId: 'orders-app',
+  brokers: ['localhost:9092'],
+  retry: {
+    retries: 5,           // give up after 5 attempts (not after N milliseconds)
+    initialRetryTime: 300,
+    maxRetryTime: 30000,
+  },
+});
+```
+
+การพิสูจน์ด้านบนใช้แบบนี้เป๊ะ: `retries: 2` หมายถึงสามครั้งรวม (หนึ่งครั้งบวกสอง retry) กับ cluster ที่เสียถาวร แต่ละครั้งถูก log เป็น `retryCount: 0`, `1`, `2` พร้อม `retryTime` ที่โตขึ้นตาม backoff ของ KafkaJS เอง — แล้วจบด้วย `KafkaJSNumberOfRetriesExceeded` ไม่ใช่ timeout ผลลัพธ์เชิงปฏิบัติ: การตั้ง retry policy ของ KafkaJS สำหรับ durability คือการเลือกจำนวน `retries` และ `maxRetryTime` ที่รวมกัน **ประมาณ** เวลารวมที่คุณยอมรอ แทนที่จะตั้งตัวเลขเดียวแบบที่ `delivery.timeout.ms` ทำได้
 
 ## Tradeoff แบบตรงไปตรงมา
 
-durability ไม่มีของฟรี ทุกระดับ `acks` ที่แข็งขึ้นเพิ่ม network round trip และรอเครื่องมากขึ้น latency จึงสูงขึ้นตามความแข็งของการรับประกัน เลือกตามต้นทุนของการเสีย record: metrics และ log มักอยู่กับ `acks=1` ได้ แต่ order, payment และอะไรที่สร้างใหม่ไม่ได้ควรใช้ `acks=all` คู่กับ `min.insync.replicas=2`
+durability ไม่มีของฟรี ทุกระดับ `acks` ที่แข็งขึ้นเพิ่ม network round trip และรอเครื่องมากขึ้น latency จึงสูงขึ้นตามความแข็งของการรับประกัน เลือกตามต้นทุนของการเสีย record: metrics และ log มักอยู่กับ `acks=1` ได้ แต่ order, payment และอะไรที่สร้างใหม่ไม่ได้ควรใช้ `acks=all` คู่กับ `min.insync.replicas` ที่ตั้งไว้ **และตรวจสอบแล้วว่าไม่เกิน replication factor จริงของ topic** — พิสูจน์แล้วด้านบนว่า broker จะไม่จับการตั้งค่าผิดแบบนี้ให้คุณ
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**`acks`** ตั้งว่าต้องมี replica กี่ตัวยืนยันการ write: **`acks=0`** คือ fire-and-forget, **`acks=1`** คือ leader อย่างเดียว, และ **`acks=all`** รอทุก **in-sync replica** ใน KafkaJS `acks` เป็น **option ต่อการ send** (`producer.send({ acks: -1, ... })`) หนุนด้วย **`min.insync.replicas=2`** เพื่อให้ broker ปฏิเสธ write ที่ทำ durable ไม่ได้ — แลก **latency** นิดหน่อยกับ record ที่รอดเมื่อ broker ล่ม
+**`acks`** ตั้งว่าต้องมี replica กี่ตัวยืนยันการ write: **`acks=0`** คือ fire-and-forget, **`acks=1`** คือ leader อย่างเดียว, และ **`acks=all`** รอทุก **in-sync replica** ให้ถึง **high watermark** ของ partition ใน KafkaJS `acks` เป็น **option ต่อการ send** (`producer.send({ acks: -1, ... })`) หนุนด้วย **`min.insync.replicas`** — พิสูจน์จริงบน cluster 3-broker แล้วว่าปฏิเสธ write ด้วย `NotEnoughReplicasException` ตัวจริงของ broker เมื่อ ISR หดตัวจริง ๆ ต่ำกว่าค่านี้ (`retriable: false` เมื่องบ retry ของ KafkaJS หมด) — **แต่ใช้ได้ก็ต่อเมื่อ replication factor อย่างน้อยเท่ากับ min.insync.replicas เท่านั้น**: บน topic single-broker (หรือ under-replicated แบบอื่น) การตั้งค่าผิดแบบเดียวกันเป๊ะถูกพิสูจน์แล้วว่า **สำเร็จเงียบ ๆ** แทน
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/acks-and-durability/payments-topic-setup.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'ops-tool', brokers: ['localhost:9092'] });
+
+// AI comment: "payments need the strongest durability — belt and suspenders"
+async function createPaymentsTopic() {
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({
+    topics: [{
+      topic: 'payments',
+      numPartitions: 1,
+      replicationFactor: 1, // "single broker for now, will scale replicas later"
+      configEntries: [{ name: 'min.insync.replicas', value: '2' }], // "require 2 replicas to confirm"
+    }],
+  });
+  await admin.disconnect();
+}
+`}>
+
+comment อ่านดูเหมือนโค้ด infrastructure ที่ระมัดระวังเรื่องความปลอดภัย — durability แบบ "belt and suspenders" ตั้ง `min.insync.replicas` ชัดเจน บั๊กจริง พิสูจน์แล้วก่อนหน้านี้ในบทนี้บน shape การตั้งค่าผิดแบบเดียวกันเป๊ะ: `replicationFactor: 1` กับ `min.insync.replicas: 2` ไม่ได้เพิ่ม durability เลย — มันสร้าง partition ที่ under-replicated **ถาวร** (เห็นได้ตลอดไปใน `kafka-topics.sh --describe --under-min-isr-partitions`) ในขณะที่ทุก write แบบ `acks=all` **สำเร็จเงียบ ๆ** อยู่ดี เพราะไม่มี follower ให้ min-ISR check รอเลย topic payments ที่ตั้งแบบนี้มี durability เท่ากับ `replicationFactor: 1` เป๊ะ — broker ล่มตัวเดียวก็เสียข้อมูลที่ยังไม่ flush — ในขณะที่ config อ่านเหมือนกำลังเรียกร้องการยืนยันจากสอง replica วิธีแก้คือทำให้ replication factor กับ `min.insync.replicas` สอดคล้องกัน และเพิ่ม broker จริงตามที่ comment ผัดไว้:
+
+```text
+await admin.createTopics({
+  topics: [{
+    topic: 'payments',
+    numPartitions: 1,
+    replicationFactor: 3, // <-- must actually be >= min.insync.replicas to mean anything
+    configEntries: [{ name: 'min.insync.replicas', value: '2' }],
+  }],
+});
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+`acks` กับ `min.insync.replicas` คือคำสัญญาสองอันที่แยกจากกัน จะรวมกันเป็น durability ได้ก็ต่อเมื่อถูกเช็กกับ **ตัวเลขเดียวกัน**: `acks=all` สัญญาว่า "ฉันจะรอไม่ว่า in-sync set ตอนนั้นจะเป็นอะไรก็ตาม" และ `min.insync.replicas` สัญญาว่า "broker จะไม่ยอมให้ set นั้นเล็กเกินไป" — แต่คำสัญญาที่สองบังคับใช้ได้แค่เท่าที่ replica set **โตได้จริงในทางกายภาพ** ซึ่งก็คือ `replication.factor` มองว่า `min.insync.replicas` เป็นข้อเรียกร้องที่มีความหมายก็ต่อเมื่อคุณเช็กด้วยว่า `replication.factor >= min.insync.replicas` สำหรับ topic นั้นเป๊ะ ๆ แล้วเท่านั้น — broker ยินดีให้คุณตั้งค่า (และรันจริงในโปรดักชันแบบเงียบ ๆ) topic ที่เงื่อนไขนั้นเป็นเท็จได้เฉย ๆ
+
+## Trade-offs
+
+- **`acks=0`** — latency ต่ำสุด ไม่มีการรับประกัน durability เลย เหมาะกับ metrics/telemetry ที่ยอมเสียได้
+- **`acks=1`** — latency หนึ่ง network hop durable กับทุกอย่างยกเว้น "leader ตายพร้อม record ที่ยังไม่ replicate" — หน้าต่างเสี่ยงจริง แม้จะแคบ
+- **`acks=all` + `min.insync.replicas <= replication.factor`** — combination เดียวที่พิสูจน์แล้วด้านบนว่าปฏิเสธ write ที่ไม่ปลอดภัยได้จริง latency สูงสุด การรับประกันจริงแข็งที่สุด
+- **`acks=all` + `min.insync.replicas > replication.factor`** — อ่านเหมือนค่าที่แข็งที่สุด แต่พิสูจน์แล้วด้านบนว่า **ไม่แข็งไปกว่า replicationFactor เฉย ๆ เลยแบบเงียบ ๆ** โดยมีแค่ flag monitoring ถาวรที่พลาดง่ายเป็นอาการเดียว
+- **retry policy แบบนับจำนวน/backoff ของ KafkaJS** — ให้เหตุผลง่ายกว่าต่อครั้ง แต่ไม่มีปุ่ม "งบเวลารวม" เดียวแบบที่ `delivery.timeout.ms` ให้ การตั้งให้ตรงกับ SLA จริงต้องคำนวณนิดหน่อย (`retries` คูณการโตของ `retryTime` เฉลี่ย)
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ตั้ง `min.insync.replicas` สูงขึ้นทำให้ topic durable ขึ้นเสมอ"** ไม่ — พิสูจน์ตรง ๆ ด้านบนแล้ว: บน topic ที่ `replication.factor` ต่ำกว่าตัวเลขนั้นอยู่แล้ว มันไม่ทำอะไรเลยตอน write มีแค่ `--under-min-isr-partitions` เท่านั้นที่จะโชว์มัน
+- **"การตั้งค่าผิดแบบ `NotEnoughReplicasException` จะ throw ตอน produce เสมอ"** ไม่ — ขึ้นอยู่ทั้งหมดว่าการขาดแคลนนั้นเป็น **ISR หดตัวชั่วคราว** บน topic ที่ replicate เพียงพออยู่แล้ว (throw จริง พิสูจน์แล้วด้านบน) หรือเป็นการขาดแคลนเชิงโครงสร้างที่ replication factor เองไม่มีทางตอบสนอง `min.insync.replicas` ได้เลย (สำเร็จเงียบ ๆ พิสูจน์แล้วด้านบน)
+- **"`acks=all` คือคำสัญญาว่า replica N ตัวตาม replication factor ที่ตั้งไว้ยืนยัน write แล้ว"** ไม่ — มันคือคำสัญญาว่าอะไรก็ตามที่ **อยู่ใน ISR ตอนนั้น** ยืนยันแล้ว `min.insync.replicas` คือสิ่งเดียวที่ตั้งพื้นให้ว่า set ตอนนั้นเล็กได้แค่ไหน
+- **"`retry.retries` ของ KafkaJS กับ `delivery.timeout.ms` ของ Java client เป็นแค่ชื่อสองชื่อของ setting เดียวกัน"** ไม่ — อันหนึ่งคือ **จำนวนครั้ง** ที่มี backoff schedule ของตัวเอง อีกอันคือ **เส้นตายตามนาฬิกาเดียว** ที่ครอบคลุมวงจรชีวิตการ send ทั้งหมด ทั้งสองเทียบเท่ากันแค่โดยประมาณ และการแปลงจากอันหนึ่งไปอีกอันต้องคำนวณจริง
 
 export const quizAcks = [
   {
@@ -84,6 +252,7 @@ export const quizAcks = [
       'เขียนลงทุก topic ใน cluster',
     ],
     answer: 1,
+    explain: 'acks=1 รอแค่การ append ในเครื่องของ leader เอง; acks=all รอจน high watermark ของ partition เลื่อนผ่าน record นั้น หมายความว่าทุก in-sync replica มีมันแล้ว',
   },
   {
     q: 'ทำไม acks=all ต้องมี min.insync.replicas ถึงจะมีความหมาย',
@@ -94,16 +263,40 @@ export const quizAcks = [
       'ตั้งว่ามี consumer อ่าน topic ได้กี่ตัว',
     ],
     answer: 1,
+    explain: '"ทุก in-sync replica" ไม่มีพื้นของตัวเอง — min.insync.replicas คือสิ่งที่ป้องกันไม่ให้ in-sync set หดเหลือแค่ leader โดยที่ broker ไม่ปฏิเสธ write',
   },
   {
-    q: 'เมื่อ replication factor 3 และ min.insync.replicas=2 จะเกิดอะไรถ้ามี replica in-sync แค่ตัวเดียวตอนส่งแบบ acks=all',
+    q: 'บน cluster 3-broker จริง (replication.factor=3, min.insync.replicas=3) หลังหยุด follower หนึ่งตัวจน ISR หดเหลือ 2 การ send แบบ acks=-1 ของ KafkaJS ให้ผลอะไรจริง ๆ',
     options: [
-      'การ write สำเร็จเงียบ ๆ',
-      'broker ปฏิเสธการ write แทนที่จะรับ record ที่อาจหายได้',
-      'record ถูกเขียนลงไฟล์ชั่วคราว',
-      'producer สลับไปใช้ acks=0 อัตโนมัติ',
+      'สำเร็จเงียบ ๆ เหมือน write ทั่วไป',
+      'error จริงของ broker "Messages are rejected since there are fewer in-sync replicas than required" ถูก retry แล้วจบด้วย KafkaJSNumberOfRetriesExceeded พร้อม retriable: false',
+      'producer สลับไปใช้ acks=1 อัตโนมัติ',
+      'broker crash',
     ],
     answer: 1,
+    explain: 'นี่คือข้อความ NotEnoughReplicasException จริงของ broker เก็บมาตรงตัว; KafkaJS retry ตาม retry policy แล้วโชว์ KafkaJSNumberOfRetriesExceeded เมื่องบหมด ทำเครื่องหมาย non-retriable ถูกต้อง',
+  },
+  {
+    q: 'บน topic single-broker ที่สร้างด้วย replicationFactor: 1 และ min.insync.replicas: 2 บทนี้พิสูจน์ว่าอะไรเกิดขึ้นจริงตอน write แบบ acks=all',
+    options: [
+      'broker ปฏิเสธเหมือนกรณี ISR หดตัวบน cluster 3-broker เป๊ะ',
+      'write สำเร็จเงียบ ๆ — kafka-topics.sh --under-min-isr-partitions แสดง partition นี้ แต่ไม่มีอะไรบล็อก produce path เลย เพราะไม่มี follower ให้รอ',
+      'topic สร้างไม่สำเร็จตั้งแต่แรก',
+      'KafkaJS ปฏิเสธที่จะต่อกับ topic แบบนี้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้วยการรัน console-producer จริง (exit code 0) และ kafka-topics.sh --describe --under-min-isr-partitions ที่แสดง partition นี้แต่ยังเขียนได้ — การบังคับใช้ min.insync.replicas เข้าทำงานแค่ใน code path ที่รอ follower เท่านั้น ซึ่ง partition replication-factor-1 ไม่มีวันเข้าไปถึง',
+  },
+  {
+    q: 'ความต่างเชิงปฏิบัติระหว่าง delivery.timeout.ms ของ Java/librdkafka กับ retry object ของ KafkaJS ในการจำกัดว่า send ที่ durability สำคัญจะ retry ได้นานแค่ไหนคืออะไร',
+    options: [
+      'เหมือนกันทุกประการ',
+      'delivery.timeout.ms คือเส้นตายตามนาฬิกาเดียวสำหรับการ send ทั้งหมด; KafkaJS คุมด้วยจำนวนครั้งและ backoff แทน (retries, initialRetryTime, maxRetryTime) ซึ่งประมาณงบเวลารวมได้เท่านั้น',
+      'KafkaJS ไม่มีทางจำกัด retry เลย',
+      'delivery.timeout.ms ใช้กับ consumer เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'การพิสูจน์ด้านบนใช้ retries: 2 (สามครั้งรวม) แทนที่จะเป็นเส้นตายตามเวลา; การจับคู่ SLA แบบ delivery.timeout.ms ใน KafkaJS ต้องตั้ง retries กับ maxRetryTime ร่วมกันอย่างตั้งใจ',
   },
   {
     q: 'tradeoff หลักเมื่อเพิ่มระดับ acks คืออะไร',
@@ -114,6 +307,7 @@ export const quizAcks = [
       'consumer เร็วขึ้นแต่ producer ช้าลง',
     ],
     answer: 0,
+    explain: 'ทุกระดับ acks ที่แข็งขึ้นรอเครื่องมากขึ้นและ network round trip มากขึ้นก่อนจะถือว่า send สำเร็จ ซึ่งคือ latency ที่มากขึ้นแน่นอนแลกกับ durability ที่มากขึ้นแน่นอน',
   },
 ];
 
