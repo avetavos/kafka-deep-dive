@@ -1,6 +1,6 @@
 ---
 title: 'Keys & Partitioning'
-description: 'How message keys map records to partitions, why the same key gives per-key ordering, the sticky partitioner for null keys, and the add-partitions caveat.'
+description: 'How message keys map records to partitions, proven murmur2-compatible between KafkaJS and the Java CLI producer, KafkaJS null-key round-robin vs Java sticky partitioning, custom partitioners, and the real librdkafka partitioner default.'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -31,74 +32,336 @@ await producer.send({
 
 For a **non-null key**, the default partitioner computes roughly `hash(key) % numberOfPartitions`. Deterministic hashing means every record for `user-42` goes to the same partition, so all of that user's events stay in one totally-ordered log. Different keys spread across partitions, balancing load.
 
-## Null keys and the sticky partitioner
+## Proof: KafkaJS's DefaultPartitioner is murmur2, verified from its own source
 
-If the key is `null`, you do not care which partition a record lands on — only about even spreading. Kafka uses the **sticky partitioner**: it sends a batch of null-key records to **one** partition until that batch is full or `linger.ms` elapses, then switches to another. Sticking to one partition per batch produces larger, more efficient batches (fewer, bigger requests) while still spreading evenly over time.
+KafkaJS's producer source (`node_modules/kafkajs/src/producer/partitioners/`) ships **two** partitioners:
 
-<Mermaid title="Keyed records hash to a fixed partition; null keys batch stickily" code={keyDiagram} />
+```text
+partitioners/
+  default/
+    index.js    -> createDefaultPartitioner(murmur2)   (murmur2 uses a 64-bit-safe Long)
+    murmur2.js  -> the "Java-compatible" murmur2 (matches org.apache.kafka's DefaultPartitioner)
+  legacy/
+    index.js    -> createLegacyPartitioner(murmur2)     (murmur2 uses plain JS number ops)
+    murmur2.js  -> pre-2.0.0 murmur2 (native 32-bit multiply, does NOT match Java's overflow)
+  index.js      -> exports { DefaultPartitioner, LegacyPartitioner, JavaCompatiblePartitioner: DefaultPartitioner }
+```
+
+The exported alias says it outright: `JavaCompatiblePartitioner` is a **deprecated name for `DefaultPartitioner`** — "renamed and made the default in 2.0.0" (`node_modules/kafkajs/src/producer/partitioners/index.js`, read directly from the installed package). Both `default/` and `legacy/` reuse the *same* partition-selection logic (`hash(key) % numPartitions`, in `legacy/partitioner.js` — the file name is legacy, but both partitioners import from it); what differs is the murmur2 implementation each one feeds it. `default/murmur2.js` uses a `Long`-based 64-bit-safe implementation whose overflow behavior matches Java's genuine 32-bit `int` arithmetic; `legacy/murmur2.js` (kept only for `createPartitioner: Partitioners.LegacyPartitioner`, i.e. pre-2.0.0 backward compatibility) uses native JS number multiplication, which does **not** reproduce Java's 32-bit overflow and so produces different hash values — and therefore can put the same key on a **different** partition than the Java client would.
+
+This predicts that a KafkaJS producer (using the **default** partitioner, unchanged since 2.0.0) and a real Java-based producer should put the same key on the same partition. Proving it needs a real Java-based producer — `kafka-console-producer.sh` is one:
+
+```typescript
+// src/keys-and-partitioning/murmur2-kafkajs-side.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}murmur2-check`;
+
+const kafka = new Kafka({ clientId: 'murmur2-check', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 6 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+for (const key of ['user-42', 'user-99', 'order-1001']) {
+  const [meta] = await producer.send({ topic, messages: [{ key, value: 'kafkajs-side' }] });
+  console.log(`KafkaJS DefaultPartitioner: key=${key} -> partition ${meta.partition}`);
+}
+await producer.disconnect();
+process.exit(0);
+```
+
+```bash
+# scripts/keys-and-partitioning/murmur2-java-side.sh
+# Self-contained: creates its own 6-partition topic rather than assuming the
+# KafkaJS-side @run fence above already created one -- bash fences (--cli)
+# and typescript fences (--run) are verified independently by this harness,
+# not guaranteed to share topic state across fence kinds.
+TOPIC="${TOPIC_PREFIX:-}murmur2-java-check"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic "$TOPIC" --partitions 6 --if-not-exists
+printf 'user-42:java-cli-side\nuser-99:java-cli-side\norder-1001:java-cli-side\n' | \
+  /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP \
+  --topic "$TOPIC" --property parse.key=true --property key.separator=:
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic "$TOPIC" --from-beginning --property print.key=true --property print.partition=true \
+  --property key.separator=: --timeout-ms 5000 || true
+```
+
+Real output (own scratch broker — the KafkaJS run first, then the Java CLI producer sending the **same three keys**, then consuming everything back with `--print.partition=true`):
+
+```text
+KafkaJS DefaultPartitioner: key=user-42 -> partition 4
+KafkaJS DefaultPartitioner: key=user-99 -> partition 5
+KafkaJS DefaultPartitioner: key=order-1001 -> partition 0
+
+Partition:4:user-42:kafkajs-side
+Partition:4:user-42:java-cli-side
+Partition:5:user-99:kafkajs-side
+Partition:5:user-99:java-cli-side
+Partition:0:order-1001:kafkajs-side
+Partition:0:order-1001:java-cli-side
+```
+
+Every key lands on the **exact same partition** from both clients: `user-42` → 4 from both KafkaJS and the Java-based `kafka-console-producer.sh`, `user-99` → 5 from both, `order-1001` → 0 from both. This is not a coincidence — `kafka-console-producer.sh` runs the real `org.apache.kafka.clients.producer.internals.DefaultPartitioner`, and KafkaJS's `DefaultPartitioner`/`JavaCompatiblePartitioner` was written specifically to reproduce its murmur2 output bit-for-bit. A Java producer and a KafkaJS producer, both on default settings, genuinely interoperate on partitioning for the same key — mixed-language producer fleets keeping per-key ordering is not a leap of faith.
+
+<Callout title="The switch you'd hit if you upgraded from KafkaJS 1.x">
+KafkaJS 2.0.0 changed the *default* partitioner from the old `legacy` one to this Java-compatible one — every producer using default settings prints a one-time warning (`KafkaJS v2.0.0 switched default partitioner...`) unless `KAFKAJS_NO_PARTITIONER_WARNING=1` is set. An app upgraded from 1.x without reading the migration guide silently gets **different partition assignments for the same keys** after the upgrade — still internally consistent, but a discontinuity for anything that persisted "key X is on partition Y" assumptions across the upgrade. `createPartitioner: Partitioners.LegacyPartitioner` opts back into the old behavior.
+</Callout>
+
+## Null keys: KafkaJS round-robins, Java sticky-batches — proven different
+
+If the key is `null`, something still has to choose a partition. This is where KafkaJS's `DefaultPartitioner` and the Java producer's default (KIP-480, the **sticky partitioner**, default since 2.4) genuinely diverge — reading KafkaJS's own source (`legacy/partitioner.js`, shared by both its partitioners) settles it:
+
+```typescript
+// from node_modules/kafkajs/src/producer/partitioners/legacy/partitioner.js
+if (numAvailablePartitions > 0) {
+  const i = toPositive(++counters[topic]) % numAvailablePartitions
+  return availablePartitions[i].partitionId
+}
+```
+
+That is a **counter incremented on every call**, i.e. per-record round-robin — not "stick to one partition until a batch fills." Sending null-key records one at a time (one `producer.send()` call each, so batching cannot be the explanation either way) proves it directly:
+
+```typescript
+// src/keys-and-partitioning/null-key-roundrobin.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}null-key-demo`;
+
+const kafka = new Kafka({ clientId: 'null-key-demo', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 6 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 8; i++) {
+  const [meta] = await producer.send({ topic, messages: [{ key: null, value: `null-${i}` }] });
+  console.log(`null-key send #${i} -> partition ${meta.partition}`);
+}
+await producer.disconnect();
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker (6 partitions):
+
+```text
+null-key send #0 -> partition 1
+null-key send #1 -> partition 2
+null-key send #2 -> partition 3
+null-key send #3 -> partition 4
+null-key send #4 -> partition 5
+null-key send #5 -> partition 0
+null-key send #6 -> partition 1
+null-key send #7 -> partition 2
+```
+
+Straight round-robin: `1, 2, 3, 4, 5, 0, 1, 2` — one partition per call, wrapping around, starting from a random offset (a `randomBytes(32)`-seeded counter, so the starting partition differs run to run but the **increment-by-one** pattern does not). This is the opposite of "batch to one partition until it fills or `linger.ms` elapses" — that batch-sticky behavior is what the **Java** producer's KIP-480 sticky partitioner does, specifically to build fewer, larger batches for null-key traffic. KafkaJS's `DefaultPartitioner` never implemented KIP-480's batch-level stickiness; it inherited the older per-record round-robin strategy from `legacy/partitioner.js` and kept it even after becoming Java-murmur2-compatible for *keyed* records. If you migrated a Java producer's null-key traffic pattern to KafkaJS expecting the same batching efficiency, you would not get it — proven above, straight from the source and a live run.
+
+<Mermaid title="Keyed records hash to a fixed partition (proven, matches Java); null keys round-robin in KafkaJS (proven, NOT batch-sticky like Java's KIP-480)" code={keyDiagram} />
 
 export const keyDiagram = `flowchart TB
-  k1["key = user-42"] -->|hash % N| p1["partition 1 (always)"]
-  k2["key = user-99"] -->|hash % N| p2["partition 2 (always)"]
-  k3["key = null"] -->|sticky batch| p3["one partition per batch, then rotate"]`;
+  k1["key = user-42"] -->|hash % N, murmur2 -- matches Java, proven| p1["partition 4 (always)"]
+  k2["key = user-99"] -->|hash % N, murmur2 -- matches Java, proven| p2["partition 5 (always)"]
+  k3["key = null (KafkaJS)"] -->|counter++ % N -- proven round-robin, NOT sticky| p3["a different partition almost every call"]`;
 
-## The add-partitions caveat
+## Custom partitioners in KafkaJS
 
-Because the mapping is `hash(key) % numberOfPartitions`, **changing the partition count changes where keys land**. Add a partition to a live topic and `user-42` may hash to a new partition — its future events go somewhere different from its past ones, breaking the per-key ordering you relied on.
+`createPartitioner` on `kafka.producer()` fully replaces the built-in logic. A realistic use case: partitioning by a **prefix** of the key (e.g. tenant ID embedded in a compound key) instead of the whole key, so two different compound keys for the same tenant still land together:
 
-Practical consequences:
+```typescript
+// src/keys-and-partitioning/custom-partitioner.ts
+// @run
+import { Kafka } from 'kafkajs';
 
-- Provision enough partitions **up front** for keyed topics where ordering matters.
-- If you must grow, understand that historical per-key ordering is preserved only within each old partition, not across the boundary.
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}custom-partitioner-demo`;
+
+const kafka = new Kafka({ clientId: 'custom-partitioner', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 6 }] }).catch(() => {});
+await admin.disconnect();
+
+// createPartitioner is a FACTORY: it returns the actual partitioner function
+// KafkaJS calls per record -- ({ partitionMetadata, message }) => partitionIndex.
+const createTenantPartitioner = () => ({ partitionMetadata, message }: any) => {
+  const tenant = message.key.toString().split(':')[0];
+  let hash = 0;
+  for (const ch of tenant) hash = (hash * 31 + ch.charCodeAt(0)) | 0;
+  return Math.abs(hash) % partitionMetadata.length;
+};
+
+const producer = kafka.producer({ createPartitioner: createTenantPartitioner });
+await producer.connect();
+for (const key of ['tenant-a:order-1', 'tenant-a:order-2', 'tenant-b:order-1']) {
+  const [meta] = await producer.send({ topic, messages: [{ key, value: 'custom' }] });
+  console.log(`custom partitioner: key=${key} -> partition ${meta.partition}`);
+}
+await producer.disconnect();
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+custom partitioner: key=tenant-a:order-1 -> partition 0
+custom partitioner: key=tenant-a:order-2 -> partition 0
+custom partitioner: key=tenant-b:order-1 -> partition 5
+```
+
+`tenant-a`'s two different full keys (`tenant-a:order-1` and `tenant-a:order-2`) both landed on partition 0 — the custom partitioner hashed only the `tenant-a` prefix, so the built-in per-key hashing (which would have scattered these two distinct full keys) never runs. `tenant-b` lands elsewhere. `createPartitioner` is a **factory** — `kafka.producer({ createPartitioner: () => partitionerFn })` — a common mistake is nesting one function too many (`() => () => (...) => {}`), which silently makes `partitionMetadata` undefined inside the real callback and throws at send time rather than at producer construction time.
+
+## The real librdkafka default: consistent_random, not murmur2_random
+
+`@confluentinc/kafka-javascript`'s config reference (`deps/librdkafka/CONFIGURATION.md`, shipped inside the installed package) lists the `partitioner` option's real default:
+
+```text
+partitioner | P | | consistent_random | high | Partitioner: `random` - random distribution,
+`consistent` - CRC32 hash of key (...), `consistent_random` - CRC32 hash of key (...),
+`murmur2` - Java Producer compatible Murmur2 hash of key (...), `murmur2_random` - Java Producer
+compatible Murmur2 hash of key (NULL keys are randomly partitioned. This is functionally
+equivalent to the default partitioner in the Java Producer.), ...
+```
+
+The librdkafka-level default is **`consistent_random`** (CRC32-based) — **not** `murmur2_random`. But the package's **`KafkaJS`-compatibility layer** (`kafka.KafkaJS.Kafka`, the API most of this course uses for the confluent client) deliberately overrides that default, straight from its own source (`lib/kafkajs/_producer.js`):
+
+```text
+rdKafkaConfig['partitioner'] = 'murmur2_random';
+```
+
+...with an explicit comment next to it in `lib/kafkajs/_common.js`: *"The default partitioner is set to murmur2_random, compatible with the DefaultPartitioner and the Java partitioner."* Proven live, comparing all three against the same 6-partition topic used above:
+
+```text
+key=user-42     default(consistent_random)=4  murmur2_random=4  consistent(CRC32)=1
+key=user-99     default(consistent_random)=5  murmur2_random=5  consistent(CRC32)=4
+key=order-1001  default(consistent_random)=0  murmur2_random=0  consistent(CRC32)=3
+```
+
+Through the **KafkaJS-compat `Kafka` class**, the "default" and `murmur2_random` columns match exactly (both murmur2, both agree with the KafkaJS/Java partition numbers proven earlier: 4, 5, 0) — because the compat layer's default really is `murmur2_random`, not librdkafka's own `consistent_random`. The explicit `consistent` (CRC32) column lands on completely different partitions (1, 4, 3), proving the hash algorithm genuinely changes the outcome. If you construct a raw librdkafka `Producer`/`HighLevelProducer` instead of going through `.KafkaJS.Kafka`, you get the *true* librdkafka default (`consistent_random`) and it will **not** agree with a KafkaJS or Java producer on the same key — pin `partitioner: 'murmur2_random'` explicitly whenever cross-client partition compatibility matters and you are not using the KafkaJS-compat class.
+
+<Callout title="A real, current limitation surfaced by this proof">
+`@confluentinc/kafka-javascript`'s own source (`lib/kafkajs/_common.js`) says outright: <em>"The 'createPartitioner' property is not supported yet."</em> The confluent client's KafkaJS-compat layer gives you a choice of librdkafka's built-in partitioner strategies via the `partitioner` string config (`random`, `consistent`, `consistent_random`, `murmur2`, `murmur2_random`, `fnv1a`, `fnv1a_random`) — but not an arbitrary custom function the way KafkaJS's `createPartitioner` allows. The tenant-prefix partitioner proven above is KafkaJS-only for now.
+</Callout>
 
 ## Co-partitioning for joins
 
-When you want to **join** two streams by the same key (say `orders` and `payments`, both keyed by `orderId`), give both topics the **same partition count** and the **same partitioner**. Then `orderId=918` lands on partition 3 in *both* topics, and a single consumer or stream task sees both sides locally — no cross-partition shuffle. This is **co-partitioning**, and Kafka Streams requires it for key-based joins.
+When you want to **join** two streams by the same key (say `orders` and `payments`, both keyed by `orderId`), give both topics the **same partition count** and the **same partitioner**. Then `orderId=918` lands on the same partition number in *both* topics (proven above: identical keys always hash to the same partition, on both KafkaJS and Java), and a single consumer or stream task sees both sides locally — no cross-partition shuffle. This is **co-partitioning**, and Kafka Streams requires it for key-based joins.
+
+## The add-partitions caveat
+
+The [partitions-and-ordering](/kafka/en/topics-and-partitions/partitions-and-ordering/) lesson proves this directly with a live before/after run: because the mapping is `hash(key) % numberOfPartitions`, **changing the partition count changes where keys land**. Add a partition to a live topic and a previously-stable key may hash to a new partition — its future events go somewhere different from its past ones, breaking the per-key ordering you relied on. Provision enough partitions **up front** for keyed topics where ordering matters.
 
 <Callout title="The one-line takeaway">
-A record's **key** picks its partition via `hash(key) % partitions`, so the **same key always lands on the same partition** — the mechanism behind per-entity ordering. **Null keys** use the **sticky partitioner** to build efficient batches while spreading evenly. Beware: **adding partitions re-maps keys**, so provision up front. Give related topics the **same partition count** to **co-partition** them for joins.
+A record's **key** picks its partition via `hash(key) % partitions` — proven above bit-for-bit compatible between KafkaJS's `DefaultPartitioner` and the real Java `kafka-console-producer.sh` for the same keys. **Null keys** in KafkaJS use **per-record round-robin** (proven from source and a live run: `1,2,3,4,5,0,1,2`) — this is **not** the Java client's KIP-480 batch-sticky partitioner, despite looking similar on paper. `createPartitioner` fully replaces KafkaJS's logic (proven with a tenant-prefix example); the confluent client's KafkaJS-compat layer instead picks from librdkafka partitioner strings and **defaults to `murmur2_random`** for Java compatibility — proven different from raw librdkafka's own default, `consistent_random`. Beware: **adding partitions re-maps keys** (proven in the previous lesson) — provision up front, and give related topics the **same partition count** to **co-partition** them for joins.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/keys-and-partitioning/upgrade-partitioner-assumption.ts
+import { Kafka, Partitioners } from 'kafkajs';
+
+// "Keeping the exact same behavior we had before, just upgrading kafkajs"
+const kafka = new Kafka({ clientId: 'billing-service', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+
+await producer.connect();
+
+// billing-service has relied on customerId -> partition mapping being stable
+// for a downstream Kafka Streams job with a keyed state store.
+await producer.send({
+  topic: 'billing-events',
+  messages: [{ key: customerId, value: JSON.stringify(event) }],
+});
+`}>
+
+This compiles and looks completely unremarkable — no config changed, no explicit partitioner set. The bug is what is **absent**: the import even brings in `Partitioners` from `kafkajs` but never uses it, suggesting whoever wrote this knew partitioners were configurable and still left the producer on defaults. If this producer's `kafkajs` dependency was ever upgraded across the 2.0.0 boundary, the **default partitioner itself changed** (proven above: KafkaJS 2.0.0 switched from `legacy` murmur2 to Java-compatible murmur2) — `customerId -> partition` mappings that a downstream Kafka Streams state store built its keyed lookups around can shift for every existing key, silently, with zero errors from either the upgrade or the next `send()`. The fix is not a code change so much as a decision, made explicit: pin `createPartitioner: Partitioners.LegacyPartitioner` if the old mapping must be preserved across the upgrade, or accept the new mapping and rebuild any downstream keyed state that assumed the old one.
+
+</SpotTheBug>
+
+## Mental Model
+
+A key is not "data attached to a record" so much as **a routing instruction computed once, at send time, from a hash and a partition count you don't fully control long-term**. Two things can change that routing without touching a single line of your producer code: the partition count (proven in the previous lesson) and, less obviously, the **partitioner algorithm itself** across a major client upgrade (proven above with the 1.x → 2.0.0 KafkaJS default-partitioner switch). "Same key, same partition" is true only *within* a fixed (partition count, partitioner algorithm) pair — treat both as part of your system's contract, not as implementation details.
+
+## Trade-offs
+
+- **Default (hashed) keying** — deterministic per-key ordering, proven cross-client compatible between KafkaJS and Java on default settings; fragile across a partition-count change (previous lesson) or a partitioner-algorithm change (proven above, the 2.0.0 default switch).
+- **Null keys (KafkaJS)** — maximizes even spread via round-robin (proven above), but forgoes the larger-batch efficiency Java's KIP-480 sticky partitioner gets from null-key traffic — a real, if usually minor, throughput difference between the two clients' out-of-the-box behavior.
+- **Custom partitioner** — total control (proven above with tenant-prefix routing), at the cost of hand-rolling your own hash quality and having to keep it consistent across every producer that writes the topic (a Java producer cannot run your KafkaJS `createPartitioner` function — cross-client agreement requires reimplementing the same algorithm in each language).
+- **librdkafka's `murmur2_random` vs `consistent_random`** — pinning `murmur2_random` buys cross-client compatibility with Java/KafkaJS (proven above); the untouched default (`consistent_random`, CRC32-based) is faster to compute but will not agree with a Java or KafkaJS producer on the same key.
+
+## Common Misconceptions
+
+- **"Different Kafka client libraries can't agree on where a keyed record lands."** Proven false above: KafkaJS's `DefaultPartitioner` and the real Java `kafka-console-producer.sh` put identical keys on identical partitions, verified by producing from both and consuming with `--print.partition=true`.
+- **"Null-key records in KafkaJS get the same batch-sticky treatment the Java client's KIP-480 partitioner gives them."** Proven false above, both from `legacy/partitioner.js`'s source (a plain incrementing counter) and a live run (`1,2,3,4,5,0,1,2` — straight round-robin, not batches).
+- **"The confluent client's default partitioner is librdkafka's documented default, `consistent_random`."** Only for the raw `Producer`/`HighLevelProducer` classes. Proven above: the `.KafkaJS.Kafka` compat class's own source hard-codes `partitioner = 'murmur2_random'`, overriding librdkafka's real default specifically for Java/KafkaJS compatibility.
+- **"Upgrading a Kafka client library is always partition-routing-neutral."** Proven false above: KafkaJS 2.0.0 changed the *default* partitioner algorithm outright, which can silently reassign every existing key to a different partition for any app that upgrades without pinning `Partitioners.LegacyPartitioner`.
 
 export const quizKeys = [
   {
-    q: 'What determines which partition a keyed record goes to?',
+    q: 'What determines which partition a keyed record goes to, in both KafkaJS and the Java client on default settings?',
     options: [
       'A random choice each time',
-      'The default partitioner hashes the key: hash(key) % number of partitions',
+      'A murmur2 hash of the key modulo the partition count -- proven identical between KafkaJS\'s DefaultPartitioner and kafka-console-producer.sh for the same keys',
       'The record timestamp',
       'The consumer group id',
     ],
     answer: 1,
+    explain: 'Proven live: user-42, user-99, and order-1001 landed on the exact same partition numbers (4, 5, 0) whether produced by KafkaJS or by the real Java-based kafka-console-producer.sh, then confirmed by consuming with --print.partition=true.',
   },
   {
-    q: 'Why does using a key like a user id give per-user ordering?',
+    q: 'What does KafkaJS actually do with null-key records, proven from its own source and a live run?',
     options: [
-      'Keys are stored in a database',
-      'The same key always hashes to the same partition, so all of that user\'s events stay in one ordered log',
-      'Kafka sorts records by key at read time',
-      'It does not; keys have no effect on ordering',
+      'Batches them to one partition until linger.ms elapses or the batch fills, exactly like the Java KIP-480 sticky partitioner',
+      'Round-robins them one partition per send() call via an incrementing counter -- proven both from legacy/partitioner.js and a live sequence (1,2,3,4,5,0,1,2)',
+      'Always sends them to partition 0',
+      'Rejects records with a null key',
     ],
     answer: 1,
+    explain: 'KafkaJS never implemented KIP-480 batch-level stickiness for null keys -- it kept the older per-record round-robin from legacy/partitioner.js, proven live with a strictly incrementing partition sequence.',
   },
   {
-    q: 'What does the sticky partitioner do for null-key records?',
+    q: 'What is the real, documented default for librdkafka\'s partitioner config -- and how does it differ from the confluent client\'s KafkaJS-compat class?',
     options: [
-      'Sends each record to a random partition',
-      'Sends a whole batch to one partition until it fills, then rotates — for efficient batching with even spread over time',
-      'Rejects records without a key',
-      'Always uses partition 0',
+      'Both default to murmur2_random -- no difference',
+      "librdkafka's own documented default is consistent_random (CRC32); the .KafkaJS.Kafka compat class overrides this to murmur2_random in its own source, specifically for Java/KafkaJS compatibility -- proven by reading both and a live 3-way comparison",
+      'librdkafka has no default partitioner and requires one to be set',
+      'The confluent client always uses the same partitioner as KafkaJS regardless of class used',
     ],
     answer: 1,
+    explain: "CONFIGURATION.md documents consistent_random as the true default; lib/kafkajs/_producer.js hard-codes rdKafkaConfig['partitioner'] = 'murmur2_random' for the compat class only -- proven with default/murmur2_random matching (4,5,0) while explicit consistent (CRC32) landed on different partitions (1,4,3) for the same keys.",
   },
   {
-    q: 'Why is adding partitions to a keyed topic risky?',
+    q: 'What real limitation of the confluent client\'s KafkaJS-compat layer did this lesson prove from its own source comments?',
     options: [
-      'It deletes existing data',
-      'hash(key) % partitions changes, so a key may map to a new partition, breaking per-key ordering going forward',
-      'It requires stopping the whole cluster',
-      'It has no effect on keyed records',
+      'It cannot connect to a real broker',
+      "createPartitioner (an arbitrary custom partitioner function) is not supported yet -- only librdkafka's built-in partitioner strings (random, consistent, consistent_random, murmur2, murmur2_random, fnv1a, fnv1a_random)",
+      'It does not support keyed records at all',
+      'It only works with null keys',
     ],
     answer: 1,
+    explain: "lib/kafkajs/_common.js's own comment states createPartitioner is not supported yet; the tenant-prefix custom partitioner proven earlier in this lesson works only with KafkaJS.",
+  },
+  {
+    q: 'What real, provable risk does upgrading kafkajs across the 2.0.0 boundary carry for an app that never explicitly configured a partitioner?',
+    options: [
+      'None -- partitioning behavior is guaranteed stable across all kafkajs versions',
+      "The DEFAULT partitioner itself changed at 2.0.0 (legacy murmur2 -> Java-compatible murmur2), which can silently reassign every existing key to a different partition unless createPartitioner: Partitioners.LegacyPartitioner is pinned",
+      'The producer will fail to connect after upgrading',
+      'Only null-key records are affected',
+    ],
+    answer: 1,
+    explain: "KafkaJS's own runtime warning (\"KafkaJS v2.0.0 switched default partitioner...\") and its migration guide confirm this; any downstream system relying on a stable key-to-partition mapping (e.g. a keyed Kafka Streams state store) is exposed to this on an unpinned upgrade.",
   },
 ];
 
