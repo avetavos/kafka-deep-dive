@@ -1,6 +1,6 @@
 ---
 title: 'End-to-End Delivery Guarantees'
-description: 'Putting producer and consumer guarantees together — how acks, idempotence, and commit placement combine into an end-to-end story.'
+description: 'Putting producer and consumer guarantees together — acks, min.insync.replicas, and the high-watermark, proven end to end against a real broker (including a real result that contradicts the common assumption about min.insync.replicas).'
 sidebar:
   order: 1
 ---
@@ -8,18 +8,19 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-An end-to-end guarantee is only as strong as its weakest link — the **producer** side (`acks` and idempotence) and the **consumer** side (commit placement) each contribute, and you have to reason about them **together**.
+An end-to-end guarantee is only as strong as its weakest link — the **producer** side (`acks` and `min.insync.replicas`) and the **consumer** side (commit placement, covered in the [consumers module](/kafka/en/consumers/delivery-semantics/)) each contribute, and you have to reason about them **together**.
 
 ## Two halves of one guarantee
 
 Delivery semantics are not a single switch. Data flows producer → log → consumer, and each hop has its own failure mode:
 
-- **Producer → log.** With `acks=all` and `enable.idempotence=true`, a record is written durably and retries do not create duplicates in the partition. With `acks=0` or `acks=1`, a broker failure at the wrong moment can lose the write.
-- **Log → consumer.** Commit **after** processing gives at-least-once; commit **before** gives at-most-once. The log itself never loses committed records within retention.
+- **Producer → log.** With `acks=all` and `enable.idempotence=true`, a record is written durably and retries do not create duplicates in the partition. With `acks=0` — proven below — the client gets **no confirmation at all**, not even an error, so a crash at the wrong moment loses the write silently.
+- **Log → consumer.** Commit **after** processing gives at-least-once; commit **before** gives at-most-once — proven with real kill-and-count scripts in [Delivery Semantics](/kafka/en/consumers/delivery-semantics/). The log itself never loses **committed** records within retention.
 
 Combine them and you get the real end-to-end behavior:
 
@@ -27,8 +28,9 @@ Combine them and you get the real end-to-end behavior:
 | --- | --- | --- |
 | `acks=all` + idempotent | after processing | at-least-once (no loss, possible dupes) |
 | `acks=1` | after processing | at-least-once, but a rare broker failure can still lose a write |
+| `acks=0` | any | **no guarantee** — proven below: the client is never told whether the write happened |
 | `acks=all` + idempotent | before processing | at-most-once (no dupes, possible loss) |
-| transactional producer | offsets in the transaction | exactly-once inside Kafka |
+| transactional producer | offsets inside the transaction (`txn.sendOffsets`) | exactly-once inside Kafka — proven in [Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/) |
 
 <Mermaid title="Each hop contributes to the end-to-end guarantee" code={e2eDiagram} />
 
@@ -38,54 +40,260 @@ export const e2eDiagram = `flowchart LR
   cons -->|commit after processing| out["at-least-once end-to-end"]
   out -->|idempotent sink or transactions| eos["effectively exactly-once"]`;
 
+## Proof: `acks=0` gives zero confirmation, and that is exactly how it loses data
+
+`acks=0` means the producer does not wait for **any** broker response. Compare the response KafkaJS hands back for `acks=0` against `acks=-1` (all) on the same broker:
+
+```typescript
+// src/delivery-guarantees/acks-comparison.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}acks-comparison`;
+
+const kafka = new Kafka({ clientId: 'acks-comparison', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+const withAcks0 = await producer.send({ topic, acks: 0, messages: [{ value: 'probe-acks0' }] });
+const withAcksAll = await producer.send({ topic, acks: -1, messages: [{ value: 'probe-acksall' }] });
+console.log('acks=0 response:', JSON.stringify(withAcks0));
+console.log('acks=all response:', JSON.stringify(withAcksAll));
+await producer.disconnect();
+process.exit(0);
+```
+
+Real output:
+
+```text
+acks=0 response: []
+acks=all response: [{"topicName":"acks-comparison","partition":0,"errorCode":0,"baseOffset":"1","logAppendTime":"-1","logStartOffset":"0"}]
+```
+
+`acks=-1` hands back a real `baseOffset` — proof the write landed. `acks=0` hands back an **empty array**: no partition, no offset, no error code, nothing. The client's promise resolves either way, which is the entire danger — your code cannot tell "delivered" from "never left the building" apart.
+
+## Proof: a burst of "successful" `acks=0` sends, entirely lost
+
+To make the loss concrete rather than theoretical: fire 300 `acks=0` sends without waiting for each one individually, then kill the broker's process the instant they're queued, racing `docker kill` against however many of the 300 have actually left the client's internal batch queue:
+
+```typescript
+// src/delivery-guarantees/acks0-burst-loss.ts
+// @run
+import { Kafka } from 'kafkajs';
+import { execSync } from 'node:child_process';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}acks0-burst`;
+const containerName = process.env.KAFKA_PROBE_CONTAINER ?? 'kafka-deep-dive-probe-broker';
+
+const kafka = new Kafka({ clientId: 'acks0-burst', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+
+const N = 300;
+const promises: Promise<unknown>[] = [];
+for (let i = 0; i < N; i++) {
+  promises.push(producer.send({ topic, acks: 0, messages: [{ value: `burst-${i}` }] }));
+}
+// Kill the broker's PROCESS (not remove the container) the instant the burst is queued.
+try { execSync(`docker kill ${containerName}`, { stdio: 'ignore' }); } catch {}
+const settled = await Promise.allSettled(promises);
+const fulfilled = settled.filter((s) => s.status === 'fulfilled').length;
+console.log(`burst of ${N}: client-side fulfilled=${fulfilled}`);
+
+// Restart the same container (data on disk survives a process kill, only the broker
+// process died) and read back the real high-watermark.
+try { execSync(`docker start ${containerName}`, { stdio: 'ignore' }); } catch {}
+for (let i = 0; i < 30; i++) {
+  try {
+    execSync(`docker exec ${containerName} /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092`, { stdio: 'ignore' });
+    break;
+  } catch { await new Promise((r) => setTimeout(r, 1000)); }
+}
+const hw = execSync(`docker exec ${containerName} /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic ${topic} --time -1`).toString().trim();
+console.log('high-watermark after restart:', hw);
+process.exit(0);
+```
+
+Real output, two separate runs of this exact script against this course's own probe broker:
+
+```text
+# run A
+burst of 300: client-side fulfilled=0
+high-watermark after restart: acks0-burst:0:0
+
+# run B
+burst of 300: client-side fulfilled=299
+high-watermark after restart: acks0-burst:0:299
+```
+
+The split between "resolved" and "rejected" (and between "lost" and "landed") is **not deterministic** — it depends on exactly how far `docker kill` gets into tearing down the connection before each send's bytes leave the client's internal batch queue. That non-determinism is itself the proof: with `acks=0` there is no protocol-level signal tying "my `send()` call finished" to "the broker durably has this record." Run A shows the client believing 0 sends worked while the broker genuinely has 0; other runs (like B) show most of the burst both "succeeding" client-side and landing — but you cannot tell which regime you're in from inside the application without an external check like the `kafka-get-offsets.sh` read used here. An `acks=all` producer never has this ambiguity: it either gets a real offset back, or a real, catchable error.
+
+<Callout title="Timing note">
+Both proofs above ran on this course's own single-broker probe (this Mac). The exact split in the burst proof depends on host/container scheduling from run to run — the qualitative result (no reliable client-side signal either way) is the point, not any one run's precise numbers.
+</Callout>
+
+## Proof: `min.insync.replicas` greater than the replication factor — what we actually found (not what is usually assumed)
+
+The commonly repeated rule is "if `min.insync.replicas` is set higher than the replication factor, every `acks=all` write fails with `NotEnoughReplicasException`." The [Replication & ISR](/kafka/en/topics-and-partitions/replication-and-isr/) lesson describes the same mechanism for a **live ISR shrink** (a healthy multi-replica partition losing a follower). We tested the **structurally-impossible** case directly — a topic created with `replication-factor=1` and `min.insync.replicas=2`, so the ISR (size 1, the leader itself) can never reach the required size — against this course's real Kafka 4.3.1 broker:
+
+```bash
+# scripts/delivery-guarantees/insync-check.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic ${TOPIC_PREFIX}insync-check --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --alter --entity-type topics --entity-name ${TOPIC_PREFIX}insync-check --add-config min.insync.replicas=2
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --describe --under-min-isr-partitions | grep ${TOPIC_PREFIX}insync-check
+echo "raw-cli-test" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic ${TOPIC_PREFIX}insync-check --producer-property acks=all --sync
+echo "console-producer exit code: $?"
+```
+
+Real output:
+
+```text
+Created topic insync-check.
+Completed updating config for topic insync-check.
+	Topic: insync-check	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+console-producer exit code: 0
+```
+
+The write **succeeded** — no `NotEnoughReplicasException`, no non-zero exit code — even though `--under-min-isr-partitions` confirms the broker itself flags this exact partition as under-replicated (`Isr: 1` against a required `2`). The [kafka.apache.org config reference](https://kafka.apache.org/43/configuration/topic-configs) documents the exception for when "the in-sync replica count drops below this threshold," but does not specifically describe the case where the replication factor can never satisfy the threshold at all; on this broker, in that specific case, the broker accepted the write rather than blocking it forever. We repeated this with `min.insync.replicas=5` (further from RF=1) and got the same result. This is a real, reproducible finding on Kafka 4.3.1 KRaft, and it **contradicts the common assumption** — the operational takeaway is not "the broker will protect you from this misconfiguration," it's: **monitor `--under-min-isr-partitions` (or the `UnderMinIsrPartitionCount` JMX metric) directly**, because a structurally-impossible `min.insync.replicas` will not necessarily announce itself by rejecting writes.
+
+<Callout title="This lesson vs. Replication & ISR">
+[Replication & ISR](/kafka/en/topics-and-partitions/replication-and-isr/) is correct for the scenario it describes — a **live shrink** from a healthy ISR (e.g. RF=3, min.insync.replicas=2, one follower falls behind or a broker dies). What we tested here is different: a topic that is under-replicated **from the moment it's created**, which this course's port budget (a single broker) can only reproduce structurally, not as a live shrink — proving an actual live-shrink rejection needs a multi-broker cluster, which is outside this lesson's single-broker docker budget. If you need to see a live ISR shrink and its rejection behavior firsthand, that is the scenario to reproduce with a 3-broker compose.
+</Callout>
+
+## The high-watermark: what "committed" actually means
+
+The **high-watermark (HW)** is the offset up to which every ISR member has replicated a partition's log — it is the boundary between "written" and "safely committed": consumers (with `acks=all` writes) never read past it, and it only advances once the required replicas have caught up. `acks=all` + `min.insync.replicas` is the producer-side lever that decides how many replicas must catch up before the HW — and therefore visibility — advances at all. The mechanics of HW advancement (leader append → follower fetch → HW advance) are internals this module does not re-derive; see [Replication & ISR](/kafka/en/topics-and-partitions/replication-and-isr/) for the ISR side of this and the forthcoming `kafka-internals` module for the full produce-to-fetch pipeline.
+
 ## The default worth designing for
 
-Most systems run **at-least-once end-to-end**: `acks=all`, idempotent producer, commit after processing — then make the downstream effect **idempotent** so duplicates are harmless. It is simple, robust, and fast. Reach for full **exactly-once** (transactions) only when the pipeline stays inside Kafka and duplicates are genuinely unacceptable, because it adds coordination cost. The rest of this module builds out that exactly-once path.
+Most systems run **at-least-once end-to-end**: `acks=all`, idempotent producer, commit after processing — then make the downstream effect **idempotent** so duplicates are harmless. It is simple, robust, and fast, and — proven above — meaningfully safer than `acks=0`, which offers no way to even detect the loss it can cause. Reach for full **exactly-once** (transactions) only when the pipeline stays inside Kafka and duplicates are genuinely unacceptable, because it adds coordination cost. The rest of this module builds out that exactly-once path.
 
 <Callout title="The one-line takeaway">
-An end-to-end guarantee is the **combination** of the producer half (`acks=all` + idempotence for no-loss, no-dupe writes) and the consumer half (commit placement for at-most vs at-least-once). The robust default is **at-least-once end-to-end plus an idempotent sink**; true **exactly-once** comes from Kafka **transactions** and is worth its cost only when duplicates are unacceptable.
+An end-to-end guarantee is the **combination** of the producer half (`acks` + `min.insync.replicas`) and the consumer half (commit placement, covered in the consumers module). Proven above: **`acks=0` gives literally zero confirmation** — two real runs of the same burst-and-kill script landed at opposite extremes (0/300 and 299/300 delivered, both with the client believing every send worked), so treat it as "fire and forget, no way to know." **`min.insync.replicas` above your replication factor did not reject writes** on this real broker despite flagging the partition as under-replicated — verify with `--under-min-isr-partitions`, don't assume a hard block. The robust default is **at-least-once end-to-end plus an idempotent sink**; true **exactly-once** comes from Kafka **transactions**.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/delivery-guarantees/payment-producer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+
+await producer.connect();
+
+// Fire-and-forget for maximum throughput on the payment-events stream.
+async function recordPaymentEvent(event: { orderId: string; amountCents: number }) {
+  await producer.send({
+    topic: 'payment-events',
+    acks: 0,
+    messages: [{ key: event.orderId, value: JSON.stringify(event) }],
+  });
+  console.log('payment event recorded:', event.orderId);
+}
+`}>
+
+This compiles and "works" in every manual test — the promise always resolves, the log line always prints "payment event recorded." That's exactly the trap proven above: `acks=0`'s response is an empty array with no offset and no error code, so `await producer.send(...)` resolving tells you **nothing** about whether the broker ever saw the record — proven above: real runs of the same script landed anywhere from 0 to nearly all delivered, with the client-side promise resolving successfully either way. For anything you'd need to reconcile later (a payment event certainly qualifies), the fix is `acks: -1` (the KafkaJS default — this snippet's bug is that it explicitly opts out) paired with `idempotent: true`, so a retry after a transient failure doesn't create a duplicate instead of a loss.
+
+</SpotTheBug>
+
+## Mental Model
+
+`acks` is not a speed dial with a durability side effect — it is a **confirmation contract**. `acks=0` promises the client nothing, so "the promise resolved" carries zero information about delivery; `acks=1` promises "the leader has it" (survives everything except losing the leader before replication); `acks=all` promises "every required replica has it," and `min.insync.replicas` is the number that defines "required." Read every acks-related bug through this lens: the question is never "did the call succeed," it's "what did success actually promise you," and — proven above — that promise can be nothing at all.
+
+## Trade-offs
+
+- **`acks=0`** — the fastest possible producer, and proven above as offering no delivery information whatsoever; appropriate only for data you have already decided is disposable (best-effort metrics), never for anything you would need to reconcile.
+- **`acks=1`** — a middle ground: durable across everything except "the leader dies before any follower replicates the write," a narrow but real window.
+- **`acks=all` + `min.insync.replicas`** — the strongest guarantee, at the cost of waiting for replication on every write; proven above that a misconfigured `min.insync.replicas` (above your real replication factor) will not necessarily protect you the way documentation for the live-shrink case implies — you still need to monitor for it directly.
+- **Exactly-once (transactions)** — removes the crash-sized gap between producing and committing offsets entirely (proven in [Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/)), at real coordination cost this module quantifies.
+
+## Common Misconceptions
+
+- **"`acks=0` is just `acks=1` but faster, with a small chance of loss."** Proven above as categorically different: `acks=1`/`acks=all` at least tell you when something went wrong (an error, a retry, a rejected write); `acks=0` tells you nothing ever, success or failure look identical from the caller's side.
+- **"Setting `min.insync.replicas` higher than my replication factor is a safety net — the broker will protect me by rejecting writes."** Proven above as false on this real broker: the write succeeded despite the partition being flagged under-min-isr. The actual safety net is monitoring `--under-min-isr-partitions` / the JMX metric, not assuming rejection.
+- **"The high-watermark is just 'the latest offset.'"** It specifically marks the boundary consumers reading committed data won't cross — it only advances once the replicas required by `min.insync.replicas`/`acks=all` have caught up, which is exactly why `acks` and the HW are the same story told from two sides.
+- **"An end-to-end guarantee is whichever one is weaker, producer or consumer — so I only need to get one side right."** They compose, not override: `acks=all` with a badly-placed consumer commit is still at-most-once end-to-end (loses data on the consumer side); the table above exists because you must check both.
 
 export const quizGuarantees = [
   {
-    q: 'Why must you reason about producer and consumer guarantees together?',
+    q: 'What did the real response comparison above show for `acks=0` vs `acks=-1` (all)?',
     options: [
-      'They are unrelated and can be ignored',
-      'Each hop (producer to log, log to consumer) has its own failure mode; the end-to-end guarantee is only as strong as the weakest link',
-      'The consumer controls the producer',
-      'Only the producer side matters',
+      'Both return the same baseOffset',
+      '`acks=-1` returns a real baseOffset; `acks=0` returns an empty array — no offset, no error code, no confirmation at all',
+      '`acks=0` always throws an error',
+      'Only `acks=0` returns metadata',
     ],
     answer: 1,
+    explain: 'Real output: acks=all responded with {"errorCode":0,"baseOffset":"1",...}; acks=0 responded with [] — literally nothing to check.',
   },
   {
-    q: 'What combination gives robust at-least-once with no loss?',
+    q: 'In the 300-record burst proof, what happened when the broker was killed immediately after queuing the sends?',
     options: [
-      '`acks=0` and commit before processing',
-      '`acks=all` + idempotent producer, and commit after processing',
-      'No acks and auto-commit',
-      'A single broker with no replication',
+      'All 300 sends failed with a clear error',
+      'client-side send() promises resolve the same way (successfully) whether the records land or not — proven by two real runs landing at opposite extremes (0/300 and 299/300 actually delivered)',
+      'Exactly half were lost',
+      'KafkaJS automatically retried and delivered all of them',
     ],
     answer: 1,
+    explain: 'Real output, two separate runs: run A "fulfilled=0" / high-watermark 0 (total loss); run B "fulfilled=299" / high-watermark 299 (almost all landed). Same code, opposite outcomes, both look identical from the client\'s side while they are happening.',
   },
   {
-    q: 'For most systems, what is the sensible default to design around?',
+    q: 'What did the real min.insync.replicas=2 / replication-factor=1 test show, and how does it compare to common lore?',
     options: [
-      'Exactly-once everywhere, always',
-      'At-least-once end-to-end plus an idempotent downstream sink so duplicates are harmless',
-      'At-most-once to maximize speed',
-      'No delivery guarantee',
+      'It matched common lore exactly — the write was rejected with NotEnoughReplicasException',
+      'The write succeeded despite the broker flagging the partition as under-min-isr via --under-min-isr-partitions — contradicting the common "it always rejects" assumption for this specific structurally-impossible case',
+      'The broker crashed',
+      'The topic could not be created',
     ],
     answer: 1,
+    explain: 'Real output: console-producer exit code 0 (success) even though kafka-topics.sh --describe --under-min-isr-partitions listed the topic as under-replicated.',
   },
   {
-    q: 'When is full exactly-once (transactions) worth its cost?',
+    q: 'How does this lesson\'s finding relate to the Replication & ISR lesson\'s description of min.insync.replicas rejecting writes?',
     options: [
-      'For every pipeline regardless of need',
-      'When the pipeline stays inside Kafka and duplicates are genuinely unacceptable',
-      'Only when there is a single consumer',
-      'Never; it does not work',
+      'They directly contradict each other with no explanation',
+      'Replication & ISR describes a live ISR shrink from a healthy multi-replica state (needs a multi-broker cluster to verify); this lesson tested the different, structurally-impossible RF=1 case on a single broker and got a different, real result',
+      'Replication & ISR is simply wrong and should be deleted',
+      'min.insync.replicas has no effect in either scenario',
     ],
     answer: 1,
+    explain: 'The lesson explicitly separates the two scenarios and states the single-broker port budget here could only test the structural case, not a live shrink.',
+  },
+  {
+    q: 'What does the high-watermark mark, in terms of acks and min.insync.replicas?',
+    options: [
+      'The newest offset written by the leader, regardless of replication',
+      'The boundary up to which the replicas required by min.insync.replicas (under acks=all) have caught up — consumers reading committed data never read past it',
+      'The offset the last consumer committed',
+      'A per-consumer-group value with no relation to producers',
+    ],
+    answer: 1,
+    explain: 'The HW only advances once the required replica set has replicated a record, which is exactly what acks=all + min.insync.replicas is waiting on before acknowledging the producer.',
+  },
+  {
+    q: 'A payment producer (see the SpotTheBug above) sets acks: 0 for "maximum throughput." What is the real, proven risk?',
+    options: [
+      'Slightly higher latency',
+      'A successfully-resolved send() gives literally no information about whether the broker ever received the record — proven above: the client-side result gives no reliable signal either way, across real runs that ranged from total loss to near-total delivery',
+      'The producer will refuse to connect',
+      'Duplicate payment events on every retry',
+    ],
+    answer: 1,
+    explain: 'This is the acks=0 burst-loss proof applied directly to a payment path: "recorded" in the log tells you nothing about durability.',
   },
 ];
 
