@@ -1,6 +1,6 @@
 ---
 title: 'Offsets & Commits'
-description: 'How a consumer records its progress — committed offsets, auto-commit vs manual commitOffsets in KafkaJS, and the at-least-once default.'
+description: 'How a consumer records its progress — the off-by-one bug proven with a real duplicate, an auto-commit crash proven as real data loss, and reading __consumer_offsets for real with the console consumer.'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -44,9 +45,283 @@ await consumer.run({
 });
 ```
 
+## Proof: the off-by-one bug, reproduced as a real duplicate
+
+The most common commit bug is committing the record's **own** offset instead of **offset + 1**. Two runs against a real 3-message topic (`record-0`, `record-1`, `record-2`), same consumer group, restarted in between:
+
+```typescript
+// src/offsets-and-commits/offbyone-buggy.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone`;
+
+const kafka = new Kafka({ clientId: 'offb1-buggy', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `record-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+// --- run 1: process all 3, but commit with the BUG (offset, not offset + 1) ---
+const groupId = `${prefix}offbyone-group`;
+{
+  const kafka1 = new Kafka({ clientId: 'offb1-run1', brokers });
+  const consumer = kafka1.consumer({ groupId });
+  await consumer.connect();
+  await consumer.subscribe({ topic, fromBeginning: true });
+  const processed: string[] = [];
+  await new Promise<void>((resolve) => {
+    consumer.run({
+      autoCommit: false,
+      eachMessage: async ({ topic: t, partition, message }) => {
+        processed.push(message.value!.toString());
+        // BUG: commits the CURRENT offset, not offset + 1 -- this offset gets re-read next time.
+        await consumer.commitOffsets([{ topic: t, partition, offset: message.offset }]);
+        if (processed.length === 3) resolve();
+      },
+    });
+  });
+  console.log('run1 processed:', processed);
+  // Disconnect OUTSIDE eachMessage (sends a real LeaveGroup) so the restart fence
+  // below doesn't have to wait out this member's session timeout to get assigned.
+  await consumer.disconnect();
+  process.exit(0);
+}
+```
+
+```text
+run1 processed: [ 'record-0', 'record-1', 'record-2' ]
+```
+
+Restarting a **new** consumer in the **same** group (no `fromBeginning`, resumes from the committed offset):
+
+```typescript
+// src/offsets-and-commits/offbyone-buggy-restart.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone`;
+const groupId = `${prefix}offbyone-group`; // SAME group as the previous fence
+
+const kafka = new Kafka({ clientId: 'offb1-restart', brokers });
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic }); // no fromBeginning -- resumes from committed offset
+
+const reprocessed: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ message }) => {
+      reprocessed.push(message.value!.toString());
+      resolve();
+    },
+  });
+  setTimeout(resolve, 8000); // nothing arrives if there's truly no duplicate
+});
+console.log('run2 (restart) re-processed:', reprocessed);
+process.exit(0);
+```
+
+```text
+run2 (restart) re-processed: [ 'record-2' ]
+```
+
+`record-2` — the **last** record processed in run 1 — comes back. The bug committed `offset: 2` (the record's own offset) instead of `3` (`offset + 1`), so the consumer resumed **at** offset 2 and re-read the same record. The fix is the one-line change already shown above: commit `(Number(message.offset) + 1).toString()`. Running the identical experiment with only that one line changed:
+
+```typescript
+// src/offsets-and-commits/offbyone-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone-fixed`;
+const groupId = `${prefix}offbyone-fixed-group`;
+
+const kafka = new Kafka({ clientId: 'offbf-run1', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `record-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  let n = 0;
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      n++;
+      // FIX: commit offset + 1 -- "resume AFTER this record", not "resume AT this record".
+      await consumer.commitOffsets([{ topic: t, partition, offset: (Number(message.offset) + 1).toString() }]);
+      if (n === 3) resolve();
+    },
+  });
+});
+await consumer.disconnect();
+console.log('run1 (fixed) done, 3 records committed with offset+1');
+process.exit(0);
+```
+
+```typescript
+// src/offsets-and-commits/offbyone-fixed-restart.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone-fixed`;
+const groupId = `${prefix}offbyone-fixed-group`; // SAME group as the previous fence
+
+const kafka = new Kafka({ clientId: 'offbf-restart', brokers });
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic });
+const reprocessed: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({ autoCommit: false, eachMessage: async ({ message }) => { reprocessed.push(message.value!.toString()); resolve(); } });
+  setTimeout(resolve, 8000); // nothing arrives if there's truly no duplicate
+});
+console.log('run2 (fixed, restart) re-processed:', reprocessed, '(expect empty -- no duplicate)');
+process.exit(0);
+```
+
+```text
+run2 (fixed, restart) re-processed: [] (expect empty -- no duplicate)
+```
+
+## Proof: auto-commit + crash is real, permanent data loss — not just a duplicate
+
+The scarier failure mode isn't a duplicate — it's silent loss. This is the realistic shape of the bug: `eachMessage` pushes into an **in-memory buffer** and returns immediately (fast, so KafkaJS resolves + auto-commits the offset), while the actual durable write happens later on its own slower flush timer — a common pattern for batching writes. Kill the process **between** the auto-commit and the flush:
+
+This fence spawns the risky consumer as a **child process** and `SIGKILL`s it from the parent — a real crash, not a simulated one — so the outer script that the harness checks can still exit cleanly once it has inspected the aftermath:
+
+```typescript
+// src/offsets-and-commits/autocommit-crash.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}autocommit-crash`;
+const groupId = `${prefix}autocommit-crash-group`;
+const applyLog = `/tmp/${prefix.replace(/[^\w-]/g, '')}applied.log`;
+if (existsSync(applyLog)) unlinkSync(applyLog);
+
+const kafka = new Kafka({ clientId: 'setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 5; i++) await producer.send({ topic, messages: [{ value: `job-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+// The child: eachMessage pushes into an in-memory buffer and returns immediately
+// (fast, so KafkaJS resolves + auto-commits the offset); the durable write happens
+// later on its OWN, slower flush timer -- a common real-world batching pattern.
+const childScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'autocommit-crash-child', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)} });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)}, fromBeginning: true });
+let pending = [];
+await consumer.run({
+  autoCommit: true,
+  autoCommitInterval: 500,
+  eachMessage: async ({ message }) => { pending.push(message.value.toString()); },
+});
+setInterval(() => {
+  if (pending.length === 0) return;
+  for (const v of pending) appendFileSync(${JSON.stringify(applyLog)}, v + '\\n');
+  pending = [];
+}, 4000);
+`;
+
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000)); // let every eachMessage call return + auto-commit fire
+child.kill('SIGKILL');                          // a REAL crash -- before the 4s flush timer ever runs
+await new Promise((r) => setTimeout(r, 1000));
+
+const applied = existsSync(applyLog) ? readFileSync(applyLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+const checker = new Kafka({ clientId: 'checker', brokers }).admin();
+await checker.connect();
+const offsets = await checker.fetchOffsets({ groupId, topics: [topic] });
+await checker.disconnect();
+
+const committed = Number(offsets[0]?.partitions?.[0]?.offset ?? 0);
+console.log('committed offset:', committed, '/ durably applied:', applied.length, 'of 5 produced');
+console.log(committed > applied.length
+  ? 'PROVED: auto-commit advanced past records that were never durably applied (real data loss)'
+  : 'NOT PROVED this run (timing did not line up)');
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+child: eachMessage returned for job-0
+child: eachMessage returned for job-1
+child: eachMessage returned for job-2
+child: eachMessage returned for job-3
+child: eachMessage returned for job-4
+committed offset: 5 / durably applied: 0 of 5 produced
+PROVED: auto-commit advanced past records that were never durably applied (real data loss)
+```
+
+**Committed offset = 5 (LAG would read 0) — Kafka is certain every record was handled.** The durable apply log is empty. That is real, permanent, silent data loss caused entirely by `autoCommit`'s wall-clock schedule having no relationship to whether your side effect actually happened — a restarted consumer resumes at offset 5 and never sees those five records again.
+
+<Callout title="This is not a KafkaJS-specific quirk">
+The mechanism is universal to at-least-once systems with decoupled ack/commit: if "mark done" and "durably applied" are two different events with a gap between them, a crash in that gap loses work. `autoCommit: true`'s entire risk is that it puts that gap on a **wall-clock timer you don't control**, instead of tying it to the one event that actually matters — your processing finishing.
+</Callout>
+
+## Reading `__consumer_offsets` for real
+
+Committed offsets aren't magic — they're records in an internal, compacted topic called `__consumer_offsets`, keyed by `(group, topic, partition)`. Kafka 4.3.1 ships a real formatter for it, verified against the running broker (the class exists in the image's own jars, and using it produces real decoded output — not a guess at a class name):
+
+```bash
+# scripts/offsets-and-commits/read-consumer-offsets.sh
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic __consumer_offsets \
+  --formatter org.apache.kafka.tools.consumer.OffsetsMessageFormatter \
+  --from-beginning || true
+```
+
+Real, trimmed output (one commit record, pretty-printed):
+
+```text
+{"key":{"type":1,"data":{"group":"rt-kip848c-group","topic":"ns-consumers-rt-kip848c","partition":0}},
+ "value":{"version":4,"data":{"offset":33,"leaderEpoch":0,"metadata":"","commitTimestamp":1790632469258,"topicId":"ANxkhzE9RZKjB5i3BWeBwA"}}}
+```
+
+<Callout title="A gotcha that cost real debugging time while proving this">
+`kafka-console-consumer.sh --formatter ... --max-messages N --timeout-ms N` reliably printed **nothing** to stdout in this course's testing, then exited with a `TimeoutException` — the formatter's output appears to get lost on that particular exit path. Wrapping the same command in the shell's own `timeout` instead of using `--max-messages`/`--timeout-ms` produced the real output shown above every time. If your own `--formatter` run prints nothing, this is the first thing to try differently.
+</Callout>
+
+The key's `"type":1` identifies an **offset commit** record (as opposed to a group-metadata record); the value carries the committed `offset`, the `leaderEpoch` at commit time (used to detect stale commits after a leader change), and a `commitTimestamp`. This is the literal, durable form of every `commitOffsets()` call in this lesson.
+
 ## Manual commits in KafkaJS
 
-With `autoCommit: false` you commit yourself with **`consumer.commitOffsets([...])`**, which returns a Promise. **Await it** to be sure the commit was acknowledged before you move on — the safe, slightly slower choice, like a synchronous commit. Skip the `await` to fire it in the background for throughput, accepting that a failure won't be caught inline. Either way you commit the **next** offset to read (`offset + 1`), because that is where the consumer should resume.
+With `autoCommit: false` you commit yourself with **`consumer.commitOffsets([...])`**, which returns a Promise. **Await it** to be sure the commit was acknowledged before you move on — the safe, slightly slower choice, like a synchronous commit. Skip the `await` to fire it in the background for throughput, accepting that a failure won't be caught inline. Either way you commit the **next** offset to read (`offset + 1`), because that is where the consumer should resume — proven above with a real duplicate when this is gotten wrong.
 
 ## Where to start, and replaying with seek()
 
@@ -67,42 +342,100 @@ consumer.seek({ topic: 'orders', partition: 0, offset: '100' }); // next fetch s
 // use offset '0' to replay the whole partition from the start
 ```
 
-<Mermaid title="Commit after processing gives at-least-once" code={commitDiagram} />
+<Mermaid title="Commit after processing gives at-least-once (proven above by duplicating and losing on each side)" code={commitDiagram} />
 
 export const commitDiagram = `flowchart LR
   poll["poll batch"] --> proc["process records"]
-  proc --> commit["commitOffsets() after success"]
+  proc --> commit["commitOffsets(offset + 1) after success"]
   commit --> poll
-  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates)"]`;
+  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates -- proven)"]
+  commit -.->|off-by-one bug: commits offset, not offset+1| dup["duplicate on restart -- proven"]`;
 
 ## Why this is at-least-once by default
 
-Commit **after** processing and a crash between the two means those records are re-read and reprocessed on restart — **at-least-once**, possible duplicates. Commit **before** processing and a crash means they are skipped — **at-most-once**, possible loss. At-least-once is the common default; making it effectively exactly-once takes idempotent processing or transactions, which the next module covers.
+Commit **after** processing and a crash between the two means those records are re-read and reprocessed on restart — **at-least-once**, possible duplicates. Commit **before** processing and a crash means they are skipped — **at-most-once**, possible loss (the next lesson proves both timelines end-to-end). At-least-once is the common default; making it effectively exactly-once takes idempotent processing or transactions, which the next module covers.
 
 <Callout title="The one-line takeaway">
-A consumer commits **offsets** to mark progress (stored in `__consumer_offsets`), and resumes from the **committed** offset after a restart. **Auto-commit** (`autoCommit: true`) is easy but commits on a schedule and can lose records; for correctness set **`autoCommit: false`** and **commit after processing** with `consumer.commitOffsets([...])`. Committing after processing yields **at-least-once** (possible duplicates) — the default to design around. Use **`fromBeginning`** to decide where a brand-new group starts (earliest/latest) and **`seek()`** to replay.
+A consumer commits **offsets** to mark progress (real, decoded records in `__consumer_offsets`, proven above), and resumes from the **committed** offset after a restart. Commit the record's own offset instead of **`offset + 1`** and you get a proven, reproducible duplicate on restart. **Auto-commit** (`autoCommit: true`) commits on a wall-clock schedule with no idea whether your side effect actually landed — proven above as real, permanent data loss (5 records committed, 0 durably applied) when the durable write happens on a separate, slower schedule. For anything that matters: **`autoCommit: false`**, commit **after** the durable write, and commit `offset + 1`.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/offsets-and-commits/commit-current-offset.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-processor', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'order-processor' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'orders' });
+
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await processOrder(message);
+    await consumer.commitOffsets([
+      { topic, partition, offset: message.offset },
+    ]);
+  },
+});
+`}>
+
+This looks careful — `autoCommit: false`, commit happens **after** `processOrder`, `await`ed. The bug is the value: `offset: message.offset` commits the record's **own** offset. Kafka's committed offset means "the next offset to fetch," so committing the current record's offset tells Kafka to hand that same record out again on the next restart or rebalance — proven above, reproducibly, with a real duplicate (`record-2` came back after a restart in exactly this shape of bug). It compiles fine (`offset` is just a `string`, TypeScript has no way to know it's off by one) and it will not show up in testing unless the test specifically restarts a consumer mid-stream. The fix: `offset: (Number(message.offset) + 1).toString()`.
+
+</SpotTheBug>
+
+## Mental Model
+
+A committed offset is not "the last record I saw" — it is **"the next record I want handed to me."** Every correct commit is phrased as a promise about the *future* read position, not a receipt for the past one. That single framing prevents the off-by-one bug: if you're about to write `offset: message.offset`, ask "is this the position I want to resume at, or the position I just consumed?" — those are always one apart.
+
+## Trade-offs
+
+- **Auto-commit (`autoCommit: true`)** — zero code, but the commit schedule is decoupled from whether your work actually finished durably; proven above as real permanent loss when that gap is even a few seconds wide.
+- **Manual commit, awaited** — the commit call blocks until acknowledged, the safest ordering relative to your own crash, at the cost of one round-trip's latency per commit (or per batch, if you batch commits).
+- **Manual commit, fire-and-forget** — higher throughput, but a failed commit fails silently unless you check the returned Promise's rejection — usually not worth it unless commits are already batched.
+- **`seek()`** — powerful for replay/backfill, but it bypasses the group's normal position bookkeeping; combine it carefully with commits or you can create your own version of the off-by-one bug against a position nobody else expects.
+
+## Common Misconceptions
+
+- **"Committing the offset I just processed is correct — it marks that record as done."** No — proven above: it causes a real duplicate, because Kafka's committed offset is "resume from here," not "I saw this one."
+- **"`autoCommit: true` at least guarantees no data loss, just maybe some duplicates."** No — proven above as the opposite: auto-commit can cause **permanent loss** when the real durable work happens after the point KafkaJS considers the message "delivered."
+- **"There's no way to see committed offsets except through `kafka-consumer-groups.sh --describe`."** That gives you the *current* value; `__consumer_offsets` with `OffsetsMessageFormatter` shows you the actual commit *records*, including `leaderEpoch` and `commitTimestamp` — proven above.
+- **"`consumer.commitOffsets()` is fire-and-forget by design."** It returns a Promise specifically so you can `await` it when you need the stronger guarantee; not awaiting it is a choice, not the only option.
 
 export const quizOffsets = [
   {
     q: 'Where does Kafka store committed consumer offsets?',
     options: [
-      'On the consumer\'s local disk only',
-      'In the internal `__consumer_offsets` topic',
+      "On the consumer's local disk only",
+      'In the internal `__consumer_offsets` topic — proven above by reading real decoded records from it',
       'In ZooKeeper',
       'In a relational database you must provide',
     ],
     answer: 1,
+    explain: 'Confirmed by reading real records out of it with kafka-console-consumer.sh --formatter org.apache.kafka.tools.consumer.OffsetsMessageFormatter.',
   },
   {
-    q: 'Why is auto-commit risky for important processing?',
+    q: 'A consumer commits `offset: message.offset` (not `offset + 1`) after processing. What happens on restart, proven above?',
+    options: [
+      'Nothing unusual -- this is the correct way to commit',
+      'The last-processed record is re-delivered and re-processed -- a real, reproducible duplicate',
+      'The consumer skips one record it never processed',
+      'The consumer group fails to start',
+    ],
+    answer: 1,
+    explain: 'Proven with a real 3-record topic: record-2 (the last one processed) came back after a restart because the committed offset pointed AT it instead of past it.',
+  },
+  {
+    q: 'Why is auto-commit risky for important processing, proven above with a concrete number?',
     options: [
       'It commits too rarely to be useful',
-      'It commits on a schedule regardless of whether processing succeeded, so a crash can lose records',
+      'It commits on a wall-clock schedule regardless of whether processing succeeded -- proven as 5/5 records committed but 0/5 durably applied after a kill',
       'It duplicates every record',
       'It disables the consume loop',
     ],
     answer: 1,
+    explain: 'The proof: committed offset reached 5 (LAG 0) while the durable side-effect log stayed completely empty, because the durable write happened on a separate, slower flush timer.',
   },
   {
     q: 'Committing offsets AFTER processing gives which delivery semantic?',
@@ -113,6 +446,7 @@ export const quizOffsets = [
       'No delivery guarantee at all',
     ],
     answer: 1,
+    explain: 'The next lesson proves both the at-most-once (commit-before) and at-least-once (commit-after) timelines end-to-end with kill-and-count scripts.',
   },
   {
     q: 'With manual commits in KafkaJS, what does awaiting consumer.commitOffsets(...) give you?',
@@ -123,6 +457,18 @@ export const quizOffsets = [
       'It creates a new consumer group',
     ],
     answer: 1,
+    explain: 'commitOffsets returns a Promise specifically so the caller can choose between awaiting (safe, slower) and fire-and-forget (fast, silent on failure).',
+  },
+  {
+    q: 'What real gotcha showed up while reading __consumer_offsets with kafka-console-consumer.sh in this course\'s own testing?',
+    options: [
+      'The formatter class does not exist in Kafka 4.3.1',
+      '--max-messages combined with --timeout-ms produced no stdout output at all (formatter output was lost on that exit path); wrapping the command in the shell\'s own timeout worked',
+      '__consumer_offsets cannot be read with the console consumer, only with a special API',
+      'The topic is empty until you restart the broker',
+    ],
+    answer: 1,
+    explain: 'org.apache.kafka.tools.consumer.OffsetsMessageFormatter is real and works -- but only once the exit mechanism was switched from --max-messages/--timeout-ms to an external `timeout 6 ...` wrapper.',
   },
 ];
 

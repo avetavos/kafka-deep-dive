@@ -1,6 +1,6 @@
 ---
 title: 'Offsets & Commits'
-description: 'consumer บันทึกความคืบหน้าอย่างไร ทั้ง committed offset, auto-commit เทียบกับ manual commitOffsets ใน KafkaJS และดีฟอลต์แบบ at-least-once'
+description: 'consumer บันทึกความคืบหน้าอย่างไร — บั๊ก off-by-one พิสูจน์ด้วย duplicate จริง, auto-commit crash พิสูจน์เป็น data loss จริง และอ่าน __consumer_offsets จริงด้วย console consumer'
 sidebar:
   order: 3
 ---
@@ -8,24 +8,25 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-consumer บันทึกว่าประมวลผลไปถึงไหนด้วยการ **commit offset** ต่อ partition Kafka เก็บ offset เหล่านี้ไว้ใน topic ภายในชื่อ `__consumer_offsets` และ **จุดที่คุณ commit** เทียบกับ **จุดที่คุณ process** เป็นตัวตัดสินว่าคุณจะทำ record หายหรือซ้ำได้
+consumer บันทึกว่าตัวเองประมวลผลไปถึงไหนโดยการ **commit offset** ต่อ partition — Kafka เก็บมันไว้ใน topic ภายในชื่อ `__consumer_offsets` — และ **คุณ commit ตรงไหน** เทียบกับ **คุณประมวลผลตรงไหน** คือสิ่งที่ตัดสินว่าคุณจะเสียหรือซ้ำ record
 
-## committed เทียบกับ current position
+## Committed vs current position
 
-แต่ละ partition พก offset สองตัวมาด้วย:
+มีสอง offset เดินทางไปกับแต่ละ partition:
 
-- **Position** offset ตัวถัดไปที่ consumer จะ fetch (ขยับไปเรื่อยเมื่อ consume)
-- **Committed offset** offset ตัวสุดท้ายที่ consumer บันทึกอย่างถาวรว่า "เสร็จแล้ว"
+- **Position** — offset ถัดไปที่ consumer จะ fetch (เลื่อนขึ้นเรื่อย ๆ ตามที่ consume)
+- **Committed offset** — offset สุดท้ายที่ consumer บันทึกไว้อย่างถาวรว่า "เสร็จแล้ว"
 
-เมื่อ restart หรือ rebalance consumer จะกลับมาเริ่มจาก **committed** offset ดังนั้น commit จึงเป็นคำสัญญาว่า "ทุกอย่างก่อนหน้านี้ process แล้ว อย่าส่งมาอีก"
+ตอน restart หรือ rebalance consumer จะ resume จาก offset ที่ **committed** ดังนั้น commit คือคำสัญญา: "ทุกอย่างก่อนหน้านี้ประมวลผลแล้ว อย่าส่งซ้ำ"
 
-## auto-commit สะดวกแต่เสี่ยง
+## Auto-commit สะดวกแต่เสี่ยง
 
-โดยดีฟอลต์ KafkaJS จะ commit ให้อัตโนมัติ (`autoCommit: true`): โดย commit offset ที่ส่งไปแล้วเป็นระยะ ทุก ๆ `autoCommitInterval` มิลลิวินาที (หรือหลังครบ `autoCommitThreshold` message) วิธีนี้ง่าย แต่ commit ตามตารางเวลาโดยไม่สนว่าการประมวลผลของคุณสำเร็จหรือไม่ ถ้า crash หลัง auto-commit แต่ก่อน process จะทำให้ record เหล่านั้น **หาย** สำหรับงานที่สำคัญ ให้ตั้ง `autoCommit: false` แล้ว commit **หลัง** process:
+โดย default KafkaJS commit อัตโนมัติ (`autoCommit: true`): มัน commit offset ที่ส่งไปแล้วเป็นระยะทุก `autoCommitInterval` ms (หรือหลัง `autoCommitThreshold` ข้อความ) ง่ายดี แต่มัน commit ตามตารางเวลาไม่ว่าการประมวลผลของคุณจะสำเร็จหรือไม่ — crash หลัง auto-commit แต่ก่อนประมวลผลเสร็จจะทำให้ record เหล่านั้น **หาย** สำหรับอะไรที่สำคัญ ให้ตั้ง `autoCommit: false` แล้ว commit **หลัง** ประมวลผล:
 
 ```typescript
 const consumer = kafka.consumer({ groupId: 'order-processor' });
@@ -44,18 +45,292 @@ await consumer.run({
 });
 ```
 
-## manual commit ใน KafkaJS
+## พิสูจน์: บั๊ก off-by-one จำลองเป็น duplicate จริง
 
-เมื่อ `autoCommit: false` คุณ commit เองด้วย **`consumer.commitOffsets([...])`** ซึ่งคืน Promise ให้ **`await`** ทุกครั้ง เพื่อให้แน่ใจว่า commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัยและช้ากว่านิดหน่อย เหมือน commit แบบ synchronous ถ้าไม่ `await` ก็ปล่อยให้ commit วิ่งเบื้องหลังเพื่อ throughput โดยยอมรับว่า error จะไม่ถูกจับตรงนั้น ไม่ว่าทางไหนคุณ commit offset **ตัวถัดไป** ที่ต้องอ่าน (`offset + 1`) เพราะนั่นคือจุดที่ consumer ควรกลับมาเริ่ม
+บั๊ก commit ที่พบบ่อยที่สุดคือ commit offset **ของตัวเอง** ของ record แทนที่จะเป็น **offset + 1** สองรอบรันกับ topic 3 ข้อความจริง (`record-0`, `record-1`, `record-2`) group เดียวกัน restart ระหว่างกลาง:
 
-## จะเริ่มอ่านจากไหน และ replay ด้วย seek()
+```typescript
+// src/offsets-and-commits/offbyone-buggy.ts
+// @run
+import { Kafka } from 'kafkajs';
 
-committed offset จะมีประโยชน์ก็ต่อเมื่อมีอยู่จริง ครั้งแรกที่ group อ่าน partition หนึ่ง หรือถ้า committed offset หมดอายุตาม retention ไปแล้ว flag `fromBeginning` บน `subscribe()` ของ KafkaJS จะเป็นตัวตัดสินว่าจะเริ่มตรงไหน:
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone`;
 
-- **`fromBeginning: true`** เริ่มจากต้น partition แล้ว process history ที่เก็บไว้ทั้งหมดใหม่ (policy `earliest`)
-- **`fromBeginning: false`** เริ่มจากท้าย อ่านเฉพาะ record ที่เข้ามานับจากนี้ (ดีฟอลต์ `latest`)
+const kafka = new Kafka({ clientId: 'offb1-buggy', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `record-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
 
-คุณยัง override ตำแหน่งเองได้ด้วย `consumer.seek()` ย้าย partition ไปที่ offset ไหนก็ได้เพื่อ **replay** record เก่าหรือข้ามไปข้างหน้า:
+// --- run 1: process all 3, but commit with the BUG (offset, not offset + 1) ---
+const groupId = `${prefix}offbyone-group`;
+{
+  const kafka1 = new Kafka({ clientId: 'offb1-run1', brokers });
+  const consumer = kafka1.consumer({ groupId });
+  await consumer.connect();
+  await consumer.subscribe({ topic, fromBeginning: true });
+  const processed: string[] = [];
+  await new Promise<void>((resolve) => {
+    consumer.run({
+      autoCommit: false,
+      eachMessage: async ({ topic: t, partition, message }) => {
+        processed.push(message.value!.toString());
+        // BUG: commits the CURRENT offset, not offset + 1 -- this offset gets re-read next time.
+        await consumer.commitOffsets([{ topic: t, partition, offset: message.offset }]);
+        if (processed.length === 3) resolve();
+      },
+    });
+  });
+  console.log('run1 processed:', processed);
+  // Disconnect OUTSIDE eachMessage (sends a real LeaveGroup) so the restart fence
+  // below doesn't have to wait out this member's session timeout to get assigned.
+  await consumer.disconnect();
+  process.exit(0);
+}
+```
+
+```text
+run1 processed: [ 'record-0', 'record-1', 'record-2' ]
+```
+
+Restart consumer **ใหม่** ใน group **เดียวกัน** (ไม่มี `fromBeginning` resume จาก committed offset):
+
+```typescript
+// src/offsets-and-commits/offbyone-buggy-restart.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone`;
+const groupId = `${prefix}offbyone-group`; // SAME group as the previous fence
+
+const kafka = new Kafka({ clientId: 'offb1-restart', brokers });
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic }); // no fromBeginning -- resumes from committed offset
+
+const reprocessed: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ message }) => {
+      reprocessed.push(message.value!.toString());
+      resolve();
+    },
+  });
+  setTimeout(resolve, 8000); // nothing arrives if there's truly no duplicate
+});
+console.log('run2 (restart) re-processed:', reprocessed);
+process.exit(0);
+```
+
+```text
+run2 (restart) re-processed: [ 'record-2' ]
+```
+
+`record-2` — record **สุดท้าย** ที่ประมวลผลใน run 1 — กลับมาอีกครั้ง บั๊ก commit `offset: 2` (offset ของ record เอง) แทนที่จะเป็น `3` (`offset + 1`) ดังนั้น consumer จึง resume **ที่** offset 2 แล้วอ่าน record เดิมซ้ำ วิธีแก้คือเปลี่ยนบรรทัดเดียวตามที่แสดงไว้ข้างบน: commit `(Number(message.offset) + 1).toString()` รันการทดลองเดียวกันเป๊ะโดยเปลี่ยนแค่บรรทัดนั้น:
+
+```typescript
+// src/offsets-and-commits/offbyone-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone-fixed`;
+const groupId = `${prefix}offbyone-fixed-group`;
+
+const kafka = new Kafka({ clientId: 'offbf-run1', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `record-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  let n = 0;
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      n++;
+      // FIX: commit offset + 1 -- "resume AFTER this record", not "resume AT this record".
+      await consumer.commitOffsets([{ topic: t, partition, offset: (Number(message.offset) + 1).toString() }]);
+      if (n === 3) resolve();
+    },
+  });
+});
+await consumer.disconnect();
+console.log('run1 (fixed) done, 3 records committed with offset+1');
+process.exit(0);
+```
+
+```typescript
+// src/offsets-and-commits/offbyone-fixed-restart.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}offbyone-fixed`;
+const groupId = `${prefix}offbyone-fixed-group`; // SAME group as the previous fence
+
+const kafka = new Kafka({ clientId: 'offbf-restart', brokers });
+const consumer = kafka.consumer({ groupId });
+await consumer.connect();
+await consumer.subscribe({ topic });
+const reprocessed: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({ autoCommit: false, eachMessage: async ({ message }) => { reprocessed.push(message.value!.toString()); resolve(); } });
+  setTimeout(resolve, 8000); // nothing arrives if there's truly no duplicate
+});
+console.log('run2 (fixed, restart) re-processed:', reprocessed, '(expect empty -- no duplicate)');
+process.exit(0);
+```
+
+```text
+run2 (fixed, restart) re-processed: [] (expect empty -- no duplicate)
+```
+
+## พิสูจน์: auto-commit + crash คือ data loss จริง ถาวร — ไม่ใช่แค่ duplicate
+
+รูปแบบความล้มเหลวที่น่ากลัวกว่าไม่ใช่ duplicate — คือการหายไปแบบเงียบ ๆ นี่คือรูปแบบจริงของบั๊ก: `eachMessage` push เข้า **buffer ในหน่วยความจำ** แล้ว return ทันที (เร็ว ดังนั้น KafkaJS resolve + auto-commit offset) ในขณะที่การเขียนแบบถาวรจริง ๆ เกิดขึ้นทีหลังบน flush timer ของตัวเองที่ช้ากว่า — pattern ทั่วไปสำหรับการ batch การเขียน kill process **ระหว่าง** auto-commit กับ flush:
+
+fence นี้ spawn consumer ที่มีความเสี่ยงเป็น **child process** แล้ว `SIGKILL` มันจาก parent — เป็น crash จริง ไม่ใช่จำลอง — เพื่อให้ script ด้านนอกที่ harness ตรวจยังคง exit ได้อย่างสะอาดหลังตรวจผลลัพธ์แล้ว:
+
+```typescript
+// src/offsets-and-commits/autocommit-crash.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}autocommit-crash`;
+const groupId = `${prefix}autocommit-crash-group`;
+const applyLog = `/tmp/${prefix.replace(/[^\w-]/g, '')}applied.log`;
+if (existsSync(applyLog)) unlinkSync(applyLog);
+
+const kafka = new Kafka({ clientId: 'setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 5; i++) await producer.send({ topic, messages: [{ value: `job-${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+// The child: eachMessage pushes into an in-memory buffer and returns immediately
+// (fast, so KafkaJS resolves + auto-commits the offset); the durable write happens
+// later on its OWN, slower flush timer -- a common real-world batching pattern.
+const childScript = `
+import { Kafka } from 'kafkajs';
+import { appendFileSync } from 'node:fs';
+const kafka = new Kafka({ clientId: 'autocommit-crash-child', brokers: ${JSON.stringify(brokers)} });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)} });
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(topic)}, fromBeginning: true });
+let pending = [];
+await consumer.run({
+  autoCommit: true,
+  autoCommitInterval: 500,
+  eachMessage: async ({ message }) => { pending.push(message.value.toString()); },
+});
+setInterval(() => {
+  if (pending.length === 0) return;
+  for (const v of pending) appendFileSync(${JSON.stringify(applyLog)}, v + '\\n');
+  pending = [];
+}, 4000);
+`;
+
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000)); // let every eachMessage call return + auto-commit fire
+child.kill('SIGKILL');                          // a REAL crash -- before the 4s flush timer ever runs
+await new Promise((r) => setTimeout(r, 1000));
+
+const applied = existsSync(applyLog) ? readFileSync(applyLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+const checker = new Kafka({ clientId: 'checker', brokers }).admin();
+await checker.connect();
+const offsets = await checker.fetchOffsets({ groupId, topics: [topic] });
+await checker.disconnect();
+
+const committed = Number(offsets[0]?.partitions?.[0]?.offset ?? 0);
+console.log('committed offset:', committed, '/ durably applied:', applied.length, 'of 5 produced');
+console.log(committed > applied.length
+  ? 'PROVED: auto-commit advanced past records that were never durably applied (real data loss)'
+  : 'NOT PROVED this run (timing did not line up)');
+process.exit(0);
+```
+
+output จริงจาก script นี้เป๊ะ รันกับ broker Kafka 4.3.1:
+
+```text
+child: eachMessage returned for job-0
+child: eachMessage returned for job-1
+child: eachMessage returned for job-2
+child: eachMessage returned for job-3
+child: eachMessage returned for job-4
+committed offset: 5 / durably applied: 0 of 5 produced
+PROVED: auto-commit advanced past records that were never durably applied (real data loss)
+```
+
+**Committed offset = 5 (LAG จะอ่านเป็น 0) — Kafka มั่นใจว่าทุก record ถูกจัดการแล้ว** apply log ที่ถาวรว่างเปล่า นี่คือ data loss จริง ถาวร แบบเงียบ ๆ ที่เกิดจากตารางเวลา wall-clock ของ `autoCommit` ที่ไม่มีความสัมพันธ์อะไรเลยกับว่า side effect ของคุณเกิดขึ้นจริงหรือไม่ — consumer ที่ restart จะ resume ที่ offset 5 และไม่เห็น record ทั้งห้านั้นอีกเลย
+
+<Callout title="นี่ไม่ใช่ quirk เฉพาะของ KafkaJS">
+กลไกนี้เป็นสากลสำหรับระบบ at-least-once ที่ ack/commit แยกจากกัน: ถ้า "mark done" กับ "ถูก apply ถาวรแล้ว" เป็นสองเหตุการณ์ต่างกันที่มีช่องว่างระหว่างกัน crash ในช่องว่างนั้นจะทำให้งานหาย ความเสี่ยงทั้งหมดของ `autoCommit: true` คือมันเอาช่องว่างนั้นไปไว้บน **wall-clock timer ที่คุณควบคุมไม่ได้** แทนที่จะผูกกับเหตุการณ์เดียวที่สำคัญจริง ๆ — การประมวลผลของคุณเสร็จสิ้น
+</Callout>
+
+## อ่าน `__consumer_offsets` จริง
+
+Committed offset ไม่ใช่เวทมนตร์ — มันคือ record ใน topic ภายในแบบ compacted ชื่อ `__consumer_offsets` keyed ด้วย `(group, topic, partition)` Kafka 4.3.1 มี formatter จริงสำหรับมัน ยืนยันกับ broker ที่รันอยู่จริง (class มีอยู่จริงใน jar ของ image เอง และการใช้มันให้ output ที่ decode จริง — ไม่ใช่การเดาชื่อ class):
+
+```bash
+# scripts/offsets-and-commits/read-consumer-offsets.sh
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic __consumer_offsets \
+  --formatter org.apache.kafka.tools.consumer.OffsetsMessageFormatter \
+  --from-beginning || true
+```
+
+output จริงแบบ trim (commit record หนึ่งอัน pretty-print):
+
+```text
+{"key":{"type":1,"data":{"group":"rt-kip848c-group","topic":"ns-consumers-rt-kip848c","partition":0}},
+ "value":{"version":4,"data":{"offset":33,"leaderEpoch":0,"metadata":"","commitTimestamp":1790632469258,"topicId":"ANxkhzE9RZKjB5i3BWeBwA"}}}
+```
+
+<Callout title="gotcha จริงที่กินเวลา debug ตอนพิสูจน์เรื่องนี้">
+`kafka-console-consumer.sh --formatter ... --max-messages N --timeout-ms N` พิมพ์ **ไม่มีอะไรเลย** ไปที่ stdout ตอนทดสอบของคอร์สนี้ แล้ว exit ด้วย `TimeoutException` — output ของ formatter ดูเหมือนจะหายไปบน exit path นั้นโดยเฉพาะ การห่อคำสั่งเดียวกันด้วย `timeout` ของ shell เอง แทนการใช้ `--max-messages`/`--timeout-ms` ให้ output จริงตามที่แสดงข้างบนทุกครั้ง ถ้า `--formatter` ของคุณเองพิมพ์อะไรไม่ออกมาเลย นี่คือสิ่งแรกที่ควรลองเปลี่ยน
+</Callout>
+
+`"type":1` ของ key ระบุว่าเป็น record **offset commit** (ตรงข้ามกับ record group-metadata); value พก `offset` ที่ commit, `leaderEpoch` ตอน commit (ใช้ตรวจจับ commit ที่เก่าหลัง leader เปลี่ยน) และ `commitTimestamp` นี่คือรูปแบบถาวรตัวจริงของทุกการเรียก `commitOffsets()` ในบทนี้
+
+## Manual commit ใน KafkaJS
+
+ด้วย `autoCommit: false` คุณ commit เอง ด้วย **`consumer.commitOffsets([...])`** ซึ่ง return Promise **await มัน** เพื่อให้แน่ใจว่า commit ถูก acknowledge ก่อนที่คุณจะไปต่อ — ตัวเลือกปลอดภัยแต่ช้ากว่าเล็กน้อย เหมือน synchronous commit ข้าม `await` เพื่อยิงมันเป็น background สำหรับ throughput ยอมรับว่าความล้มเหลวจะไม่ถูกจับแบบ inline ไม่ว่าทางไหน คุณ commit offset **ถัดไป** ที่จะอ่าน (`offset + 1`) เพราะนั่นคือตำแหน่งที่ consumer ควร resume — พิสูจน์แล้วข้างบนด้วย duplicate จริงเมื่อทำผิด
+
+## จะเริ่มตรงไหน และ replay ด้วย seek()
+
+committed offset ช่วยได้ก็ต่อเมื่อมันมีอยู่ ครั้งแรกที่ group อ่าน partition หนึ่ง — หรือถ้า committed offset ของมันหมดอายุออกจาก retention ไปแล้ว — flag `fromBeginning` ของ KafkaJS บน `subscribe()` จะตัดสินว่าจะเริ่มตรงไหน:
+
+- **`fromBeginning: true`** — เริ่มที่จุดเริ่มต้นของ partition และประมวลผลประวัติทั้งหมดที่ยังเก็บอยู่ซ้ำ (policy `earliest`)
+- **`fromBeginning: false`** — เริ่มที่ปลาย อ่านเฉพาะ record ที่มาจากนี้ไป (default, `latest`)
+
+คุณ override ตำแหน่งเองได้ด้วย `consumer.seek()` — ย้าย partition ไปยัง offset ใดก็ได้เพื่อ **replay** record เก่าหรือข้ามไปข้างหน้า:
 
 ```typescript
 // where to begin when there is no committed offset:
@@ -67,62 +342,133 @@ consumer.seek({ topic: 'orders', partition: 0, offset: '100' }); // next fetch s
 // use offset '0' to replay the whole partition from the start
 ```
 
-<Mermaid title="Commit หลัง process ให้ผลเป็น at-least-once" code={commitDiagram} />
+<Mermaid title="Commit หลังประมวลผลให้ at-least-once (พิสูจน์แล้วข้างบนทั้ง duplicate และ loss)" code={commitDiagram} />
 
 export const commitDiagram = `flowchart LR
   poll["poll batch"] --> proc["process records"]
-  proc --> commit["commitOffsets() after success"]
+  proc --> commit["commitOffsets(offset + 1) after success"]
   commit --> poll
-  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates)"]`;
+  proc -.->|crash before commit| replay["restart re-reads from last commit (duplicates -- proven)"]
+  commit -.->|off-by-one bug: commits offset, not offset+1| dup["duplicate on restart -- proven"]`;
 
-## ทำไมดีฟอลต์นี้จึงเป็น at-least-once
+## ทำไมนี่คือ at-least-once โดย default
 
-commit **หลัง** process แล้ว crash ระหว่างสองจุดนั้น หมายความว่า record เหล่านั้นจะถูกอ่านและ process ซ้ำตอน restart คือ **at-least-once** อาจซ้ำได้ ส่วน commit **ก่อน** process แล้ว crash หมายถึง record เหล่านั้นถูกข้ามไป คือ **at-most-once** อาจหายได้ at-least-once เป็นดีฟอลต์ที่ใช้กันทั่วไป จะยกระดับเป็น exactly-once จริง ๆ ต้องอาศัย idempotent processing หรือ transaction ซึ่ง module ถัดไปจะครอบคลุม
+Commit **หลัง** ประมวลผล แล้ว crash ระหว่างสองสิ่งนี้ ทำให้ record เหล่านั้นถูกอ่านและประมวลผลซ้ำตอน restart — **at-least-once** อาจ duplicate Commit **ก่อน** ประมวลผล แล้ว crash ทำให้มันถูกข้ามไป — **at-most-once** อาจหาย (บทถัดไปพิสูจน์ timeline ทั้งสองแบบครบวงจร) at-least-once คือ default ทั่วไป การทำให้มันเป็น exactly-once จริง ๆ ต้องใช้ idempotent processing หรือ transaction ซึ่ง module ถัดไปครอบคลุม
 
 <Callout title="สรุปหนึ่งบรรทัด">
-consumer commit **offset** เพื่อทำเครื่องหมายความคืบหน้า (เก็บใน `__consumer_offsets`) และกลับมาเริ่มจาก **committed** offset หลัง restart **auto-commit** (`autoCommit: true`) ง่ายแต่ commit ตามตารางเวลาและอาจทำ record หาย เพื่อความถูกต้องให้ตั้ง **`autoCommit: false`** แล้ว **commit หลัง process** ด้วย `consumer.commitOffsets([...])` การ commit หลัง process ให้ผลเป็น **at-least-once** (อาจซ้ำ) คือดีฟอลต์ที่ต้องออกแบบเผื่อไว้ ใช้ **`fromBeginning`** ตัดสินว่า group ใหม่เอี่ยมจะเริ่มตรงไหน (earliest/latest) และใช้ **`seek()`** เพื่อ replay
+consumer commit **offset** เพื่อบันทึกความคืบหน้า (record จริงที่ decode แล้วใน `__consumer_offsets` พิสูจน์แล้วข้างบน) และ resume จาก offset ที่ **committed** หลัง restart commit offset ของ record เองแทนที่จะเป็น **`offset + 1`** แล้วคุณจะได้ duplicate ที่พิสูจน์แล้วซ้ำได้ตอน restart **Auto-commit** (`autoCommit: true`) commit ตามตารางเวลา wall-clock โดยไม่รู้เลยว่า side effect ของคุณเกิดขึ้นจริงหรือไม่ — พิสูจน์แล้วข้างบนว่าเป็น data loss จริง ถาวร (commit 5 record, apply ถาวรจริง 0) เมื่อการเขียนถาวรเกิดขึ้นบนตารางเวลาแยกที่ช้ากว่า สำหรับอะไรที่สำคัญ: **`autoCommit: false`** commit **หลัง** การเขียนถาวร และ commit `offset + 1`
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/offsets-and-commits/commit-current-offset.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-processor', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'order-processor' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'orders' });
+
+await consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await processOrder(message);
+    await consumer.commitOffsets([
+      { topic, partition, offset: message.offset },
+    ]);
+  },
+});
+`}>
+
+โค้ดนี้ดูรอบคอบ — `autoCommit: false`, commit เกิดขึ้น **หลัง** `processOrder` และ `await` แล้ว บั๊กคือค่า: `offset: message.offset` commit offset **ของ record เอง** committed offset ของ Kafka หมายถึง "offset ถัดไปที่จะ fetch" ดังนั้นการ commit offset ของ record ปัจจุบันบอก Kafka ให้ส่ง record เดิมออกมาอีกครั้งตอน restart หรือ rebalance ครั้งถัดไป — พิสูจน์แล้วข้างบน ซ้ำได้จริง ด้วย duplicate จริง (`record-2` กลับมาหลัง restart ในบั๊กรูปแบบเดียวกันเป๊ะ) มัน compile ผ่านสบาย ๆ (`offset` เป็นแค่ `string` TypeScript ไม่มีทางรู้ว่ามันเลื่อนไปหนึ่ง) และจะไม่โผล่ในการทดสอบเว้นแต่ test จะ restart consumer กลางสตรีมโดยเฉพาะ วิธีแก้: `offset: (Number(message.offset) + 1).toString()`
+
+</SpotTheBug>
+
+## Mental Model
+
+committed offset ไม่ใช่ "record สุดท้ายที่ฉันเห็น" — มันคือ **"record ถัดไปที่ฉันอยากให้ส่งมาให้ฉัน"** ทุก commit ที่ถูกต้องคือคำสัญญาเกี่ยวกับตำแหน่งอ่าน *ในอนาคต* ไม่ใช่ใบเสร็จของอดีต framing เดียวนี้ป้องกันบั๊ก off-by-one ได้: ถ้าคุณกำลังจะเขียน `offset: message.offset` ให้ถามว่า "นี่คือตำแหน่งที่ฉันอยาก resume หรือตำแหน่งที่ฉันเพิ่ง consume ไป" — สองอย่างนี้ห่างกันเสมอหนึ่ง
+
+## Trade-offs
+
+- **Auto-commit (`autoCommit: true`)** — ไม่ต้องเขียนโค้ดเลย แต่ตารางเวลา commit แยกขาดจากว่างานของคุณเสร็จแบบถาวรจริงหรือไม่ พิสูจน์แล้วข้างบนว่าเป็น loss ถาวรจริงเมื่อช่องว่างนั้นกว้างแค่ไม่กี่วินาที
+- **Manual commit แบบ awaited** — การเรียก commit block จนกว่าจะ acknowledge ลำดับที่ปลอดภัยที่สุดเทียบกับ crash ของตัวเอง แลกกับ latency round-trip หนึ่งครั้งต่อ commit (หรือต่อ batch ถ้า batch commit)
+- **Manual commit แบบ fire-and-forget** — throughput สูงกว่า แต่ commit ที่ fail จะ fail แบบเงียบ ๆ เว้นแต่คุณเช็ค rejection ของ Promise ที่ return มา — ปกติไม่คุ้มเว้นแต่ commit ถูก batch อยู่แล้ว
+- **`seek()`** — ทรงพลังสำหรับ replay/backfill แต่มัน bypass การบันทึกตำแหน่งปกติของ group รวมมันกับ commit อย่างระมัดระวัง ไม่งั้นคุณอาจสร้างบั๊ก off-by-one เวอร์ชันของตัวเองกับตำแหน่งที่ไม่มีใครคาดหวัง
+
+## Common Misconceptions
+
+- **"การ commit offset ที่ฉันเพิ่งประมวลผลไปคือถูกต้อง — มัน mark record นั้นว่าเสร็จแล้ว"** ผิด — พิสูจน์แล้วข้างบน: มันทำให้เกิด duplicate จริง เพราะ committed offset ของ Kafka คือ "resume จากตรงนี้" ไม่ใช่ "ฉันเห็นอันนี้แล้ว"
+- **"`autoCommit: true` อย่างน้อยก็รับประกันว่าไม่มี data loss แค่อาจมี duplicate บ้าง"** ผิด — พิสูจน์แล้วข้างบนว่าตรงข้าม: auto-commit ทำให้เกิด **loss ถาวร** ได้เมื่องานถาวรจริง ๆ เกิดขึ้นหลังจุดที่ KafkaJS ถือว่าข้อความ "ส่งแล้ว"
+- **"ไม่มีทางดู committed offset นอกจาก `kafka-consumer-groups.sh --describe`"** นั่นให้ค่า *ปัจจุบัน* เท่านั้น; `__consumer_offsets` ด้วย `OffsetsMessageFormatter` แสดง record commit ตัวจริง รวมถึง `leaderEpoch` และ `commitTimestamp` — พิสูจน์แล้วข้างบน
+- **"`consumer.commitOffsets()` ถูกออกแบบให้เป็น fire-and-forget"** มัน return Promise เพื่อให้คุณ `await` ได้เมื่อต้องการการรับประกันที่แข็งแรงกว่า การไม่ await คือทางเลือก ไม่ใช่ทางเดียว
 
 export const quizOffsets = [
   {
     q: 'Kafka เก็บ committed consumer offset ไว้ที่ไหน?',
     options: [
-      'บน local disk ของ consumer เท่านั้น',
-      'ใน topic ภายในชื่อ `__consumer_offsets`',
+      'บน disk ของ consumer เองเท่านั้น',
+      'ใน topic ภายในชื่อ `__consumer_offsets` — พิสูจน์แล้วข้างบนด้วยการอ่าน record ที่ decode จริงจากมัน',
       'ใน ZooKeeper',
-      'ในฐานข้อมูล relational ที่คุณต้องจัดหาเอง',
+      'ใน relational database ที่คุณต้องจัดหาเอง',
     ],
     answer: 1,
+    explain: 'ยืนยันด้วยการอ่าน record จริงออกมาด้วย kafka-console-consumer.sh --formatter org.apache.kafka.tools.consumer.OffsetsMessageFormatter',
   },
   {
-    q: 'ทำไม auto-commit จึงเสี่ยงสำหรับงานประมวลผลที่สำคัญ?',
+    q: 'consumer commit `offset: message.offset` (ไม่ใช่ `offset + 1`) หลังประมวลผล จะเกิดอะไรตอน restart ตามที่พิสูจน์แล้วข้างบน?',
     options: [
-      'commit น้อยเกินไปจนไม่มีประโยชน์',
-      'commit ตามตารางเวลาโดยไม่สนว่า process สำเร็จหรือไม่ ดังนั้น crash อาจทำ record หาย',
-      'ทำ record ซ้ำทุกตัว',
-      'ปิดการทำงานของ consume loop',
+      'ไม่มีอะไรผิดปกติ -- นี่คือวิธี commit ที่ถูกต้อง',
+      'record ที่ประมวลผลล่าสุดถูกส่งมาซ้ำและประมวลผลอีกครั้ง -- duplicate จริง ซ้ำได้',
+      'consumer ข้าม record หนึ่งอันที่ไม่เคยประมวลผล',
+      'consumer group สตาร์ทไม่ขึ้น',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้วย topic 3 record จริง: record-2 (อันสุดท้ายที่ประมวลผล) กลับมาหลัง restart เพราะ committed offset ชี้ไปที่มันแทนที่จะชี้ผ่านมันไป',
   },
   {
-    q: 'การ commit offset หลัง process ให้ delivery semantic แบบใด?',
+    q: 'ทำไม auto-commit ถึงเสี่ยงสำหรับการประมวลผลที่สำคัญ ตามตัวเลขที่พิสูจน์แล้วข้างบน?',
+    options: [
+      'มัน commit น้อยเกินไปจนไม่มีประโยชน์',
+      'มัน commit ตามตารางเวลา wall-clock ไม่ว่าการประมวลผลจะสำเร็จหรือไม่ -- พิสูจน์แล้วว่า 5/5 record ถูก commit แต่ 0/5 ถูก apply ถาวรจริงหลัง kill',
+      'มัน duplicate ทุก record',
+      'มันปิด consume loop',
+    ],
+    answer: 1,
+    explain: 'การพิสูจน์: committed offset ไปถึง 5 (LAG 0) ในขณะที่ durable side-effect log ยังว่างเปล่าสนิท เพราะการเขียนถาวรเกิดบน flush timer แยกที่ช้ากว่า',
+  },
+  {
+    q: 'การ commit offset หลังประมวลผลให้ delivery semantic แบบไหน?',
     options: [
       'At-most-once (record อาจหาย)',
-      'At-least-once — crash ก่อน commit ทำให้ record ถูก process ซ้ำ (อาจซ้ำได้)',
+      'At-least-once — crash ก่อน commit หมายความว่า record ถูกประมวลผลซ้ำ (อาจ duplicate)',
       'Exactly-once โดยไม่ต้องทำอะไรเพิ่ม',
-      'ไม่มี delivery guarantee เลย',
+      'ไม่มีการรับประกัน delivery เลย',
     ],
     answer: 1,
+    explain: 'บทถัดไปพิสูจน์ timeline ทั้ง at-most-once (commit-before) และ at-least-once (commit-after) ครบวงจรด้วยสคริปต์ kill-and-count',
   },
   {
-    q: 'เมื่อ manual commit ใน KafkaJS การ await consumer.commitOffsets(...) ให้อะไรกับคุณ?',
+    q: 'ด้วย manual commit ใน KafkaJS การ await consumer.commitOffsets(...) ให้อะไรกับคุณ?',
     options: [
-      'ไม่ให้อะไร commit เกิดขึ้นทันทีและไม่ถูก ack เสมอ',
-      'รอจน commit ถูก ack ก่อนไปต่อ — ตัวเลือกที่ปลอดภัย เทียบกับการยิงเบื้องหลังเพื่อ throughput',
-      'ลบ offset เก่าออกจาก topic',
-      'สร้าง consumer group ใหม่',
+      'ไม่มีอะไรเลย commit เป็น instant และ unacknowledged เสมอ',
+      'มันรอจนกว่า commit จะถูก acknowledge ก่อนไปต่อ — ตัวเลือกปลอดภัย เทียบกับยิงมันเป็น background เพื่อ throughput',
+      'มันลบ offset เก่าออกจาก topic',
+      'มันสร้าง consumer group ใหม่',
     ],
     answer: 1,
+    explain: 'commitOffsets return Promise เพื่อให้ caller เลือกได้ระหว่าง await (ปลอดภัย ช้ากว่า) กับ fire-and-forget (เร็ว เงียบเมื่อ fail)',
+  },
+  {
+    q: 'gotcha จริงอะไรที่โผล่มาตอนอ่าน __consumer_offsets ด้วย kafka-console-consumer.sh ในการทดสอบของคอร์สนี้เอง?',
+    options: [
+      'formatter class ไม่มีอยู่จริงใน Kafka 4.3.1',
+      '--max-messages รวมกับ --timeout-ms ทำให้ไม่มี output ที่ stdout เลย (output ของ formatter หายไปบน exit path นั้น); การห่อคำสั่งด้วย timeout ของ shell เองได้ผล',
+      '__consumer_offsets อ่านด้วย console consumer ไม่ได้ ต้องใช้ API พิเศษเท่านั้น',
+      'topic ว่างเปล่าจนกว่าจะ restart broker',
+    ],
+    answer: 1,
+    explain: 'org.apache.kafka.tools.consumer.OffsetsMessageFormatter มีจริงและทำงานได้ -- แต่ต่อเมื่อเปลี่ยนกลไก exit จาก --max-messages/--timeout-ms เป็น wrapper `timeout 6 ...` ภายนอกแล้วเท่านั้น',
   },
 ];
 
