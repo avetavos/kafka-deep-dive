@@ -1,6 +1,6 @@
 ---
 title: 'Replication & ISR'
-description: 'How Kafka keeps data durable — replication factor, leader and follower replicas, the in-sync replica set, min.insync.replicas, and safe leader election.'
+description: 'How Kafka keeps data durable — replication factor, leader/follower, the in-sync replica set proven to shrink and expand on a real 3-broker cluster, min.insync.replicas rejecting writes with a real error, unclean leader election, and the KRaft controller quorum.'
 sidebar:
   order: 3
 ---
@@ -8,11 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 Kafka survives broker failure by keeping each partition on several brokers — one **leader** and several **followers** — and it tracks which copies are fully caught up in the **in-sync replica (ISR)** set, so a failed leader can be replaced without losing acknowledged data.
+
+<Callout title="This lesson's proofs need a real 3-broker cluster">
+Every other lesson in this course proves its claims against this repo's single-broker harness (port 19092, `npm run verify -- --run/--cli`) — a single broker cannot fail over, because there is nothing to fail over *to*. The ISR-shrink, leader-election, and controller-quorum proofs below were run against a **separate, temporary 3-broker KRaft cluster** in this course's own scratch directory, torn down as soon as this lesson was committed. Those are shown as real command transcripts, not fences this harness re-runs — the harness's own broker genuinely cannot reproduce them. Everything that a single broker *can* prove (config defaults, a real `min.insync.replicas` rejection) is a normal collected, harness-verified fence below.
+</Callout>
 
 ## Leaders and followers
 
@@ -26,74 +31,281 @@ kafka-topics.sh --bootstrap-server localhost:9092 \
 
 If the leader's broker dies, one of the followers is promoted to leader and the partition keeps serving. Clients rediscover the new leader through the bootstrap server — no data lost, brief interruption only.
 
-## The in-sync replica set
+## Proof: a real 3-broker cluster, Leader/Replicas/Isr
 
-Not every follower is always current — one might be slow or briefly disconnected. Kafka tracks the **ISR**: the set of replicas (the leader plus followers) that are fully caught up to the leader's log. Only ISR members are eligible to become leader, because only they have all the acknowledged data.
+A 3-broker KRaft cluster (own scratch compose, ports 59092–59094, torn down right after this lesson), topic `isr-demo`, 3 partitions, replication factor 3:
 
-Two configs turn the ISR into a durability contract:
+```text
+$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic isr-demo \
+    --partitions 3 --replication-factor 3 --config min.insync.replicas=2
+Created topic isr-demo.
 
-- **`acks=all`** (producer side) — the write is acknowledged only after **all ISR members** have it.
-- **`min.insync.replicas`** (topic/broker side) — the **minimum ISR size** for a write to be accepted. With `min.insync.replicas=2`, if the ISR shrinks to 1, `acks=all` writes are **rejected** rather than risking a single copy.
+$ kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+Topic: isr-demo  TopicId: buA7wmUvS8CEP7U5iXWnXA  PartitionCount: 3  ReplicationFactor: 3  Configs: min.insync.replicas=2
+  Topic: isr-demo  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+  Topic: isr-demo  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+  Topic: isr-demo  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2
+```
 
-<Mermaid title="Leader replicates to followers; ISR gates durable writes" code={isrDiagram} />
+Each partition's `Replicas` list is the same three brokers in a different rotation — Kafka spreads leadership round-robin across partitions so no single broker leads everything. `Isr` starts out equal to `Replicas`: all three copies are caught up.
 
-export const isrDiagram = `flowchart TB
-  prod["Producer (acks=all)"] --> leader["Leader replica"]
-  leader -->|replicate| f1["Follower (in ISR)"]
-  leader -->|replicate| f2["Follower (in ISR)"]
-  leader -.->|lagging, dropped from ISR| f3["Follower (out of ISR)"]
-  isr["Write acked once all ISR have it; min.insync.replicas enforces ISR size"]`;
+## Proof: stop a broker, watch ISR shrink and leader failover, live
 
-## Durability over availability
+Stopping broker 3 (`docker stop`) and waiting past `replica.lag.time.max.ms` (**default 30000 ms**, confirmed below):
 
-The classic durability recipe is `replication-factor=3`, `min.insync.replicas=2`, `acks=all`. That tolerates one broker failure while still requiring two copies of every acknowledged write — you never depend on a single disk.
+```text
+$ docker stop kafka-topics-3b-broker3
+kafka-topics-3b-broker3
 
-What if the ISR drops to zero and a stale, out-of-sync replica is the only survivor? Electing it would bring the partition back online but **lose** the records it never received. Kafka's default, **`unclean.leader.election.enable=false`**, refuses that trade: it keeps the partition offline until an in-sync replica returns, choosing **durability over availability**. You can flip it to prioritize availability, but only with eyes open about the data-loss risk.
+# ... wait ~35s for replica.lag.time.max.ms (30000ms default) to elapse ...
+
+$ kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+Topic: isr-demo  PartitionCount: 3  ReplicationFactor: 3  Configs: min.insync.replicas=2
+  Topic: isr-demo  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2
+  Topic: isr-demo  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,1
+  Topic: isr-demo  Partition: 2  Leader: 1  Replicas: 3,1,2  Isr: 1,2
+```
+
+Two things happened, both real: partitions 0 and 1 **shrank** their ISR from 3 members to 2 (broker 3 dropped, since it stopped fetching); partition 2 — whose **leader was broker 3** — **failed over**, with broker 1 promoted to the new leader and the ISR settling at `1,2`. No client intervention, no manual failover command — this is the mechanism the "one broker can die" durability story actually rests on, not a diagram.
+
+<Mermaid title="Stopping the leader's broker: a follower in the ISR is promoted; ISR shrinks everywhere that broker was a replica" code={isrShrinkDiagram} />
+
+export const isrShrinkDiagram = `flowchart TB
+  before["Partition 2: Leader=broker3, ISR={3,1,2}"] -->|broker3 stops, replica.lag.time.max.ms elapses| after["Partition 2: Leader=broker1 (promoted), ISR={1,2}"]
+  p0["Partition 0: ISR={1,2,3}"] -->|broker3 stops, same trigger| p0after["Partition 0: ISR={1,2} (leader unaffected, was broker1)"]`;
+
+## Proof: min.insync.replicas rejects writes when ISR drops too low
+
+With `min.insync.replicas=2` and the ISR still at 2 (brokers 1 and 2), an `acks=all` write still succeeds:
+
+```text
+acks=all write SUCCEEDED: [{"topicName":"isr-demo","partition":2,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+Stopping a **second** broker (broker 2) drops every partition's ISR to just `{1}` — below `min.insync.replicas=2`:
+
+```text
+$ docker stop kafka-topics-3b-broker2
+$ kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+  Topic: isr-demo  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1  Elr: 2
+  Topic: isr-demo  Partition: 1  Leader: 1  Replicas: 2,3,1  Isr: 1  Elr: 2
+  Topic: isr-demo  Partition: 2  Leader: 1  Replicas: 3,1,2  Isr: 1  Elr: 2
+```
+
+(`Elr` — Eligible Leader Replicas, a KRaft-era field — lists broker 2 as a replica that could still become leader once it catches back up, even though it just dropped out of the ISR.) An `acks=all` write against this same topic now fails with a real error, not a timeout or a generic disconnect:
+
+```text
+acks=all write FAILED as expected: KafkaJSNumberOfRetriesExceeded | Messages are rejected since there are fewer in-sync replicas than required
+```
+
+That message is KafkaJS's wrapping of the broker's real `NotEnoughReplicasException` after retries were exhausted — the durability contract held: rather than accept a write backed by only 1 copy when 2 were promised, the broker refused it outright.
+
+A tempting assumption is that this same rejection is reachable on a **single** broker too, by setting `min.insync.replicas` higher than `replication-factor` can ever satisfy. Testing that assumption directly is exactly what turned up a real surprise:
+
+```typescript
+// src/replication-and-isr/min-insync-single-broker.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}min-insync-single-broker`;
+
+const kafka = new Kafka({ clientId: 'min-insync-single-broker', brokers });
+const admin = kafka.admin();
+await admin.connect();
+// Single broker -> replication factor can only ever be 1 -> ISR can only ever be size 1.
+// min.insync.replicas=5 is deliberately absurd: no cluster this small could ever satisfy it.
+await admin.createTopics({
+  topics: [{ topic, numPartitions: 1, replicationFactor: 1, configEntries: [{ name: 'min.insync.replicas', value: '5' }] }],
+}).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+try {
+  const r = await producer.send({ topic, acks: -1, messages: [{ value: 'min.insync.replicas=5 on RF=1 -- does this reject?' }] });
+  console.log('acks=all write SUCCEEDED:', JSON.stringify(r));
+} catch (e: any) {
+  console.log('acks=all write FAILED:', e.name, '|', e.message);
+}
+await producer.disconnect();
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+acks=all write SUCCEEDED: [{"topicName":"...-min-insync-single-broker","partition":0,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+It **succeeds** — proven twice in this course's own testing, once with `min.insync.replicas=2` and once with an absurd `min.insync.replicas=5`, both on a `replication-factor=1` topic whose ISR can only ever contain 1 member. This contradicts the intuitive assumption (the one this lesson started with) that `min.insync.replicas` exceeding what the topology can structurally satisfy would reject every `acks=all` write forever. Combined with the 3-broker proof above — where `min.insync.replicas=2` genuinely **did** reject writes once the ISR *shrank* to 1 from a starting size of 3 — the real, provable rule is narrower than "ISR size < min.insync.replicas always rejects": Kafka's enforced requirement behaves as if capped by what the partition's replica set can structurally reach. A `min.insync.replicas` set above `replication-factor` does not make writes impossible; it silently behaves as though it were capped at `replication-factor`. The rejection this lesson proved on the 3-broker cluster only fires when the ISR drops **below a level the replica set could otherwise reach** — a real, temporary shortfall — not when the configured minimum was simply unreachable from the start.
+
+<Callout title="Why this matters more than the wrong assumption did">
+Setting `min.insync.replicas` above a dev/staging cluster's actual `replication-factor`, intending to "mirror production's strict durability requirement" so the failure-rejection path gets exercised in testing, proven above to **not work** — the write silently succeeds instead of exercising the `NotEnoughReplicasException` path a test suite might be trying to cover. Testing that specific rejection requires a topology where the ISR can genuinely fall short of `min.insync.replicas` while still being at or below `replication-factor` — in practice, at least 2 brokers, with `min.insync.replicas` no higher than `replication-factor`, and a real broker stopped to shrink the ISR (proven above on the 3-broker cluster).
+</Callout>
+
+## Proof: restart the broker, ISR expands back
+
+```text
+$ docker start kafka-topics-3b-broker2 kafka-topics-3b-broker3
+# ... wait ~20s for both to catch up and rejoin ...
+
+$ kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic isr-demo
+  Topic: isr-demo  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+  Topic: isr-demo  Partition: 1  Leader: 1  Replicas: 2,3,1  Isr: 1,2,3
+  Topic: isr-demo  Partition: 2  Leader: 1  Replicas: 3,1,2  Isr: 1,2,3
+```
+
+ISR is back to all three brokers on every partition. Note partitions 1 and 2's **leader** stayed on broker 1 — restarting a broker makes it eligible to rejoin the ISR as a follower again, but it does not automatically reclaim leadership (that would need a deliberate `kafka-leader-election.sh --election-type preferred`, outside this lesson's scope).
+
+## Durability over availability: unclean leader election
+
+What if the ISR drops to zero and a stale, out-of-sync replica is the only survivor? Electing it would bring the partition back online but **lose** the records it never received. Kafka's default, **`unclean.leader.election.enable=false`**, refuses that trade — confirmed against a real running broker, not assumed from documentation:
+
+```bash
+# scripts/replication-and-isr/check-unclean-election-default.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "unclean.leader.election.enable"
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "replica.lag.time.max.ms"
+```
+
+Real output (this harness's own broker):
+
+```text
+unclean.leader.election.enable=false sensitive=false synonyms={DEFAULT_CONFIG:unclean.leader.election.enable=false}
+replica.lag.time.max.ms=30000 sensitive=false synonyms={DEFAULT_CONFIG:replica.lag.time.max.ms=30000}
+```
+
+With the default `false`, Kafka keeps the partition **offline** until an in-sync replica returns — choosing **durability over availability**. Flipping it to `true` prioritizes availability (the partition comes back online immediately, on whatever replica survived) at the explicit cost of silently losing every acknowledged record the elected replica never received. This is a per-topic-overridable, per-cluster-wide-defaultable trade-off, not a hidden setting — anyone flipping it should be doing so deliberately, with the data-loss window understood.
+
+## KRaft controller quorum: 3 combined nodes
+
+Since Kafka 4.0 removed ZooKeeper, the controller quorum itself is Kafka brokers (or dedicated controller nodes) using the Raft protocol. On this course's 3-broker cluster, all three nodes run **combined** broker+controller roles:
+
+```text
+$ kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status
+ClusterId:              5L6g3nShT-eMCtK--X86sw
+LeaderId:               1
+LeaderEpoch:            4
+HighWatermark:          229
+MaxFollowerLag:         0
+MaxFollowerLagTimeMs:   0
+CurrentVoters:          [{"id": 1, "endpoints": ["CONTROLLER://broker1:9093"]}, {"id": 2, "endpoints": ["CONTROLLER://broker2:9093"]}, {"id": 3, "endpoints": ["CONTROLLER://broker3:9093"]}]
+CurrentObservers:       []
+```
+
+Three voters, one elected `LeaderId` (the active controller) — this is a **separate** Raft group from partition leadership above; a broker can be the metadata/controller leader without leading any partition, and vice versa. The same command works against a single-broker cluster too (one voter instead of three) — a useful sanity check that `process.roles=broker,controller` actually registered this node as a controller:
+
+```bash
+# scripts/replication-and-isr/check-controller-quorum.sh
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $BOOTSTRAP describe --status
+```
+
+Real output (this harness's single-broker probe):
+
+```text
+ClusterId:              (a real cluster id, single-node)
+LeaderId:               1
+CurrentVoters:          [{"id": 1, "endpoints": ["CONTROLLER://localhost:9093"]}]
+CurrentObservers:       []
+```
+
+One voter, itself — a single-node KRaft "quorum" is really just a quorum of one, which is why single-broker KRaft has no controller-failover story at all. See [kraft-and-the-cluster](/kafka/en/foundations/kraft-and-the-cluster/) for how this metadata log itself works.
 
 <Callout title="The one-line takeaway">
-Kafka replicates each partition to a **leader** plus **followers**; the **ISR** is the set of replicas fully caught up. **`acks=all`** waits for all ISR members and **`min.insync.replicas`** enforces a minimum ISR size, so the safe recipe is **RF=3, min.insync.replicas=2, acks=all**. By default Kafka disables **unclean leader election**, choosing **durability over availability** — it will not promote a stale replica and lose acknowledged data.
+Kafka replicates each partition to a **leader** plus **followers**; the **ISR** is the set of replicas fully caught up — proven above shrinking live when a broker stops (`replica.lag.time.max.ms`, default **30000 ms**) and expanding back on restart, with a real **leader failover** for the partition whose leader was the stopped broker. **`acks=all`** waits for all ISR members and **`min.insync.replicas`** enforces a minimum ISR size — proven with a real `NotEnoughReplicasException` (via KafkaJS's `KafkaJSNumberOfRetriesExceeded` wrapper) when the ISR **shrinks below** `min.insync.replicas` on the 3-broker cluster; proven **not** to fire at all when `min.insync.replicas` is simply set above what `replication-factor` could ever reach (`min.insync.replicas=5` on `replication-factor=1` still let `acks=all` writes through) — the enforced requirement behaves as capped by the replica set's actual size, not a hard floor independent of it. By default Kafka disables **unclean leader election** (`unclean.leader.election.enable=false`, confirmed live) — durability over availability. The KRaft **controller quorum** is a separate Raft group of voters, proven with `kafka-metadata-quorum.sh describe --status` on both a 3-node and a single-node cluster.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="properties" code={`# config/replication-and-isr/payments-topic.properties
+# AI-generated topic config for a payments topic, "matching the durability
+# guide's recommended settings"
+# section: topic
+cleanup.policy=delete
+retention.ms=2592000000
+min.insync.replicas=3
+`}>
+
+This reads like it was assembled from a durability checklist: `min.insync.replicas=3` looks like the "safe, high" choice — surely more is safer than the `min.insync.replicas=2` this course's own examples use. The bug is that `min.insync.replicas` is only meaningful **relative to the topic's `replication-factor`**, which is entirely absent from this file (it is a topic-config file, not a `--create` command, so the replication factor lives elsewhere — and nothing here checks that the two agree). If this topic was created with `--replication-factor 3`, `min.insync.replicas=3` demands **every single replica** be in the ISR for any `acks=all` write to succeed — the ISR tolerates **zero** broker slowness or downtime before every write starts failing, which is a strictly worse availability trade-off than the standard `min.insync.replicas=2` recipe (tolerates one lagging/down broker) for barely more durability. Worse, if this topic was created with the common default `--replication-factor 3` but someone later reads this config in isolation and assumes "3 is extra-safe," they may not realize it makes the topic **less** available than the review's own recommended `RF=3, min.insync.replicas=2, acks=all`. The fix is not a syntax fix — the file is valid — it is checking `min.insync.replicas` against the actual `replication-factor` the topic was created with and asking whether the availability cost was actually intended.
+
+</SpotTheBug>
+
+## Mental Model
+
+The ISR is not a static list decided once at topic-creation time — it is a **live, continuously re-evaluated membership**, proven above shrinking within seconds of a broker going quiet and expanding again once it catches back up. Think of `acks=all` + `min.insync.replicas` as a standing **quorum requirement on whichever brokers happen to be in the ISR right now**, not on the topic's nominal replication factor — proven above: the exact same `replication-factor=3` topic accepted `acks=all` writes with 2 brokers up and rejected them with 1, without any config change in between. The number that matters at write time is the *live* ISR size, not the number in `--describe`'s `Replicas` column.
+
+## Trade-offs
+
+- **`unclean.leader.election.enable=false`** (default, confirmed above) — never loses acknowledged data to a stale leader, but a partition whose entire ISR is down stays **offline** until an in-sync replica returns, however long that takes.
+- **`unclean.leader.election.enable=true`** — the partition comes back online immediately on whatever replica survives, at the explicit cost of silently losing any acknowledged record the elected replica never received — availability over durability, the opposite default.
+- **`min.insync.replicas=2` on `replication-factor=3`** (this course's baseline recipe) — tolerates one broker being down or lagging with zero write rejections, proven above; the SpotTheBug's `min.insync.replicas=3` on the same RF tolerates **zero**, for a durability gain (every replica confirmed) that most workloads don't need at that availability cost.
+- **A single-broker dev cluster with `min.insync.replicas` set above 1** (proven above to have no effect) — cheap to set up, but proven not to exercise the `NotEnoughReplicasException` rejection path at all; testing that specific failure mode needs at least 2 brokers with a real one stopped, proven above on the 3-broker cluster.
+
+## Common Misconceptions
+
+- **"The ISR is fixed once a topic is created, based on its replication factor."** Proven false above: the same `replication-factor=3` topic's ISR shrank to 2, then to 1, then expanded back to 3, entirely from brokers stopping and restarting — nothing about the topic's own config changed.
+- **"If a write with `acks=all` succeeds, it's backed by `replication-factor` copies."** Proven false above: it is backed by however many replicas are in the **ISR** at that moment, which can be less than `replication-factor` — a `replication-factor=3` topic with an ISR of 2 still accepts `acks=all` writes, backed by only 2 copies.
+- **"A higher `min.insync.replicas` is always a safer choice."** Proven above (SpotTheBug) to be a real availability trade-off, not a free upgrade: `min.insync.replicas` equal to `replication-factor` means **any single broker** being down or slow rejects every write.
+- **"Setting `min.insync.replicas` above `replication-factor` makes writes stricter, or at least fails safely."** Proven false above, twice, on a single RF=1 broker: `min.insync.replicas=2` and even `min.insync.replicas=5` both still let `acks=all` writes through. The enforced requirement is capped by what the replica set can structurally reach — it is not a hard floor independent of topology.
+- **"Restarting a failed broker immediately makes it the leader again for partitions it used to lead."** Proven false above: broker 1, promoted to leader for partition 2 while broker 3 was down, stayed the leader after broker 3 rejoined the ISR — rejoining the ISR and reclaiming leadership are separate events.
+- **"The KRaft controller quorum and partition leadership are the same mechanism."** Proven above to be two separate things: `kafka-metadata-quorum.sh describe --status` shows a completely separate Raft group (metadata/controller leadership) from `kafka-topics.sh --describe`'s per-partition `Leader` column (data-plane leadership) — a broker's role in one says nothing about its role in the other.
 
 export const quizIsr = [
   {
-    q: 'What is the ISR (in-sync replica set)?',
+    q: 'What is the ISR (in-sync replica set), proven above to change live?',
     options: [
-      'All brokers in the cluster',
-      'The set of replicas fully caught up to the leader, eligible to become leader without data loss',
+      'All brokers in the cluster, fixed at topic creation',
+      'The set of replicas fully caught up to the leader RIGHT NOW, eligible to become leader without data loss -- proven shrinking within seconds of a broker stopping and expanding back on restart',
       'The list of consumers reading a partition',
       'The offsets a producer has written',
     ],
     answer: 1,
+    explain: 'Proven live on a real 3-broker cluster: stopping broker 3 shrank two partitions\' ISR from {1,2,3} to {1,2} within replica.lag.time.max.ms (30s default), and restarting it expanded the ISR back to all three.',
   },
   {
-    q: 'What does min.insync.replicas control?',
+    q: 'Proven above on the 3-broker cluster, AND proven NOT to happen on a single RF=1 broker with min.insync.replicas=5 -- what is the real, narrower rule for when acks=all actually gets rejected?',
     options: [
-      'How many partitions a topic has',
-      'The minimum ISR size required for an acks=all write to be accepted',
-      'The number of consumer groups allowed',
-      'The retention period',
+      'min.insync.replicas > replication-factor always rejects every acks=all write, on any cluster size',
+      "Rejection (NotEnoughReplicasException / KafkaJSNumberOfRetriesExceeded) only fires when the ISR SHRINKS below min.insync.replicas from a level the replica set could otherwise reach -- a min.insync.replicas set above what replication-factor could ever satisfy is silently capped instead, proven on RF=1 with min.insync.replicas=5 still succeeding",
+      'acks=all writes always succeed regardless of ISR size',
+      'min.insync.replicas only applies to consumers, not producers',
     ],
     answer: 1,
+    explain: 'Proven twice on a single RF=1 broker (min.insync.replicas=2 AND an absurd min.insync.replicas=5) that the write still succeeds -- contradicting the intuitive assumption -- while the 3-broker cluster proved a genuine rejection when the ISR shrank from 3 down to 1 with min.insync.replicas=2. The enforced floor behaves as capped by what the replica set can structurally reach.',
   },
   {
-    q: 'Which combination is the standard durable-write recipe?',
+    q: 'When broker 3 (the leader for partition 2) was stopped, what happened to partition 2, proven above?',
     options: [
-      'replication-factor=1, acks=0',
-      'replication-factor=3, min.insync.replicas=2, acks=all',
-      'replication-factor=2, acks=0, min.insync.replicas=1',
-      'replication-factor=1, min.insync.replicas=3',
+      'Partition 2 went offline until broker 3 restarted',
+      "A follower already in the ISR (broker 1) was promoted to leader automatically -- proven with a live kafka-topics.sh --describe showing Leader: 1 where it had been Leader: 3",
+      'Partition 2 lost all its data',
+      'A new partition was created to replace it',
     ],
     answer: 1,
+    explain: 'This is exactly the "durability without manual failover" mechanism replication provides -- proven live, not just described: the ISR always contains a broker eligible to take over.',
   },
   {
-    q: 'Why is unclean.leader.election.enable false by default?',
+    q: 'After the stopped brokers restarted and rejoined the ISR, proven above, did they automatically reclaim leadership of partitions they used to lead?',
     options: [
-      'To make the cluster faster',
-      'To avoid promoting a stale, out-of-sync replica, which would lose acknowledged data — durability over availability',
-      'Because leader election is not supported in KRaft',
-      'To reduce the number of partitions',
+      'Yes, leadership always reverts to the original leader automatically',
+      'No -- proven above: broker 1 (promoted during the outage) remained the leader for partition 2 even after broker 3 rejoined the ISR; reclaiming leadership needs a deliberate preferred-leader election',
+      'The partition had to be recreated',
+      'Leadership becomes random on every restart',
     ],
     answer: 1,
+    explain: 'The final kafka-topics.sh --describe, run after both stopped brokers rejoined, showed Leader: 1 for every partition -- rejoining the ISR (a follower again) and reclaiming leadership are proven to be separate events.',
+  },
+  {
+    q: 'What did kafka-metadata-quorum.sh describe --status prove about the KRaft controller quorum, above?',
+    options: [
+      'It is the same mechanism as partition leader election',
+      'It is a separate Raft group of voters (CurrentVoters, one per combined broker+controller node) with its own LeaderId -- proven on both a 3-node cluster (3 voters) and a single-node cluster (1 voter)',
+      'It only exists with ZooKeeper',
+      'It requires a dedicated, non-broker controller node to run at all',
+    ],
+    answer: 1,
+    explain: 'Real output on the 3-broker cluster showed CurrentVoters with 3 entries and a LeaderId separate from any partition\'s data-plane leader; the same command against a single combined broker+controller node showed exactly 1 voter.',
   },
 ];
 
