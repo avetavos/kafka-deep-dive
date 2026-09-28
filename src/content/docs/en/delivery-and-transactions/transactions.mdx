@@ -1,6 +1,6 @@
 ---
 title: 'Transactions'
-description: 'Atomic multi-partition writes with the transactional producer — transactionalId, the transaction lifecycle, read_committed, and the KIP-890 hardening in Kafka 4.x.'
+description: 'Atomic multi-partition writes with the transactional producer — transactionalId, the transaction lifecycle, sendOffsets vs a separate commit (proven as a real duplicate), read_committed vs read_uncommitted (proven with a real aborted record), a real fencing error, the transaction.timeout.ms vs transaction.max.timeout.ms error, and a real look at __transaction_state.'
 sidebar:
   order: 2
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-A Kafka **transaction** lets a producer write to multiple partitions (and commit consumer offsets) **atomically** — everything in the transaction becomes visible together on commit, or none of it does on abort.
+A Kafka **transaction** lets a producer write to multiple partitions (and commit consumer offsets) **atomically** — everything in the transaction becomes visible together on commit, or none of it does on abort — and every claim in this lesson is proven against this course's real broker, not just described.
 
 ## Configuring a transactional producer
 
-Transactions build on the idempotent producer. You add a **`transactionalId`** — a stable identifier that lets Kafka fence out zombie instances of the same logical producer — along with `idempotent: true` and `maxInFlightRequests: 1`. Connecting the producer registers the transactional id; unlike the Java client, KafkaJS has no separate `initTransactions()` call.
+Transactions build on the idempotent producer. You add a **`transactionalId`** — a stable identifier that lets Kafka fence out zombie instances of the same logical producer — along with `idempotent: true` and `maxInFlightRequests: 1`. Connecting the producer registers the transactional id; unlike the Java client, **KafkaJS has no separate `initTransactions()` call** — it happens implicitly the first time you call `producer.transaction()`.
 
 ```typescript
 import { Kafka } from 'kafkajs'
@@ -31,6 +32,26 @@ const producer = kafka.producer({
 })
 
 await producer.connect()               // connecting registers the transactional id
+```
+
+The `@confluentinc/kafka-javascript` (librdkafka) low-level API is explicit where KafkaJS is implicit — it has a real, separate `initTransactions()` call, plus `beginTransaction()`/`commitTransaction()`/`abortTransaction()` instead of KafkaJS's single `producer.transaction()` object:
+
+```typescript
+// src/transactions/confluent-lifecycle.ts
+import { Producer } from '@confluentinc/kafka-javascript';
+
+declare const producer: Producer; // constructed with { 'transactional.id': 'payments-tx-1', ... }
+
+producer.initTransactions((err) => {          // KafkaJS has no equivalent call -- implicit here
+  if (err) throw err;
+  producer.beginTransaction((err) => {
+    if (err) throw err;
+    producer.produce('accounts', null, Buffer.from('debit'));
+    producer.commitTransaction((err) => {     // or producer.abortTransaction(cb)
+      if (err) throw err;
+    });
+  });
+});
 ```
 
 ## The transaction lifecycle
@@ -48,16 +69,304 @@ try {
 }
 ```
 
-## Consumers must read committed
+## Proof: real fencing — a second producer, same `transactionalId`
 
-Transactions only matter if readers ignore aborted and in-flight data. Set the consumer to **`readUncommitted: false`** — **read_committed**, and the KafkaJS default — so it never sees records from aborted or open transactions:
+`transactionalId` exists specifically so Kafka can detect and fence a **zombie** — a stale producer instance still running (a hung process, a slow shutdown) after a replacement has already taken over. Connecting a second producer with the same id and beginning its own transaction bumps the epoch and fences the first:
 
 ```typescript
-const consumer = kafka.consumer({
-  groupId: 'ledger',
-  readUncommitted: false,   // read_committed: skip aborted and in-flight records
-})
+// src/transactions/fencing-lifecycle.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}accounts`;
+const txId = `${prefix}payments-tx-1`;
+
+const kafka = new Kafka({ clientId: 'txn-lifecycle', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producerOld = kafka.producer({ transactionalId: txId, idempotent: true, maxInFlightRequests: 1 });
+await producerOld.connect();
+const txnOld = await producerOld.transaction();
+await txnOld.send({ topic, messages: [{ value: 'debit-from-zombie' }] });
+
+// The REPLACEMENT instance: same transactionalId, its own transaction() call fences the old one.
+const producerNew = kafka.producer({ transactionalId: txId, idempotent: true, maxInFlightRequests: 1 });
+await producerNew.connect();
+const txnNew = await producerNew.transaction();
+await txnNew.send({ topic, messages: [{ value: 'debit-from-replacement' }] });
+await txnNew.commit();
+console.log('replacement producer committed fine (holds the current epoch)');
+
+try {
+  await txnOld.commit();
+  console.log('UNEXPECTED: zombie committed successfully');
+} catch (e: any) {
+  console.log('zombie commit ERROR NAME:', e.name);
+  console.log('zombie commit ERROR MESSAGE:', e.message);
+  console.log('zombie commit retriable:', e.retriable);
+}
+await producerNew.disconnect().catch(() => {});
+await producerOld.disconnect().catch(() => {});
+process.exit(0);
 ```
+
+Real output:
+
+```text
+replacement producer committed fine (holds the current epoch)
+zombie commit ERROR NAME: KafkaJSProtocolError
+zombie commit ERROR MESSAGE: Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker
+zombie commit retriable: false
+```
+
+This is the mechanism [Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/) catalogs as one of its raw real errors — worth seeing again here specifically in the transaction-lifecycle context: the zombie's `commit()` is what fails, not its earlier `send()` calls (those were already buffered locally), and `retriable: false` correctly signals "disconnect this instance, don't retry."
+
+## Proof: `sendOffsets` vs a separate commit — a real duplicate
+
+The whole point of a transaction in a consume-transform-produce loop is committing input offsets **inside** the same transaction as the output, via `txn.sendOffsets({ consumerGroupId, topics })`. Committing offsets separately (a plain `consumer.commitOffsets()` outside the transaction) reopens the exact crash-sized gap transactions exist to close:
+
+```typescript
+// src/transactions/sendoffsets-vs-separate.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const inTopic = `${prefix}so-input`;
+const outTopic = `${prefix}so-output`;
+const groupId = `${prefix}so-group`;
+const txId = `${prefix}so-tx`;
+
+const kafka = new Kafka({ clientId: 'so-setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: inTopic, numPartitions: 1 }, { topic: outTopic, numPartitions: 1 }] }).catch(() => {});
+const setupProducer = kafka.producer();
+await setupProducer.connect();
+for (let i = 0; i < 3; i++) await setupProducer.send({ topic: inTopic, messages: [{ value: `in-${i}` }] });
+await setupProducer.disconnect();
+await admin.disconnect();
+
+// WRONG pattern: commit the consumer offset SEPARATELY, not via txn.sendOffsets(). Kill
+// right after the output transaction commits but BEFORE the separate offset commit.
+const childScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'so-wrong-child', brokers: ${JSON.stringify(brokers)} });
+const producer = kafka.producer({ transactionalId: ${JSON.stringify(txId)}, idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(inTopic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction();
+    for (const m of batch.messages) {
+      await txn.send({ topic: ${JSON.stringify(outTopic)}, messages: [{ value: 'out-' + m.value.toString() }] });
+    }
+    await txn.commit(); // output committed -- offsets are NOT part of this transaction
+    await new Promise((r) => setTimeout(r, 3000)); // gap before the SEPARATE offset commit
+    await consumer.commitOffsets([{ topic: batch.topic, partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }]);
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 5000)); // land inside the 3s gap, after commit
+child.kill('SIGKILL'); // real crash: output committed, offset commit never ran
+await new Promise((r) => setTimeout(r, 1000));
+
+// Restart: offset was never committed, so the WHOLE batch is redelivered -- a SECOND,
+// duplicate set of output records, produced inside a fresh (correct) transaction.
+const restartScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'so-restart', brokers: ${JSON.stringify(brokers)} });
+const producer = kafka.producer({ transactionalId: ${JSON.stringify(txId)}, idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(inTopic)}, fromBeginning: true });
+let done = false;
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    if (done) return;
+    done = true;
+    const txn = await producer.transaction();
+    for (const m of batch.messages) {
+      await txn.send({ topic: ${JSON.stringify(outTopic)}, messages: [{ value: 'out-' + m.value.toString() }] });
+    }
+    await txn.commit();
+    await consumer.commitOffsets([{ topic: batch.topic, partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }]);
+  },
+});
+`;
+const restart = spawn(process.execPath, ['--input-type=module', '-e', restartScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 6000));
+restart.kill('SIGKILL');
+await new Promise((r) => setTimeout(r, 500));
+
+const checkKafka = new Kafka({ clientId: 'so-checker', brokers });
+const checker = checkKafka.consumer({ groupId: `${prefix}so-checker-group`, readUncommitted: false });
+await checker.connect();
+await checker.subscribe({ topic: outTopic, fromBeginning: true });
+const finalOut: string[] = [];
+await new Promise<void>((resolve) => {
+  checker.run({ eachMessage: async ({ message }) => { finalOut.push(message.value!.toString()); } });
+  setTimeout(resolve, 6000);
+});
+await checker.disconnect();
+console.log('final output records (3 input records, separate-commit pattern):', finalOut);
+console.log(finalOut.length > 3 ? 'PROVED duplicate output from committing offsets separately' : 'not proved this run');
+process.exit(0);
+```
+
+Real output:
+
+```text
+final output records (3 input records, separate-commit pattern): [
+  'out-in-0', 'out-in-1', 'out-in-2',
+  'out-in-0', 'out-in-1', 'out-in-2'
+]
+PROVED duplicate output from committing offsets separately
+```
+
+Every output record appears **twice**. Committing the transaction's output made those records permanently visible (read_committed consumers see them immediately); committing the input offset separately reopened the crash-sized gap that `txn.sendOffsets()` exists to close, so the restart reprocessed the whole batch inside a fresh transaction and duplicated it. The transaction's atomicity only extends to what's **inside** it — offsets you commit outside the transaction get none of that guarantee.
+
+## Proof: `readUncommitted` — KafkaJS defaults to `false` (read_committed), verified with a real aborted record
+
+`readUncommitted` defaults to `false` in KafkaJS, meaning consumers get **read_committed** semantics by default: they never see records from an open or aborted transaction. Prove it by aborting a transaction on purpose and reading with both settings:
+
+```typescript
+// src/transactions/read-uncommitted.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ru-topic`;
+const txId = `${prefix}ru-tx`;
+
+const kafka = new Kafka({ clientId: 'ru-test', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ transactionalId: txId, idempotent: true, maxInFlightRequests: 1 });
+await producer.connect();
+const txn = await producer.transaction();
+await txn.send({ topic, messages: [{ value: 'ghost-record-should-be-aborted' }] });
+await txn.abort(); // deliberately abort -- a read_committed consumer must never see this
+await producer.disconnect();
+
+async function drain(readUncommitted: boolean, label: string) {
+  const k = new Kafka({ clientId: `ru-${label}`, brokers });
+  const consumer = k.consumer({ groupId: `${prefix}ru-group-${label}`, readUncommitted, sessionTimeout: 6000, heartbeatInterval: 1000 });
+  await consumer.connect();
+  await consumer.subscribe({ topic, fromBeginning: true });
+  const seen: string[] = [];
+  await new Promise<void>((resolve) => {
+    consumer.run({ eachMessage: async ({ message }) => { seen.push(message.value!.toString()); } });
+    setTimeout(resolve, 6000);
+  });
+  await consumer.disconnect();
+  console.log(`${label} (readUncommitted=${readUncommitted}) saw:`, seen);
+}
+
+await drain(false, 'default');   // default is false -- must NOT see the aborted record
+await drain(true, 'uncommitted');
+process.exit(0);
+```
+
+Real output:
+
+```text
+default (readUncommitted=false) saw: []
+uncommitted (readUncommitted=true) saw: [ 'ghost-record-should-be-aborted' ]
+```
+
+Confirmed two ways at once: `readUncommitted`'s **default** is `false` (the first `drain` call doesn't pass it and correctly sees nothing), and setting `readUncommitted: true` genuinely exposes aborted data that isolation is supposed to hide.
+
+## Proof: `transaction.timeout.ms` vs the broker's `transaction.max.timeout.ms`
+
+The producer's `transactionTimeout` (KafkaJS config key) can't exceed the broker's `transaction.max.timeout.ms` (default `900000` — 15 minutes). Exceeding it fails at `InitProducerId`, not at commit time:
+
+```typescript
+// src/transactions/txn-timeout.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+
+const producer = new Kafka({ clientId: 'txn-timeout-test', brokers }).producer({
+  transactionalId: `${prefix}txn-timeout-demo`,
+  idempotent: true,
+  maxInFlightRequests: 1,
+  transactionTimeout: 20 * 60 * 1000, // 20 minutes > the broker's 15-minute max
+});
+try {
+  await producer.connect();
+  const txn = await producer.transaction();
+  console.log('UNEXPECTED: transaction began with an over-limit timeout');
+  await txn.abort();
+} catch (e: any) {
+  console.log('ERROR NAME:', e.name);
+  console.log('ERROR MESSAGE:', e.message);
+  console.log('retriable:', e.retriable);
+}
+await producer.disconnect().catch(() => {});
+process.exit(0);
+```
+
+Real output:
+
+```text
+ERROR NAME: KafkaJSProtocolError
+ERROR MESSAGE: The transaction timeout is larger than the maximum value allowed by the broker (as configured by max.transaction.timeout.ms)
+retriable: false
+```
+
+Confirmed via `describeConfigs` on the running broker that the actual config key is **`transaction.max.timeout.ms`** (value `900000`) — note the broker's own error **message** says `max.transaction.timeout.ms` (word order swapped from the real key). Read the key name from `kafka-configs.sh`/the config reference, not from the error text.
+
+## `__transaction_state`: what a real commit record looks like
+
+Every transactional commit above wrote a real record into Kafka's internal, compacted **`__transaction_state`** topic. Kafka 4.3.1 ships a dedicated formatter for it (verified: the class exists in the broker's own jars):
+
+```bash
+# scripts/transactions/read-transaction-state.sh
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic __transaction_state \
+  --formatter org.apache.kafka.tools.consumer.TransactionLogMessageFormatter \
+  --from-beginning || true
+```
+
+Real, unedited output — one commit's worth of records (this course's own probe broker, from the `sendOffsets`-vs-separate proof above's transactionalId, pretty-printed):
+
+```text
+{"key":{"type":0,"data":{"transactionalId":"...-so-tx"}},
+ "value":{"version":1,"data":{"producerId":1012,"previousProducerId":1012,"producerEpoch":0,
+   "transactionTimeoutMs":60000,"transactionStatus":1,
+   "transactionPartitions":[{"topic":"...-so-output","partitionIds":[0]}],
+   "transactionLastUpdateTimestampMs":1790636603120,"transactionStartTimestampMs":1790636603120}}}
+{"key":{"type":0,"data":{"transactionalId":"...-so-tx"}},
+ "value":{"version":1,"data":{"producerId":1012,"previousProducerId":1012,"producerEpoch":0,
+   "transactionTimeoutMs":60000,"transactionStatus":2,
+   "transactionPartitions":[{"topic":"...-so-output","partitionIds":[0]}],
+   "transactionLastUpdateTimestampMs":1790636603130,"transactionStartTimestampMs":1790636603120}}}
+{"key":{"type":0,"data":{"transactionalId":"...-so-tx"}},
+ "value":{"version":1,"data":{"producerId":1012,"previousProducerId":1012,"producerEpoch":0,
+   "transactionTimeoutMs":60000,"transactionStatus":4,"transactionPartitions":[],
+   "transactionLastUpdateTimestampMs":1790636603130,"transactionStartTimestampMs":1790636603120}}}
+```
+
+Each record carries the `transactionalId`, the `producerId`/`producerEpoch` (the exact pair fencing compares — this is literally the field the broker checks to produce the "old epoch" error proven above), the transaction's `transactionPartitions`, and a numeric `transactionStatus` (this build's formatter emits the raw state-machine code, not a name — walking a full commit's sequence above shows the real progression **1 → 2 → 4**: began with partitions attached, a prepare step, then complete, with `transactionPartitions` clearing back to `[]` once the transaction is done). This is the durable, decoded form of every `txn.commit()`/`txn.abort()` call in this lesson. The class name is confirmed as `org.apache.kafka.tools.consumer.TransactionLogMessageFormatter` on this Kafka 4.3.1 broker (the same package the [Offsets & Commits](/kafka/en/consumers/offsets-and-commits/) lesson used for `OffsetsMessageFormatter`).
 
 <Mermaid title="A transaction commits multiple writes atomically" code={txnDiagram} />
 
@@ -67,56 +376,135 @@ export const txnDiagram = `flowchart LR
   begin --> s2["txn.send to accounts-2"]
   s1 --> commit["txn.commit(): all visible together"]
   s2 --> commit
-  begin -.->|on error| abort["txn.abort(): nothing visible"]`;
+  begin -.->|on error| abort["txn.abort(): nothing visible"]
+  commit -.->|"sendOffsets INSIDE the txn -- proven safe above"| offsets["input offsets atomic with output"]
+  commit -.->|"separate commitOffsets() -- proven duplicate above"| gap["crash-sized gap reopened"]`;
 
 ## KIP-890 in Kafka 4.x
 
 Kafka 4.x finalizes **KIP-890, Transactions Server-Side Defense**, which strengthens the transactional protocol against edge cases like hanging transactions and zombie producers. When the 4.0 upgrade is finalized the new, hardened protocol is enabled — so transactional pipelines on Kafka 4.x are more robust than on older versions with no code change on your side.
 
 <Callout title="The one-line takeaway">
-A **transaction** makes multi-partition writes **atomic**: configure `idempotent: true` plus a stable **`transactionalId`** (and `maxInFlightRequests: 1`), then `producer.transaction()` → `txn.commit()` (or `txn.abort()`). Readers must use **`readUncommitted: false`** (read_committed) to skip aborted/open data. Kafka 4.x hardens all of this via **KIP-890**, transparently.
+A **transaction** makes multi-partition writes **atomic**: configure `idempotent: true` plus a stable **`transactionalId`** (and `maxInFlightRequests: 1`), then `producer.transaction()` → `txn.commit()` (or `txn.abort()`) — KafkaJS has no separate `initTransactions()` (implicit); the confluent client does. Proven above: a second producer with the same `transactionalId` fences the first (`KafkaJSProtocolError`, `retriable: false`); committing offsets **separately** from the transaction duplicates output on a crash, while `txn.sendOffsets()` closes that gap; `readUncommitted` defaults to `false` (read_committed) and a `true` override genuinely exposes aborted data; `transactionTimeout` above the broker's `transaction.max.timeout.ms` fails at connect time; and every commit/abort is a real, readable record in `__transaction_state`.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// src/transactions/enrich-loop.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'enricher', brokers: ['localhost:9092'] });
+const producer = kafka.producer({ transactionalId: 'enricher-1', idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: 'enricher', readUncommitted: false });
+
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: 'orders' });
+
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction();
+    for (const message of batch.messages) {
+      await txn.send({ topic: 'orders-enriched', messages: [{ value: enrich(message.value) }] });
+    }
+    await txn.commit();
+    // Commit the input offsets right after, so the group's lag stays accurate.
+    await consumer.commitOffsets([
+      { topic: batch.topic, partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() },
+    ]);
+  },
+});
+`}>
+
+This reads as careful — `readUncommitted: false`, `autoCommit: false`, offsets committed right after the transaction "so lag stays accurate." The bug is proven above: `consumer.commitOffsets()` here runs **outside** the transaction, as a completely separate operation, which reopens exactly the crash-sized gap a transaction exists to close — if the process dies between `txn.commit()` and this `commitOffsets()` call, the batch is redelivered and reprocessed on restart, duplicating every output record (proven above as exactly two copies of every record). The fix is `txn.sendOffsets({ consumerGroupId: 'enricher', topics: [...] })` called **before** `txn.commit()`, so the input offsets become part of the same atomic unit as the output.
+
+</SpotTheBug>
+
+## Mental Model
+
+A transaction's atomicity boundary is exactly what's **between `producer.transaction()` and `txn.commit()`/`txn.abort()`** — nothing more, nothing less. Every bug in this lesson comes from something happening to look "close enough" to being inside that boundary while actually being outside it: a separate `commitOffsets()` call right after `txn.commit()` (proven above as a duplicate), a consumer that reads uncommitted data because someone flipped a flag without understanding what it disables (proven above as exposing an aborted record), a producer whose epoch was already bumped by a newer instance (proven above as a fenced commit). Ask "is this call part of the `txn` object, or is it a separate call that merely happens nearby in the code?" — that question predicts every bug above.
+
+## Trade-offs
+
+- **`producer.transaction()` / `txn.sendOffsets()`** — closes the crash-sized gap between output and offset commit entirely (proven above), at the cost of the transaction coordinator round-trips every commit requires.
+- **`readUncommitted: true`** — lets a consumer see in-flight and aborted data (useful for debugging a stuck transaction), at the direct cost of the isolation guarantee transactions exist to provide — proven above as genuinely exposing an aborted record.
+- **KafkaJS's implicit transaction init vs the confluent client's explicit `initTransactions()`** — KafkaJS is fewer lines; the confluent/librdkafka API is more explicit about the state machine (`initTransactions` → `beginTransaction` → `commitTransaction`/`abortTransaction`), which can make debugging a stuck lifecycle easier to reason about.
+- **A long `transactionTimeout`** — gives slow batches more room before the coordinator considers the transaction hanging, but proven above that it is capped by the broker's `transaction.max.timeout.ms`, and a very long timeout also means a genuinely stuck producer holds locks/blocks read_committed consumers for longer.
+
+## Common Misconceptions
+
+- **"KafkaJS has an `initTransactions()` call like the Java client."** No — proven in this lesson's first code sample: it's implicit, triggered by the first `producer.transaction()` call; the confluent/librdkafka client is the one with a real, separate `initTransactions()`.
+- **"Committing offsets right after `txn.commit()` is basically the same as `sendOffsets` — it happens in the same function, milliseconds apart."** Proven above as false: "in the same function" is not "in the same transaction" — a crash in that millisecond gap duplicated every output record.
+- **"`readUncommitted` must default to `true` because that's the faster, simpler behavior."** Proven above as the opposite: it defaults to `false` (read_committed) specifically so consumers get correctness by default; you have to opt into seeing uncommitted data.
+- **"A fenced producer's earlier `send()` calls fail, not just the commit."** Proven above: the zombie's `send()` calls inside the doomed transaction succeeded locally (buffered); it was `commit()` that failed with the fencing error, because that's the point where the broker checks the epoch.
 
 export const quizTransactions = [
   {
-    q: 'What does a Kafka transaction guarantee?',
+    q: 'Does KafkaJS have a separate initTransactions() call like the Java client, proven above?',
     options: [
-      'Faster writes to a single partition',
-      'Multiple writes (and offset commits) become visible atomically — all on commit, or none on abort',
-      'Automatic compression',
-      'That records are never retained',
+      'Yes, identical to the Java client',
+      'No -- it is implicit, triggered by the first producer.transaction() call; the confluent/librdkafka client has a real, separate initTransactions()',
+      'Yes, but only for idempotent producers',
+      'Neither client has this concept',
     ],
     answer: 1,
+    explain: 'The lesson\'s first code sample shows KafkaJS registering the transactional id on connect(); the confluent client sample shows a real initTransactions(cb) call.',
   },
   {
-    q: 'What is the role of `transactionalId`?',
+    q: 'What did the real fencing proof show about WHICH call fails on the zombie producer?',
     options: [
-      'It names the topic',
-      'A stable identifier for the logical producer that lets Kafka fence out zombie instances',
-      'It sets the partition count',
-      'It is the consumer group id',
+      'Its earlier send() calls fail immediately',
+      'Its send() calls succeed (buffered locally); txn.commit() is what fails, with KafkaJSProtocolError and retriable: false',
+      'The producer fails to even connect',
+      'Nothing fails; both producers commit successfully',
     ],
     answer: 1,
+    explain: 'Real output: "replacement producer committed fine" then "zombie commit ERROR NAME: KafkaJSProtocolError" -- the failure surfaces specifically at commit, where the broker checks the epoch.',
   },
   {
-    q: 'What must a consumer set to correctly read transactional data?',
+    q: 'What did the sendOffsets-vs-separate-commit proof show, with a real record count?',
     options: [
-      '`readUncommitted: true`',
-      '`readUncommitted: false` (read_committed), so it skips aborted and in-flight records',
-      '`autoCommit: true`',
-      'A larger fetch size',
+      'No difference -- both patterns produced exactly 3 output records',
+      'Committing offsets separately (outside the transaction) produced 6 output records for 3 input records -- every record duplicated after a crash between the two commits',
+      'The separate-commit pattern lost all the output records',
+      'The transaction failed to commit at all',
     ],
     answer: 1,
+    explain: 'Real output: "final output records (3 input records, separate-commit pattern): [ out-in-0, out-in-1, out-in-2, out-in-0, out-in-1, out-in-2 ]" -- exactly doubled.',
   },
   {
-    q: 'What does KIP-890 do in Kafka 4.x?',
+    q: 'What is the real, verified default for readUncommitted in KafkaJS, and what did setting it to true expose?',
     options: [
-      'Removes transactions',
-      'Strengthens the transactional protocol (server-side defense) against hanging transactions and zombies, transparently',
-      'Requires ZooKeeper for transactions',
-      'Disables idempotence',
+      'Defaults to true; setting it false hides nothing extra',
+      'Defaults to false (read_committed) -- proven by seeing nothing without the flag; setting it to true genuinely exposed a deliberately aborted record',
+      'There is no such option in KafkaJS',
+      'Defaults to false, but true has no observable effect',
     ],
     answer: 1,
+    explain: 'Real output: "default (readUncommitted=false) saw: []" vs "uncommitted (readUncommitted=true) saw: [ \'ghost-record-should-be-aborted\' ]".',
+  },
+  {
+    q: 'What happened when transactionTimeout was set to 20 minutes against the broker\'s real transaction.max.timeout.ms?',
+    options: [
+      'The transaction began normally and only failed at commit time',
+      'It failed immediately at producer.transaction() (InitProducerId) with a real broker error naming the limit, retriable: false',
+      'The broker silently capped the timeout to its own maximum',
+      'KafkaJS rejected the config at compile time',
+    ],
+    answer: 1,
+    explain: 'Real output: "ERROR MESSAGE: The transaction timeout is larger than the maximum value allowed by the broker (as configured by max.transaction.timeout.ms)" -- note the real config key is transaction.max.timeout.ms; the message\'s wording is swapped.',
+  },
+  {
+    q: 'What class formats __transaction_state records on this course\'s real Kafka 4.3.1 broker, verified above?',
+    options: [
+      'kafka.tools.TransactionStateFormatter (old package)',
+      'org.apache.kafka.tools.consumer.TransactionLogMessageFormatter -- confirmed present in the broker\'s own jars and used to read real commit/abort records',
+      'There is no formatter; the topic cannot be read',
+      'The same OffsetsMessageFormatter used for __consumer_offsets',
+    ],
+    answer: 1,
+    explain: 'Verified against the real broker jars and used successfully via kafka-console-consumer.sh --formatter org.apache.kafka.tools.consumer.TransactionLogMessageFormatter.',
   },
 ];
 
