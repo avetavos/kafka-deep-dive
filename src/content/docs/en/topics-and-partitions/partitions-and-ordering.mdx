@@ -1,6 +1,6 @@
 ---
 title: 'Partitions & Ordering'
-description: 'Why the partition is Kafka unit of both parallelism and ordering, per-partition total order, and the tradeoff between throughput and global order.'
+description: 'Why the partition is Kafka unit of both parallelism and ordering, per-partition total order proven with a real interleaved consume, key remapping on --alter proven live, and segment files on disk.'
 sidebar:
   order: 1
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -25,6 +26,69 @@ orders-1:  [b0][b1][b2]          ← totally ordered
 ```
 
 This is not a limitation to work around so much as the price of horizontal scale. A single totally-ordered log cannot be written faster than one machine can append. Splitting into partitions lets many machines append in parallel — you trade global order for throughput.
+
+## Proof: writes interleaved in real time, reads not interleaved at all
+
+To make "no defined order across partitions" concrete rather than abstract, this sends to two partitions **interleaved in real send order** (`a0, b0, a1, b1, a2, b2, a3, b3`) and then consumes everything back:
+
+```typescript
+// src/partitions-and-ordering/ordering-interleave.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ordering-interleave`;
+
+const kafka = new Kafka({ clientId: 'ordering-interleave', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+// Send order in real time: a0, b0, a1, b1, a2, b2, a3, b3 -- genuinely interleaved.
+for (let i = 0; i < 4; i++) {
+  await producer.send({ topic, messages: [{ partition: 0, value: `a${i}` }] });
+  await producer.send({ topic, messages: [{ partition: 1, value: `b${i}` }] });
+}
+await producer.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}ordering-interleave-group` });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+const seen: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({
+    eachMessage: async ({ partition, message }) => {
+      seen.push(`p${partition}:${message.value!.toString()}(offset ${message.offset})`);
+      if (seen.length === 8) resolve();
+    },
+  });
+  setTimeout(resolve, 8000);
+});
+await consumer.disconnect();
+console.log('consumed order (as delivered to the app):');
+console.log(seen.join('\n'));
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+consumed order (as delivered to the app):
+p1:b0(offset 0)
+p1:b1(offset 1)
+p1:b2(offset 2)
+p1:b3(offset 3)
+p0:a0(offset 0)
+p0:a1(offset 1)
+p0:a2(offset 2)
+p0:a3(offset 3)
+```
+
+**Within** `p1`: `b0, b1, b2, b3` — strictly the order they were written, every time. **Within** `p0`: `a0, a1, a2, a3` — same. But the two logs were written **interleaved** (`a0, b0, a1, b1, ...`) and the consumer delivered **all of `p1` before any of `p0`** — the opposite of interleaved. That is not a bug: nothing in the protocol promises a relationship between partitions' real-time write order and a consumer's fetch/delivery order. Per-partition order is the only guarantee; cross-partition order is undefined and, as shown here, can look nothing like real time.
 
 ## Partitions bound consumer parallelism
 
@@ -51,19 +115,151 @@ export const parallelDiagram = `flowchart LR
   p3 --> c3["Consumer 3"]
   idle["Consumer 4 (idle: no partition left)"]`;
 
+## Proof: adding partitions remaps keys mid-flight
+
+Because the default partitioner computes `hash(key) % numberOfPartitions`, changing the partition count changes the divisor — and therefore where a key lands. The equivalent CLI command for growing a topic is:
+
+```text
+kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic remap-demo --partitions 6
+```
+
+This proves it the same way `--alter --partitions` does it under the hood (the admin API's `createPartitions`, which `kafka-topics.sh --alter` itself calls) — one continuous script sends the same key **before** and **after**, in strict order, so there is no ambiguity about which write happened under which partition count:
+
+```typescript
+// src/partitions-and-ordering/remap-demo.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}remap-demo`;
+
+const kafka = new Kafka({ clientId: 'remap-demo', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+
+const producer = kafka.producer();
+await producer.connect();
+const [before] = await producer.send({ topic, messages: [{ key: 'user-42', value: 'before-alter' }] });
+console.log(`BEFORE alter (3 partitions): key=user-42 -> partition ${before.partition}`);
+
+// Same operation kafka-topics.sh --alter --topic remap-demo --partitions 6 performs.
+await admin.createPartitions({ topicPartitions: [{ topic, count: 6 }] });
+await admin.disconnect();
+await producer.disconnect();
+
+// A FRESH producer, not the same one, deliberately -- see the gotcha below.
+const producer2 = kafka.producer();
+await producer2.connect();
+const [after] = await producer2.send({ topic, messages: [{ key: 'user-42', value: 'after-alter' }] });
+console.log(`AFTER alter (6 partitions): key=user-42 -> partition ${after.partition}`);
+await producer2.disconnect();
+process.exit(0);
+```
+
+Real output from this exact script, run against a Kafka 4.3.1 broker:
+
+```text
+BEFORE alter (3 partitions): key=user-42 -> partition 1
+AFTER alter (6 partitions): key=user-42 -> partition 4
+```
+
+Same key, same producer logic, **different partition** — because `hash("user-42") % 3 = 1` but `hash("user-42") % 6 = 4`. Every record for `user-42` written before the alter stays on partition 1 forever; every record written after lands on partition 4. If anything relied on all of `user-42`'s events being in one partition (ordering, or a Kafka Streams state store keyed by partition), that guarantee just broke — silently, with no error from either the alter or the next `send()`. The [keys-and-partitioning](/kafka/en/topics-and-partitions/keys-and-partitioning/) lesson covers this in depth, including why you provision partition count up front for keyed topics.
+
+<Callout title="A gotcha that showed up while proving this">
+The **same** KafkaJS producer instance reused for the "after" send, without disconnecting first, kept returning partition 1 — the old, 3-partition answer — even though the topic really did have 6 partitions by then. A connected producer caches the partition metadata it fetched on its first send and does not proactively refresh it just because an admin client altered the topic elsewhere. Disconnecting and reconnecting (or, in a long-lived process, calling `producer.send()` after enough time/errors for KafkaJS's own metadata refresh to kick in) is what actually picks up the new partition count. If your own "I added partitions but the producer keeps writing to the old range" debugging ever looks like this, stale client-side metadata is the first thing to check.
+</Callout>
+
+## Producer-side reordering: max.in.flight and retries
+
+Partition order can also break **before** anything reaches a partition, at the producer. If `maxInFlightRequests` is greater than 1 and a batch fails and is retried, a **later** batch that already succeeded can end up durably ordered **before** an earlier one that took a retry round-trip — the partition itself never reorders anything it has accepted, but two separate producer requests can arrive out of their original order. Setting `maxInFlightRequests: 1` (KafkaJS) prevents this at a throughput cost; the idempotent producer (`idempotent: true`) solves it with sequence numbers instead, at no ordering cost. That mechanism, proven with real sequence numbers from `kafka-dump-log.sh`, belongs to the producer module — see [idempotent-producer](/kafka/en/producers/idempotent-producer/) for the full proof.
+
+## Proof: segment files, live on disk
+
+A partition is not an abstraction — it is a directory of real files. Kafka 4.3.1's default `log.dirs` is `/tmp/kafka-logs`, and every partition gets `/tmp/kafka-logs/<topic>-<partition>/`:
+
+```bash
+# scripts/partitions-and-ordering/list-segments.sh
+TOPIC="${TOPIC_PREFIX:-}segments-demo"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic "$TOPIC" --partitions 1 --if-not-exists
+for i in 1 2 3; do echo "record-$i" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC"; done
+ls -la "/tmp/kafka-logs/${TOPIC}-0/"
+```
+
+Real output (own scratch broker, one partition after 3 produced records):
+
+```text
+total 20
+drwxr-xr-x  2 appuser appuser     4096 Sep 28 22:57 .
+drwxr-xr-x 59 appuser appuser     4096 Sep 28 22:58 ..
+-rw-r--r--  1 appuser appuser 10485760 Sep 28 22:57 00000000000000000000.index
+-rw-r--r--  1 appuser appuser      428 Sep 28 22:57 00000000000000000000.log
+-rw-r--r--  1 appuser appuser 10485756 Sep 28 22:57 00000000000000000000.timeindex
+-rw-r--r--  1 appuser appuser        8 Sep 28 22:57 leader-epoch-checkpoint
+-rw-r--r--  1 appuser appuser       43 Sep 28 22:57 partition.metadata
+```
+
+Three files per **segment** (the log starts with one segment, `00000000000000000000.*`, named after its base offset): **`.log`** holds the actual records (real bytes, grows with every append — that's why it is only 428 bytes here despite the `.index`/`.timeindex` files being pre-allocated at 10 MiB, the `index.max.bytes`-driven ceiling, not their live size); **`.index`** maps offsets to byte positions in the `.log` file for fast seeks; **`.timeindex`** does the same for timestamps (powers `--offsets-for-times` and time-based seeking). `leader-epoch-checkpoint` tracks leader-epoch boundaries (used to fence stale followers after a leader change); `partition.metadata` holds the partition's topic ID. A partition growing over time means **more segments**, not one ever-growing file — the [retention-and-compaction](/kafka/en/topics-and-partitions/retention-and-compaction/) lesson proves segment rolling and deletion directly on these same files.
+
 ## The design tradeoff
 
 Choosing a partition count is choosing a point on a curve:
 
 - **More partitions** → higher throughput and more consumer parallelism, but more open files, more metadata, and longer rebalances.
 - **Fewer partitions** → simpler and cheaper, but a lower throughput ceiling.
-- **Ordering need** → if a set of events must stay strictly ordered relative to each other, they must land on the **same partition** (the next lesson shows how keys do this).
+- **Ordering need** → if a set of events must stay strictly ordered relative to each other, they must land on the **same partition** — proven above to require planning ahead, since altering partition count remaps keys.
 
 The practical rule: partition for your **target throughput plus headroom**, and make sure related events that need ordering share a partition.
 
 <Callout title="The one-line takeaway">
-A **partition** is Kafka's unit of **parallelism and ordering**. Order is guaranteed **within** a partition, never across the topic — that is the price of scaling writes across machines. Within a consumer group **one partition is read by one consumer**, so the partition count **caps consumer parallelism**. Provision partitions for target throughput, and keep events that must stay ordered on the same partition.
+A **partition** is Kafka's unit of **parallelism and ordering**. Order is guaranteed **within** a partition, never across the topic — proven above: real-time-interleaved writes came back completely un-interleaved on read. Within a consumer group **one partition is read by one consumer**, so the partition count **caps consumer parallelism**. **Adding partitions remaps keys** (proven above: the same key moved from partition 1 to partition 4 after altering 3 → 6 partitions) — provision partitions for target throughput **up front** for any topic where per-key ordering matters.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/partitions-and-ordering/global-order-assumption.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-service', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'order-timeline' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'order-events', fromBeginning: true });
+
+// Build a single global timeline of every order event across the whole topic
+const timeline: string[] = [];
+
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    // Assumes offsets increase in the same order events actually happened,
+    // across the WHOLE topic, so this array is "the" order of events.
+    timeline.push(message.value!.toString());
+  },
+});
+`}>
+
+This compiles and runs without error, and for a **single-partition** topic it would even be correct. The bug is the assumption baked into the comment: "offsets increase in the same order events actually happened, across the whole topic." Kafka only guarantees order **within a partition** (proven above with the interleaved-write test — `p1`'s four records arrived before any of `p0`'s, even though they were written interleaved in real time). If `order-events` has more than one partition, `timeline` is not "the order things happened" — it is an arbitrary interleaving of N independently-ordered logs that depends on fetch timing, not event time. The fix is to either keep the topic single-partition (kills throughput and parallelism), or track order **per key** (e.g. per `orderId`) using each record's own partition + offset instead of a shared array, and never assume a cross-partition timeline is meaningful without an explicit timestamp-based reconciliation step.
+
+</SpotTheBug>
+
+## Mental Model
+
+Think of a topic as a **shelf of independent notebooks**, one per partition, not one long scroll. Each notebook is written front-to-back, strictly, forever — you can always trust the order of pages within one notebook. But nothing says notebook 3's page 10 was written before or after notebook 1's page 10; they're separate books being filled by separate (or the same, but independently-scheduled) writers. "Reading the topic" means picking up notebooks in whatever order is convenient, not reading pages in a single unified sequence.
+
+## Trade-offs
+
+- **Single partition** — perfect global order, zero write parallelism (one machine, one disk, one append stream is the ceiling). Fine for low-throughput topics that truly need total order.
+- **Many partitions** — high write and read parallelism, but ordering only survives within each partition; anything that must stay ordered has to be steered onto the same partition via keys (next lesson), and that steering breaks if partition count ever changes (proven above).
+- **`maxInFlightRequests: 1`** — restores strict per-partition send order even under retries, at the cost of one in-flight request at a time (lower producer throughput). The idempotent producer gets the same guarantee without this cost — see the producers module.
+- **Adding partitions later** — the cheap, reversible-looking operation (`--alter --partitions`) is not free: it silently remaps every key's destination going forward (proven above), which is a correctness change disguised as a capacity change.
+
+## Common Misconceptions
+
+- **"Kafka guarantees order across the whole topic."** No — proven above: interleaved real-time writes across two partitions came back completely reordered (all of one partition, then all of the other). Order is per-partition only.
+- **"Adding partitions is a safe, purely-additive scaling operation."** No — proven above: the exact same key moved from partition 1 to partition 4 the moment the topic went from 3 to 6 partitions, because the partitioner's hash is `% numberOfPartitions`.
+- **"More partitions always means better performance."** Not unconditionally — more partitions means more open file handles per broker, more replication traffic, more metadata, and longer rebalances; it raises the throughput *ceiling*, it does not lower latency by itself.
+- **"A partition is a logical concept, not real files I could go look at."** It is real files — proven above with a live `ls` of `/tmp/kafka-logs/<topic>-0/` showing the actual `.log`/`.index`/`.timeindex` segment files Kafka just wrote.
 
 export const quizOrdering = [
   {
@@ -75,6 +271,7 @@ export const quizOrdering = [
       'No ordering at all',
     ],
     answer: 1,
+    explain: 'Proven above: two partitions written interleaved in real time (a0,b0,a1,b1,...) were consumed as all-of-p1-then-all-of-p0 -- zero relationship to write order across partitions, while each partition individually stayed in strict order.',
   },
   {
     q: 'A topic has 4 partitions and a consumer group has 6 consumers. What happens?',
@@ -85,26 +282,40 @@ export const quizOrdering = [
       'The group fails to start',
     ],
     answer: 1,
+    explain: 'A partition is assigned to exactly one consumer within a group at a time -- a partition cannot be split between two consumers.',
   },
   {
-    q: 'Why does Kafka not guarantee ordering across partitions?',
+    q: 'What real, provable effect does kafka-topics.sh --alter --partitions have on a keyed topic, shown above?',
     options: [
-      'It is a bug being fixed',
-      'Splitting into independent partitions is what lets many machines write in parallel — global order would defeat that',
-      'Because consumers are single-threaded',
-      'Ordering across partitions requires ZooKeeper',
+      'No effect on where keys land -- only capacity changes',
+      "The SAME key can land on a DIFFERENT partition afterward, because hash(key) % numberOfPartitions changes -- proven: user-42 moved from partition 1 to partition 4 after 3->6",
+      'It deletes all existing data in the topic',
+      'It requires stopping the whole cluster',
     ],
     answer: 1,
+    explain: 'Proven live: the exact same producer call for key "user-42" returned partition 1 before the alter and partition 4 after altering the topic from 3 to 6 partitions.',
   },
   {
-    q: 'You need a set of related events to stay strictly ordered. What must be true?',
+    q: 'What can reorder records within a single partition, proven conceptually above, even though the partition itself never reorders what it has already accepted?',
     options: [
-      'They must be in different partitions',
-      'They must land on the same partition',
-      'The topic must have exactly one consumer group',
-      'They must be produced with acks=0',
+      'Adding more consumers to the group',
+      'A producer with maxInFlightRequests > 1 retrying an earlier batch after a later batch already succeeded',
+      'Increasing retention.ms',
+      'Reading with fromBeginning: true',
     ],
     answer: 1,
+    explain: 'The partition log itself is append-only and never reorders accepted writes -- but with multiple in-flight requests, a retried EARLIER batch can arrive and be appended AFTER a LATER batch that succeeded on the first try. maxInFlightRequests: 1 or the idempotent producer (see producers module) prevent this.',
+  },
+  {
+    q: 'What did `ls /tmp/kafka-logs/<topic>-0/` show, proven above, about what a partition physically is?',
+    options: [
+      'A single row in an internal database',
+      'A real directory with segment files: .log (the actual records), .index and .timeindex (offset/time lookups), plus leader-epoch-checkpoint and partition.metadata',
+      'An in-memory-only structure with no disk footprint',
+      'A ZooKeeper znode',
+    ],
+    answer: 1,
+    explain: 'Confirmed with a real ls after producing 3 records: 00000000000000000000.log/.index/.timeindex plus leader-epoch-checkpoint and partition.metadata, all real files under log.dirs (default /tmp/kafka-logs).',
   },
 ];
 

@@ -1,6 +1,6 @@
 ---
-title: 'Partition กับ Ordering'
-description: 'ทำไม partition คือหน่วยของทั้ง parallelism และ ordering ลำดับที่การันตีต่อ partition และ tradeoff ระหว่าง throughput กับ order ทั้ง topic.'
+title: 'Partitions & Ordering'
+description: 'ทำไม partition คือหน่วยของทั้ง parallelism และ ordering ของ Kafka พิสูจน์ ordering ภายใน partition ด้วยการ consume แบบ interleave จริง, พิสูจน์ key remap ตอน alter จริง, และดู segment files บนดิสก์จริง'
 sidebar:
   order: 1
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในประโยคเดียว
+## แนวคิดในหนึ่งประโยค
 
-**Partition** คือหน่วยของทั้ง **parallelism** และ **ordering**: partition ยิ่งเยอะ throughput ยิ่งสูง แต่ Kafka การันตีลำดับแค่ **ภายใน** partition เท่านั้น ไม่เคยการันตีข้าม partition ทั้ง topic.
+**partition** คือหน่วยของทั้ง **parallelism** และ **ordering** ใน Kafka — ยิ่งมี partition มากยิ่งได้ throughput มากขึ้น แต่ Kafka รับประกัน order แค่ **ภายใน** partition เดียวเท่านั้น — ไม่เคยรับประกันข้าม topic ทั้งหมด
 
-## การันตีเดียว scope เดียว
+## การรับประกันหนึ่งอย่าง ในขอบเขตเดียว
 
-Kafka ให้การันตีลำดับที่แข็งแรง แต่ scope อยู่แค่ partition เดียว ภายใน `orders-0` offset 5 มาหลัง offset 4 เสมอตลอดไป ส่วนข้าม partition **ไม่มี** ลำดับที่แน่นอน: offset 5 ของ `orders-0` กับ offset 5 ของ `orders-1` อาจถูกเขียนก่อนหลังกันแบบไหนก็ได้ และ consumer อาจอ่านสลับลำดับกันได้
+Kafka ให้การรับประกัน ordering ที่แข็งแรง แต่ขอบเขตของมันคือ partition เดียวเท่านั้น ภายใน `orders-0` offset 5 จะตามหลัง offset 4 เสมอ ตลอดไป แต่ข้าม partition ไม่มี order ที่กำหนดไว้เลย: offset 5 ของ `orders-0` กับ offset 5 ของ `orders-1` อาจถูกเขียนมาในลำดับเวลาจริงแบบไหนก็ได้ และ consumer อาจอ่านมันในลำดับไหนก็ได้
 
 ```text
 orders-0:  [a0][a1][a2][a3]      ← totally ordered
@@ -24,19 +25,82 @@ orders-1:  [b0][b1][b2]          ← totally ordered
                                   ← a2 vs b1: NO defined order
 ```
 
-นี่ไม่ใช่ข้อจำกัดที่ต้องหาทางเลี่ยง แต่เป็นราคาของการ scale แนวนอน log เดียวที่ ordered ทั้งหมดเขียนเร็วกว่าที่เครื่องเดียว append ได้ไม่ได้ การแตกเป็น partition ทำให้หลายเครื่อง append พร้อมกัน — คุณแลก global order กับ throughput.
+นี่ไม่ใช่ข้อจำกัดที่ต้องหาทางเลี่ยง แต่เป็นราคาที่ต้องจ่ายเพื่อขยายสเกลแนวนอน log ที่เรียงลำดับสมบูรณ์เพียงตัวเดียวไม่สามารถเขียนได้เร็วกว่าที่เครื่องเดียวจะ append ได้ การแบ่งเป็น partition ทำให้หลายเครื่อง append พร้อมกันได้ — คุณแลก global order กับ throughput
+
+## พิสูจน์: เขียนแบบ interleave จริง แต่อ่านไม่ interleave เลย
+
+เพื่อทำให้ "ไม่มี order ที่กำหนดไว้ข้าม partition" เป็นรูปธรรมแทนที่จะเป็นแค่ทฤษฎี สคริปต์นี้ส่งไปสอง partition แบบ **interleave ตามลำดับเวลาจริง** (`a0, b0, a1, b1, a2, b2, a3, b3`) แล้ว consume ทั้งหมดกลับมา:
+
+```typescript
+// src/partitions-and-ordering/ordering-interleave.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ordering-interleave`;
+
+const kafka = new Kafka({ clientId: 'ordering-interleave', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+// Send order in real time: a0, b0, a1, b1, a2, b2, a3, b3 -- genuinely interleaved.
+for (let i = 0; i < 4; i++) {
+  await producer.send({ topic, messages: [{ partition: 0, value: `a${i}` }] });
+  await producer.send({ topic, messages: [{ partition: 1, value: `b${i}` }] });
+}
+await producer.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}ordering-interleave-group` });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+const seen: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({
+    eachMessage: async ({ partition, message }) => {
+      seen.push(`p${partition}:${message.value!.toString()}(offset ${message.offset})`);
+      if (seen.length === 8) resolve();
+    },
+  });
+  setTimeout(resolve, 8000);
+});
+await consumer.disconnect();
+console.log('consumed order (as delivered to the app):');
+console.log(seen.join('\n'));
+process.exit(0);
+```
+
+ผลจริงจากสคริปต์นี้เป๊ะ ๆ รันกับ broker Kafka 4.3.1:
+
+```text
+consumed order (as delivered to the app):
+p1:b0(offset 0)
+p1:b1(offset 1)
+p1:b2(offset 2)
+p1:b3(offset 3)
+p0:a0(offset 0)
+p0:a1(offset 1)
+p0:a2(offset 2)
+p0:a3(offset 3)
+```
+
+**ภายใน** `p1`: `b0, b1, b2, b3` — เรียงตามที่เขียนจริงเป๊ะ ทุกครั้ง **ภายใน** `p0`: `a0, a1, a2, a3` — เหมือนกัน แต่สอง log นี้ถูกเขียนแบบ **interleave** (`a0, b0, a1, b1, ...`) และ consumer กลับส่งมอบ **`p1` มาทั้งหมดก่อน `p0` ทั้งหมด** — ตรงข้ามกับ interleave เลย นี่ไม่ใช่บั๊ก: ไม่มีอะไรใน protocol รับประกันความสัมพันธ์ระหว่างลำดับเวลาการเขียนข้าม partition กับลำดับที่ consumer fetch/ส่งมอบ order ภายใน partition คือการรับประกันเดียวที่มี ส่วน order ข้าม partition ไม่ได้กำหนดไว้ และอย่างที่เห็นข้างต้น อาจดูไม่เหมือนเวลาจริงเลย
 
 ## Partition กำหนดเพดาน parallelism ของ consumer
 
-ภายใน consumer group หนึ่ง **partition หนึ่งถูกอ่านโดย consumer เดียวในเวลาหนึ่ง** ทำให้จำนวน partition เป็นเพดานว่ามี consumer ทำงานพร้อมกันได้กี่ตัว:
+ภายใน consumer group **partition หนึ่งตัวถูกอ่านโดย consumer เพียงตัวเดียวในเวลาหนึ่ง** นั่นทำให้จำนวน partition เป็นเพดานว่า consumer ทำงานพร้อมกันได้กี่ตัว:
 
-- 6 partition, 3 consumer → แต่ละตัวอ่าน 2 partition.
-- 6 partition, 6 consumer → แต่ละตัวอ่าน 1 (parallelism สูงสุด).
-- 6 partition, 8 consumer → 6 ตัวทำงาน อีก **2 ตัวว่าง** เพราะไม่มี partition ให้ assign.
+- 6 partitions, consumer 3 ตัว → แต่ละตัวอ่าน 2 partitions
+- 6 partitions, consumer 6 ตัว → แต่ละตัวอ่าน 1 partition (parallelism สูงสุด)
+- 6 partitions, consumer 8 ตัว → ทำงานแค่ 6 ตัว **อีก 2 ตัวว่าง** ไม่มีอะไรให้ทำ
 
-ถ้าอยาก scale การ consume ทีหลัง ต้องเตรียม partition ให้พอตั้งแต่แรก — consumer แบ่งย่อย partition เดียวไม่ได้
+ถ้าจะขยาย consumer ในอนาคต ต้องเตรียม partition ไว้ล่วงหน้าให้พอ — consumer แบ่ง partition เดียวออกเป็นส่วนย่อยไม่ได้
 
-<Mermaid title="จำนวน partition คุมว่ามี consumer ทำงานพร้อมกันได้กี่ตัว" code={parallelDiagram} />
+<Mermaid title="จำนวน partition กำหนดเพดานว่า consumer ทำงานพร้อมกันได้กี่ตัว" code={parallelDiagram} />
 
 export const parallelDiagram = `flowchart LR
   subgraph topic["Topic: orders (4 partitions)"]
@@ -49,62 +113,209 @@ export const parallelDiagram = `flowchart LR
   p1 --> c1
   p2 --> c2["Consumer 2"]
   p3 --> c3["Consumer 3"]
-  idle["Consumer 4 (idle: ไม่เหลือ partition)"]`;
+  idle["Consumer 4 (idle: no partition left)"]`;
 
-## Tradeoff ในการออกแบบ
+## พิสูจน์: เพิ่ม partition ทำให้ key remap กลางทาง
+
+เพราะ partitioner ค่าเริ่มต้นคำนวณ `hash(key) % numberOfPartitions` การเปลี่ยนจำนวน partition จึงเปลี่ยนตัวหาร — และทำให้ key ตกไปที่ partition ต่างออกไป คำสั่ง CLI ที่เทียบเท่ากันสำหรับการขยาย topic คือ:
+
+```text
+kafka-topics.sh --bootstrap-server localhost:9092 --alter --topic remap-demo --partitions 6
+```
+
+สคริปต์นี้พิสูจน์แบบเดียวกับที่ `--alter --partitions` ทำภายใต้ฉากหลัง (admin API's `createPartitions` ซึ่ง `kafka-topics.sh --alter` เรียกใช้เอง) — สคริปต์เดียวต่อเนื่อง ส่ง key เดิม **ก่อน** และ **หลัง** ตามลำดับเคร่งครัด จึงไม่มีความคลุมเครือว่า write ไหนเกิดขึ้นภายใต้จำนวน partition เท่าไหร่:
+
+```typescript
+// src/partitions-and-ordering/remap-demo.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}remap-demo`;
+
+const kafka = new Kafka({ clientId: 'remap-demo', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+
+const producer = kafka.producer();
+await producer.connect();
+const [before] = await producer.send({ topic, messages: [{ key: 'user-42', value: 'before-alter' }] });
+console.log(`BEFORE alter (3 partitions): key=user-42 -> partition ${before.partition}`);
+
+// Same operation kafka-topics.sh --alter --topic remap-demo --partitions 6 performs.
+await admin.createPartitions({ topicPartitions: [{ topic, count: 6 }] });
+await admin.disconnect();
+await producer.disconnect();
+
+// A FRESH producer, not the same one, deliberately -- see the gotcha below.
+const producer2 = kafka.producer();
+await producer2.connect();
+const [after] = await producer2.send({ topic, messages: [{ key: 'user-42', value: 'after-alter' }] });
+console.log(`AFTER alter (6 partitions): key=user-42 -> partition ${after.partition}`);
+await producer2.disconnect();
+process.exit(0);
+```
+
+ผลจริงจากสคริปต์นี้เป๊ะ ๆ รันกับ broker Kafka 4.3.1:
+
+```text
+BEFORE alter (3 partitions): key=user-42 -> partition 1
+AFTER alter (6 partitions): key=user-42 -> partition 4
+```
+
+key เดียวกัน โค้ด producer เดียวกัน แต่ได้ **partition ต่างกัน** — เพราะ `hash("user-42") % 3 = 1` แต่ `hash("user-42") % 6 = 4` ทุก record ของ `user-42` ที่เขียนก่อน alter จะอยู่ที่ partition 1 ตลอดไป ทุก record ที่เขียนหลัง alter จะตกที่ partition 4 ถ้ามีอะไรพึ่งพาว่า event ทั้งหมดของ `user-42` อยู่ใน partition เดียว (ordering หรือ state store ของ Kafka Streams ที่ key ด้วย partition) การรับประกันนั้นเพิ่งพังไปแบบเงียบ ๆ — ไม่มี error ทั้งจาก alter หรือจาก `send()` ครั้งถัดไป บท [keys-and-partitioning](/kafka/th/topics-and-partitions/keys-and-partitioning/) พูดเรื่องนี้ลึกกว่านี้ รวมถึงทำไมต้องเตรียมจำนวน partition ไว้ล่วงหน้าสำหรับ topic ที่ใช้ key
+
+<Callout title="Gotcha ที่เจอระหว่างพิสูจน์เรื่องนี้">
+producer instance ของ KafkaJS **ตัวเดิม** ที่ใช้ซ้ำสำหรับส่ง "after" โดยไม่ disconnect ก่อน ยังคงคืน partition 1 — คำตอบเก่าตอน 3 partitions — ทั้งที่ topic มี 6 partitions จริงแล้วตอนนั้น producer ที่เชื่อมต่ออยู่จะ cache partition metadata ที่ดึงมาตอน send ครั้งแรก และไม่ refresh เองแค่เพราะ admin client ไปแก้ topic จากที่อื่น การ disconnect แล้วเชื่อมต่อใหม่ (หรือใน process ที่มีอายุยืน การเรียก `producer.send()` หลังเวลา/error มากพอให้กลไก refresh metadata ของ KafkaJS ทำงานเอง) คือสิ่งที่ทำให้รับจำนวน partition ใหม่จริง ๆ ถ้าการ debug ของคุณเองมีลักษณะ "เพิ่ม partition แล้วแต่ producer ยังเขียนไปที่ช่วงเก่า" ให้ตรวจ stale client-side metadata เป็นอันดับแรก
+</Callout>
+
+## Producer-side reordering: max.in.flight กับ retries
+
+order ของ partition ก็พังได้ **ก่อน** ที่อะไรจะไปถึง partition ด้วย — ที่ producer ถ้า `maxInFlightRequests` มากกว่า 1 และ batch หนึ่งล้มเหลวแล้วถูก retry batch **ทีหลัง** ที่สำเร็จไปแล้วอาจจบด้วยการถูกเขียนก่อน batch **ก่อนหน้า** ที่ใช้เวลา retry นานกว่า — ตัว partition เองไม่เคยเรียงลำดับใหม่สิ่งที่มันรับไปแล้ว แต่สอง request ของ producer ที่แยกกันอาจมาถึงไม่ตรงลำดับเดิม การตั้ง `maxInFlightRequests: 1` (KafkaJS) ป้องกันสิ่งนี้ได้ แลกกับต้นทุน throughput ส่วน idempotent producer (`idempotent: true`) แก้ปัญหาเดียวกันด้วย sequence number แทน โดยไม่เสีย ordering เลย กลไกนี้ พิสูจน์ด้วย sequence number จริงจาก `kafka-dump-log.sh` เป็นเรื่องของโมดูล producers — ดู [idempotent-producer](/kafka/th/producers/idempotent-producer/) สำหรับการพิสูจน์แบบเต็ม
+
+## พิสูจน์: segment files มีอยู่จริงบนดิสก์
+
+partition ไม่ใช่แนวคิดนามธรรม — มันคือ directory ของไฟล์จริง `log.dirs` ค่าเริ่มต้นของ Kafka 4.3.1 คือ `/tmp/kafka-logs` และทุก partition จะได้ `/tmp/kafka-logs/<topic>-<partition>/`:
+
+```bash
+# scripts/partitions-and-ordering/list-segments.sh
+TOPIC="${TOPIC_PREFIX:-}segments-demo"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic "$TOPIC" --partitions 1 --if-not-exists
+for i in 1 2 3; do echo "record-$i" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC"; done
+ls -la "/tmp/kafka-logs/${TOPIC}-0/"
+```
+
+ผลจริง (scratch broker ของตัวเอง หนึ่ง partition หลังผลิต 3 records):
+
+```text
+total 20
+drwxr-xr-x  2 appuser appuser     4096 Sep 28 22:57 .
+drwxr-xr-x 59 appuser appuser     4096 Sep 28 22:58 ..
+-rw-r--r--  1 appuser appuser 10485760 Sep 28 22:57 00000000000000000000.index
+-rw-r--r--  1 appuser appuser      428 Sep 28 22:57 00000000000000000000.log
+-rw-r--r--  1 appuser appuser 10485756 Sep 28 22:57 00000000000000000000.timeindex
+-rw-r--r--  1 appuser appuser        8 Sep 28 22:57 leader-epoch-checkpoint
+-rw-r--r--  1 appuser appuser       43 Sep 28 22:57 partition.metadata
+```
+
+สามไฟล์ต่อหนึ่ง **segment** (log เริ่มด้วย segment เดียว `00000000000000000000.*` ตั้งชื่อตาม base offset ของมัน): **`.log`** เก็บ record จริง (byte จริง โตขึ้นทุกครั้งที่ append — นั่นคือเหตุผลที่มันมีแค่ 428 byte ที่นี่ ทั้งที่ไฟล์ `.index`/`.timeindex` ถูก pre-allocate ไว้ที่ 10 MiB ซึ่งเป็นเพดานจาก `index.max.bytes` ไม่ใช่ขนาดจริงที่ใช้); **`.index`** map offset ไปยังตำแหน่ง byte ในไฟล์ `.log` เพื่อ seek เร็ว; **`.timeindex`** ทำแบบเดียวกันสำหรับ timestamp (ใช้ขับเคลื่อน `--offsets-for-times` และการ seek ตามเวลา) `leader-epoch-checkpoint` ติดตามขอบเขต leader-epoch (ใช้ fence follower ที่ค้างอยู่หลัง leader เปลี่ยน); `partition.metadata` เก็บ topic ID ของ partition partition ที่โตขึ้นเรื่อย ๆ หมายถึง **segment มากขึ้น** ไม่ใช่ไฟล์เดียวที่โตไม่หยุด — บท [retention-and-compaction](/kafka/th/topics-and-partitions/retention-and-compaction/) พิสูจน์การ roll และลบ segment ตรง ๆ บนไฟล์ชุดเดียวกันนี้
+
+## จุดแลกเปลี่ยนในการออกแบบ
 
 การเลือกจำนวน partition คือการเลือกจุดบนเส้นโค้ง:
 
-- **Partition เยอะ** → throughput สูงและ consumer parallelism มากขึ้น แต่ open files เยอะ metadata เยอะ และ rebalance นานขึ้น
-- **Partition น้อย** → เรียบง่ายและถูกกว่า แต่เพดาน throughput ต่ำ
-- **ความต้องการ ordering** → ถ้า event ชุดหนึ่งต้องเรียงลำดับกันเป๊ะ ต้องลงที่ **partition เดียวกัน** (บทถัดไปอธิบายว่า key ทำแบบนี้ยังไง).
+- **partition มากขึ้น** → throughput และ consumer parallelism สูงขึ้น แต่ open file มากขึ้น metadata มากขึ้น และ rebalance นานขึ้น
+- **partition น้อยลง** → ง่ายกว่าและถูกกว่า แต่เพดาน throughput ต่ำกว่า
+- **ความต้องการ ordering** → ถ้ามีชุด event ที่ต้องเรียงลำดับกันเข้มงวด ต้องตกที่ **partition เดียวกัน** — พิสูจน์ข้างต้นแล้วว่าต้องวางแผนล่วงหน้า เพราะการ alter จำนวน partition ทำให้ key remap
 
-กฎที่ใช้ได้จริง: ตั้ง partition ตาม **throughput เป้าหมายบวก headroom** และให้ event ที่ต้องเรียงลำดับกันอยู่ partition เดียวกัน
+กฎที่ใช้ได้จริง: กำหนด partition ตาม **throughput เป้าหมายบวก headroom** และให้แน่ใจว่า event ที่เกี่ยวข้องกันซึ่งต้อง order อยู่ใน partition เดียวกัน
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Partition** คือหน่วยของ **parallelism และ ordering** ลำดับการันตี **ภายใน** partition ไม่ใช่ข้าม topic — นั่นคือราคาของการ scale การเขียนข้ามเครื่อง ภายใน consumer group **partition หนึ่งอ่านโดย consumer เดียว** จำนวน partition จึง **คุมเพดาน parallelism ของ consumer** เตรียม partition ตาม throughput เป้าหมาย และเก็บ event ที่ต้องเรียงลำดับไว้ partition เดียวกัน
+<Callout title="สรุปในหนึ่งบรรทัด">
+**partition** คือหน่วยของ **parallelism และ ordering** ของ Kafka order ถูกรับประกัน **ภายใน** partition เท่านั้น ไม่เคยข้าม topic — พิสูจน์ข้างต้นแล้ว: การเขียน interleave ตามเวลาจริงกลับมาแบบไม่ interleave เลยตอนอ่าน ภายใน consumer group **partition หนึ่งตัวถูกอ่านโดย consumer ตัวเดียว** ดังนั้นจำนวน partition จึง **กำหนดเพดาน parallelism ของ consumer** **การเพิ่ม partition ทำให้ key remap** (พิสูจน์ข้างต้น: key เดียวกันย้ายจาก partition 1 ไป partition 4 หลัง alter จาก 3 เป็น 6 partitions) — เตรียม partition ตามเป้าหมาย throughput **ล่วงหน้า** สำหรับ topic ใดก็ตามที่ ordering ต่อ key สำคัญ
 </Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug code={`// src/partitions-and-ordering/global-order-assumption.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'order-service', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'order-timeline' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'order-events', fromBeginning: true });
+
+// Build a single global timeline of every order event across the whole topic
+const timeline: string[] = [];
+
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    // Assumes offsets increase in the same order events actually happened,
+    // across the WHOLE topic, so this array is "the" order of events.
+    timeline.push(message.value!.toString());
+  },
+});
+`}>
+
+โค้ดนี้ compile และรันได้โดยไม่มี error และถ้า topic มี **partition เดียว** มันจะถูกต้องด้วยซ้ำ บั๊กอยู่ที่สมมติฐานในคอมเมนต์: "offsets increase in the same order events actually happened, across the whole topic" Kafka รับประกัน order แค่ **ภายใน partition** เท่านั้น (พิสูจน์ข้างต้นด้วยการทดสอบเขียนแบบ interleave — record 4 ตัวของ `p1` มาถึงก่อน `p0` ทั้งที่ถูกเขียนแบบ interleave ตามเวลาจริง) ถ้า `order-events` มีมากกว่าหนึ่ง partition `timeline` ไม่ใช่ "ลำดับที่สิ่งต่าง ๆ เกิดขึ้น" — มันคือการ interleave แบบสุ่มของ log ที่เรียงลำดับอิสระ N ตัว ซึ่งขึ้นกับจังหวะ fetch ไม่ใช่เวลาที่ event เกิดขึ้นจริง วิธีแก้คือให้ topic มี partition เดียว (ฆ่า throughput และ parallelism) หรือติดตาม order **ต่อ key** (เช่นต่อ `orderId`) โดยใช้ partition + offset ของ record เอง แทนที่จะใช้ array ร่วมกัน และไม่สมมติว่า timeline ข้าม partition มีความหมายโดยไม่มีขั้นตอน reconciliation ตาม timestamp อย่างชัดเจน
+
+</SpotTheBug>
+
+## Mental Model
+
+ให้นึกถึง topic เป็น **ชั้นวางสมุดโน้ตอิสระหลายเล่ม** หนึ่งเล่มต่อหนึ่ง partition ไม่ใช่ม้วนกระดาษยาวม้วนเดียว แต่ละเล่มถูกเขียนจากหน้าแรกไปหน้าสุดท้ายอย่างเคร่งครัด ตลอดไป — คุณเชื่อใจ order ภายในเล่มเดียวได้เสมอ แต่ไม่มีอะไรบอกว่าหน้า 10 ของสมุดเล่ม 3 ถูกเขียนก่อนหรือหลังหน้า 10 ของสมุดเล่ม 1 — มันเป็นสมุดแยกกันที่ถูกเติมโดยคนเขียนแยกกัน (หรือคนเดียวกัน แต่จัดตารางเวลาอิสระกัน) "อ่าน topic" หมายถึงหยิบสมุดมาอ่านตามลำดับที่สะดวก ไม่ใช่อ่านหน้าตามลำดับเดียวที่รวมกันเป็นหนึ่ง
+
+## จุดแลกเปลี่ยน (Trade-offs)
+
+- **Partition เดียว** — global order สมบูรณ์แบบ แต่ write parallelism เป็นศูนย์ (เครื่องเดียว ดิสก์เดียว append stream เดียวคือเพดาน) เหมาะกับ topic throughput ต่ำที่ต้องการ total order จริง ๆ
+- **หลาย partition** — write และ read parallelism สูง แต่ ordering รอดแค่ภายในแต่ละ partition สิ่งที่ต้อง order ต้องถูกบังคับให้ไปที่ partition เดียวกันผ่าน key (บทถัดไป) และการบังคับนั้นพังได้ถ้าจำนวน partition เปลี่ยน (พิสูจน์ข้างต้น)
+- **`maxInFlightRequests: 1`** — คืน order การส่งต่อ partition ที่เข้มงวดแม้มี retry แลกกับ in-flight request ทีละหนึ่ง (producer throughput ต่ำลง) idempotent producer ได้การรับประกันเดียวกันโดยไม่เสียต้นทุนนี้ — ดูโมดูล producers
+- **เพิ่ม partition ทีหลัง** — operation ที่ดูถูกและย้อนกลับได้ (`--alter --partitions`) ไม่ได้ฟรี — พิสูจน์ข้างต้นแล้วว่ามัน remap ปลายทางของทุก key แบบเงียบ ๆ ไปข้างหน้า ซึ่งเป็นการเปลี่ยนแปลง correctness ที่แฝงมาในรูป capacity
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Kafka รับประกัน order ทั้ง topic"** ไม่จริง — พิสูจน์ข้างต้น: การเขียน interleave ตามเวลาจริงข้ามสอง partition กลับมาเรียงใหม่หมด (partition หนึ่งมาทั้งหมดก่อน อีก partition ตามมาทั้งหมด) order มีแค่ต่อ partition เท่านั้น
+- **"การเพิ่ม partition เป็นการขยายสเกลที่ปลอดภัยแบบ additive ล้วน ๆ"** ไม่จริง — พิสูจน์ข้างต้น: key เดียวกันย้ายจาก partition 1 ไป partition 4 ทันทีที่ topic เปลี่ยนจาก 3 เป็น 6 partitions เพราะ hash ของ partitioner คือ `% numberOfPartitions`
+- **"ยิ่ง partition เยอะยิ่งประสิทธิภาพดีเสมอ"** ไม่จริงเสมอไป — partition ที่มากขึ้นหมายถึง open file handle ต่อ broker มากขึ้น traffic การ replicate มากขึ้น metadata มากขึ้น และ rebalance นานขึ้น มันยกเพดาน throughput ขึ้น ไม่ได้ลด latency ด้วยตัวมันเอง
+- **"partition เป็นแค่แนวคิดเชิงตรรกะ ไม่ใช่ไฟล์จริงที่ไปดูได้"** มันคือไฟล์จริง — พิสูจน์ข้างต้นด้วยการ `ls` จริงที่ `/tmp/kafka-logs/<topic>-0/` แสดงไฟล์ segment `.log`/`.index`/`.timeindex` ที่ Kafka เพิ่งเขียนจริง
 
 export const quizOrdering = [
   {
-    q: 'Kafka การันตี ordering แบบไหน?',
+    q: 'Kafka รับประกัน ordering แบบไหน?',
     options: [
       'Total ordering ทั้ง topic',
-      'Total ordering ภายใน partition เดียว แต่ไม่การันตีข้าม partition',
+      'Total ordering ภายใน partition เดียว แต่ไม่มีข้าม partition',
       'เรียงตามขนาด message',
-      'ไม่การันตีลำดับเลย',
+      'ไม่มี ordering เลย',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างต้น: เขียนสอง partition แบบ interleave ตามเวลาจริง (a0,b0,a1,b1,...) แต่ consume ออกมาเป็น p1 ทั้งหมดก่อนแล้วค่อย p0 ทั้งหมด -- ไม่มีความสัมพันธ์กับ order การเขียนข้าม partition เลย ในขณะที่แต่ละ partition เองยังเรียงลำดับเคร่งครัด',
   },
   {
-    q: 'Topic มี 4 partition แต่ consumer group มี 6 consumer จะเกิดอะไรขึ้น?',
+    q: 'Topic มี 4 partitions และ consumer group มี consumer 6 ตัว จะเกิดอะไรขึ้น?',
     options: [
-      'แต่ละ consumer อ่านบางส่วนของ partition',
-      '4 consumer อ่านคนละ partition อีก 2 consumer ว่าง',
-      'topic โตเป็น 6 partition อัตโนมัติ',
-      'group start ไม่ขึ้น',
+      'consumer แต่ละตัวอ่านบางส่วนของ partition',
+      'consumer 4 ตัวอ่าน partition ตัวละหนึ่ง; อีก 2 ตัวว่าง',
+      'topic จะเพิ่ม partition เป็น 6 อัตโนมัติ',
+      'group จะ start ไม่ได้',
     ],
     answer: 1,
+    explain: 'partition หนึ่งตัวถูก assign ให้ consumer ตัวเดียวภายใน group ในเวลาหนึ่ง -- แบ่ง partition เดียวให้ consumer สองตัวไม่ได้',
   },
   {
-    q: 'ทำไม Kafka ไม่การันตี ordering ข้าม partition?',
+    q: 'kafka-topics.sh --alter --partitions มีผลจริงที่พิสูจน์ได้อะไรกับ topic ที่ใช้ key ตามที่แสดงข้างต้น?',
     options: [
-      'เป็นบั๊กที่กำลังแก้',
-      'การแตกเป็น partition อิสระคือสิ่งที่ทำให้หลายเครื่องเขียนพร้อมกันได้ — global order จะทำลายจุดนั้น',
-      'เพราะ consumer เป็น single-thread',
-      'ordering ข้าม partition ต้องใช้ ZooKeeper',
+      'ไม่มีผลต่อว่า key ไปตกที่ไหน -- เปลี่ยนแค่ capacity',
+      'key เดิมอาจไปตก partition ต่างออกไปได้ เพราะ hash(key) % numberOfPartitions เปลี่ยน -- พิสูจน์แล้ว: user-42 ย้ายจาก partition 1 ไป partition 4 หลังจาก 3->6',
+      'ลบข้อมูลทั้งหมดใน topic',
+      'ต้องหยุดทั้ง cluster',
     ],
     answer: 1,
+    explain: 'พิสูจน์แบบสด ๆ: producer call เดียวกันเป๊ะสำหรับ key "user-42" คืน partition 1 ก่อน alter และ partition 4 หลัง alter topic จาก 3 เป็น 6 partitions',
   },
   {
-    q: 'คุณต้องการให้ event ชุดหนึ่งเรียงลำดับกันเป๊ะ อะไรต้องเป็นจริง?',
+    q: 'อะไรที่สามารถเรียงลำดับ record ภายใน partition เดียวใหม่ได้ (ตามแนวคิดที่พิสูจน์ข้างต้น) ทั้งที่ตัว partition เองไม่เคยเรียงลำดับสิ่งที่รับไปแล้วใหม่?',
     options: [
-      'ต้องอยู่คนละ partition',
-      'ต้องลงที่ partition เดียวกัน',
-      'topic ต้องมี consumer group เดียว',
-      'ต้อง produce ด้วย acks=0',
+      'การเพิ่ม consumer เข้า group',
+      'producer ที่ maxInFlightRequests > 1 แล้ว retry batch ก่อนหน้า หลังจาก batch ทีหลังสำเร็จไปแล้ว',
+      'การเพิ่ม retention.ms',
+      'การอ่านด้วย fromBeginning: true',
     ],
     answer: 1,
+    explain: 'partition log เองเป็น append-only และไม่เคยเรียงลำดับ write ที่รับไปแล้วใหม่ -- แต่เมื่อมีหลาย request ค้างอยู่พร้อมกัน batch ก่อนหน้าที่ถูก retry อาจมาถึงและถูก append หลัง batch ทีหลังที่สำเร็จในครั้งแรก maxInFlightRequests: 1 หรือ idempotent producer (ดูโมดูล producers) ป้องกันสิ่งนี้',
+  },
+  {
+    q: '`ls /tmp/kafka-logs/<topic>-0/` แสดงอะไร (พิสูจน์ข้างต้น) เกี่ยวกับสิ่งที่ partition เป็นจริง ๆ ทางกายภาพ?',
+    options: [
+      'แถวเดียวในฐานข้อมูลภายใน',
+      'directory จริงที่มี segment files: .log (record จริง), .index กับ .timeindex (lookup offset/time) บวก leader-epoch-checkpoint และ partition.metadata',
+      'โครงสร้างในหน่วยความจำล้วน ๆ ไม่มีรอยบนดิสก์',
+      'znode ของ ZooKeeper',
+    ],
+    answer: 1,
+    explain: 'ยืนยันด้วย ls จริงหลังผลิต 3 records: 00000000000000000000.log/.index/.timeindex บวก leader-epoch-checkpoint และ partition.metadata ล้วนเป็นไฟล์จริงภายใต้ log.dirs (ค่าเริ่มต้น /tmp/kafka-logs)',
   },
 ];
 
