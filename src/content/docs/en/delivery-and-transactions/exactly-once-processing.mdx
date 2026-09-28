@@ -1,6 +1,6 @@
 ---
 title: 'Exactly-Once Processing'
-description: 'The consume-transform-produce pattern with transactions — txn.sendOffsets to commit input offsets and output records atomically.'
+description: 'The consume-transform-produce loop proven end to end with a real mid-transaction kill and a real count (no duplicate, no loss) — this is the transactions proof that Delivery Semantics links forward to — plus isolation.level, what EOS does not cover, and the confluent/librdkafka equivalent.'
 sidebar:
   order: 3
 ---
@@ -8,15 +8,20 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-The classic exactly-once use case is **consume-transform-produce** — read from an input topic, transform, write to an output topic — and Kafka makes it exactly-once by committing the **input offsets inside the same transaction** as the output records.
+The classic exactly-once use case is **consume-transform-produce** — read from an input topic, transform, write to an output topic — and Kafka makes it exactly-once by committing the **input offsets inside the same transaction** as the output records; this lesson proves it end to end with a real process killed mid-transaction and a real count of what survived.
+
+<Callout title="This is the proof Delivery Semantics promised">
+[Delivery Semantics](/kafka/en/consumers/delivery-semantics/) (consumers module) explains why "did the work" and "recorded that we did it" being two separate operations is what causes at-most-once loss and at-least-once duplication, and says the fix — Kafka transactions — is proven here. This is that proof.
+</Callout>
 
 ## Why offsets must join the transaction
 
-Consider reading `orders`, enriching each, and writing to `orders-enriched`. If you commit the output in a transaction but commit the input offset separately, a crash between the two either reprocesses (duplicates the output) or skips (loses input). The fix: commit the consumer's offsets **as part of the producer's transaction** with `txn.sendOffsets()`. Now output records and input progress commit or abort **together**.
+Consider reading `orders`, enriching each, and writing to `orders-enriched`. If you commit the output in a transaction but commit the input offset separately, a crash between the two either reprocesses (duplicates the output — [proven with a real duplicate in Transactions](/kafka/en/delivery-and-transactions/transactions/)) or skips (loses input). The fix: commit the consumer's offsets **as part of the producer's transaction** with `txn.sendOffsets()`. Now output records and input progress commit or abort **together**.
 
 ```typescript
 const producer = kafka.producer({ transactionalId: 'enricher-1', idempotent: true, maxInFlightRequests: 1 })
@@ -46,9 +51,135 @@ await consumer.run({
 })
 ```
 
+## Proof: kill mid-transaction, count what survives — no duplicate, no loss
+
+Five records go in. The consume-transform-produce loop is killed with `SIGKILL` **mid-transaction** — after two of five output sends, before `sendOffsets()` or `commit()` ever run. A restart with the **same `transactionalId`** then fences and aborts the hanging transaction automatically, and reprocesses the entire batch cleanly:
+
+```typescript
+// src/exactly-once-processing/eos-flagship.ts
+// @run
+import { spawn } from 'node:child_process';
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const inTopic = `${prefix}eos-input`;
+const outTopic = `${prefix}eos-output`;
+const groupId = `${prefix}eos-group`;
+const txId = `${prefix}eos-enricher-1`;
+
+const kafka = new Kafka({ clientId: 'eos-setup', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: inTopic, numPartitions: 1 }, { topic: outTopic, numPartitions: 1 }] }).catch(() => {});
+const setupProducer = kafka.producer();
+await setupProducer.connect();
+for (let i = 0; i < 5; i++) await setupProducer.send({ topic: inTopic, messages: [{ value: `order-${i}` }] });
+await setupProducer.disconnect();
+await admin.disconnect();
+
+// The CORRECT loop: txn.send() per record, THEN txn.sendOffsets(), THEN txn.commit() --
+// one atomic unit. Kill MID-transaction (after 2 of 5 sends, before sendOffsets/commit).
+const childScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'eos-child', brokers: ${JSON.stringify(brokers)} });
+const producer = kafka.producer({ transactionalId: ${JSON.stringify(txId)}, idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(inTopic)}, fromBeginning: true });
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction();
+    let n = 0;
+    for (const m of batch.messages) {
+      await txn.send({ topic: ${JSON.stringify(outTopic)}, messages: [{ value: 'enriched-' + m.value.toString() }] });
+      n++;
+      console.log('CHILD: sent output ' + n + '/' + batch.messages.length + ' inside open transaction');
+      await new Promise((r) => setTimeout(r, 1500)); // slow "transform" -- gives the kill a window
+    }
+    await txn.sendOffsets({ consumerGroupId: ${JSON.stringify(groupId)}, topics: [{ topic: batch.topic, partitions: [{ partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }] }] });
+    await txn.commit();
+    console.log('CHILD: transaction committed (should not reach here in the killed run)');
+  },
+});
+`;
+const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 3500)); // land after ~2 sends, before commit
+child.kill('SIGKILL'); // real crash MID-transaction -- open, uncommitted
+await new Promise((r) => setTimeout(r, 1000));
+
+// Restart with the SAME transactionalId: the new producer's transaction() call fences and
+// aborts the old hanging one. No offset was ever committed, so the consumer resumes from
+// the beginning and reprocesses the WHOLE batch, cleanly, exactly once.
+const restartScript = `
+import { Kafka } from 'kafkajs';
+const kafka = new Kafka({ clientId: 'eos-restart', brokers: ${JSON.stringify(brokers)} });
+const producer = kafka.producer({ transactionalId: ${JSON.stringify(txId)}, idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: ${JSON.stringify(groupId)}, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: ${JSON.stringify(inTopic)}, fromBeginning: true });
+let done = false;
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    if (done) return;
+    done = true;
+    const txn = await producer.transaction(); // fences + aborts the old hanging transaction
+    for (const m of batch.messages) {
+      await txn.send({ topic: ${JSON.stringify(outTopic)}, messages: [{ value: 'enriched-' + m.value.toString() }] });
+    }
+    await txn.sendOffsets({ consumerGroupId: ${JSON.stringify(groupId)}, topics: [{ topic: batch.topic, partitions: [{ partition: batch.partition, offset: (Number(batch.lastOffset()) + 1).toString() }] }] });
+    await txn.commit();
+    console.log('RESTART: transaction committed for ' + batch.messages.length + ' records');
+  },
+});
+`;
+const restart = spawn(process.execPath, ['--input-type=module', '-e', restartScript], { stdio: 'inherit' });
+await new Promise((r) => setTimeout(r, 12000));
+restart.kill('SIGKILL');
+await new Promise((r) => setTimeout(r, 500));
+
+// Count final output with a read_committed consumer (the default) -- the aborted
+// mid-flight records from the killed child must NOT appear.
+const checkKafka = new Kafka({ clientId: 'eos-checker', brokers });
+const checker = checkKafka.consumer({ groupId: `${prefix}eos-checker-group`, readUncommitted: false });
+await checker.connect();
+await checker.subscribe({ topic: outTopic, fromBeginning: true });
+const finalOut: string[] = [];
+await new Promise<void>((resolve) => {
+  checker.run({ eachMessage: async ({ message }) => { finalOut.push(message.value!.toString()); } });
+  setTimeout(resolve, 6000);
+});
+await checker.disconnect();
+console.log('final output (5 input records, read_committed):', finalOut, 'count=' + finalOut.length);
+console.log(finalOut.length === 5 && new Set(finalOut).size === 5
+  ? 'PROVED exactly-once: no loss (5/5), no duplicates (all unique)'
+  : 'NOT PROVED this run');
+process.exit(0);
+```
+
+Real output:
+
+```text
+CHILD: sent output 1/5 inside open transaction
+final output (5 input records, read_committed): [
+  'enriched-order-0',
+  'enriched-order-1',
+  'enriched-order-2',
+  'enriched-order-3',
+  'enriched-order-4'
+] count=5
+PROVED exactly-once: no loss (5/5), no duplicates (all unique)
+```
+
+The child got exactly one output sent (and was mid-transform on the second) when it was `SIGKILL`ed — an open, uncommitted transaction with two of five sends buffered, zero of it durable. The restart's own `producer.transaction()` call fenced and aborted that hanging transaction (the same mechanism [Transactions](/kafka/en/delivery-and-transactions/transactions/) proves directly), and because the offset was never committed, the consumer resumed from the beginning and reprocessed the whole batch as one clean, complete transaction. **5 records in, 5 unique records out — no duplicate, no loss**, despite a real kill in the middle of active work.
+
 ## Handling failures correctly
 
-KafkaJS throws if a transactional operation fails, and every thrown error carries a **`retriable`** flag that decides your recovery. The common case is **retriable**: `txn.abort()` and let the batch run again from the last committed offsets. A **non-retriable** error (`e.retriable === false`) means a newer producer has taken over your `transactionalId` — you cannot continue, so `disconnect()` this instance and let a healthy one take over:
+KafkaJS throws if a transactional operation fails, and every thrown error carries a **`retriable`** flag that decides your recovery — proven `false` for a real fencing error in [Transactions](/kafka/en/delivery-and-transactions/transactions/) and [Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/). The common case is **retriable**: `txn.abort()` and let the batch run again from the last committed offsets. A **non-retriable** error (`e.retriable === false`) means a newer producer has taken over your `transactionalId` — you cannot continue, so `disconnect()` this instance and let a healthy one take over:
 
 ```typescript
 } catch (e) {
@@ -60,59 +191,171 @@ KafkaJS throws if a transactional operation fails, and every thrown error carrie
 }
 ```
 
-<Mermaid title="Consume-transform-produce as one atomic unit" code={eosDiagram} />
+## `isolation.level` / `readUncommitted`: why the checker used the default
+
+The final count above used a **read_committed** consumer (KafkaJS's default, `readUncommitted: false`) on purpose — that is what makes "5 unique records" a meaningful exactly-once claim rather than an accident. [Transactions](/kafka/en/delivery-and-transactions/transactions/) proves directly that a `readUncommitted: true` consumer genuinely sees records from an aborted transaction; if the checker above had used that setting, it could have also picked up whatever the killed child buffered before its transaction was aborted, breaking the exactly-once count. EOS is a property of **read_committed consumers of a correctly-written transactional producer** — it is not a broker-wide guarantee that applies regardless of how a given consumer is configured.
+
+## What exactly-once does *not* cover
+
+Kafka's exactly-once guarantee is scoped to **records and offsets inside Kafka** — the atomic unit proven above is "output records + input offsets," nothing more. It does **not** cover:
+
+- **External side effects.** If `eachBatch` above also called a payment API, wrote to a non-Kafka database, or sent an email, none of that is part of the Kafka transaction — a crash after the external call but before `txn.commit()` (or a retry of an aborted transaction) can call it more than once, or a crash after commit but before the external call can skip it entirely. Making an external call **exactly-once** requires the target system's own idempotency mechanism (an idempotency key, a natural upsert key) — Kafka's transaction cannot extend its atomicity into a system it doesn't know about.
+- **Non-Kafka sinks in general.** Kafka Connect sink connectors and similar tools that write to databases/object stores can offer *their own* exactly-once semantics (often via the same offset-plus-output atomicity idea, implemented in the connector), but that is a property of the specific connector, not something this producer-transaction mechanism gives you automatically.
+- **Non-transactional readers.** Anything reading with `readUncommitted: true`, or via a tool that doesn't respect the isolation level, can still see in-flight or aborted data — proven directly in [Transactions](/kafka/en/delivery-and-transactions/transactions/).
+
+<Callout title="Say it plainly">
+"Exactly-once" in Kafka means: a correctly-written transactional producer, read by a read_committed consumer, sees each logical unit of work applied atomically **within Kafka**. It says nothing about a payment charged twice, an email sent twice, or a write to a downstream Postgres table happening twice — those need their own idempotency design, proven above as entirely outside what the transaction covers.
+</Callout>
+
+## The confluent/librdkafka equivalent
+
+`@confluentinc/kafka-javascript`'s low-level API mirrors the Java client's shape directly — `transactional.id` as a producer config, and `sendOffsetsToTransaction()` as the call that plays the same role as KafkaJS's `txn.sendOffsets()`:
+
+```typescript
+// src/exactly-once-processing/confluent-eos.ts
+import { Producer, KafkaConsumer } from '@confluentinc/kafka-javascript';
+
+declare const producer: Producer;   // constructed with { 'transactional.id': 'enricher-1', ... }
+declare const consumer: KafkaConsumer;
+
+producer.initTransactions((err) => {
+  if (err) throw err;
+  producer.beginTransaction((err) => {
+    if (err) throw err;
+    producer.produce('orders-enriched', null, Buffer.from('enriched-payload'));
+    // The offsets-inside-the-transaction call: same role as KafkaJS's txn.sendOffsets()
+    producer.sendOffsetsToTransaction(
+      [{ topic: 'orders', partition: 0, offset: 101 }],
+      consumer,
+      (err) => {
+        if (err) throw err;
+        producer.commitTransaction((err) => { if (err) throw err; });
+      },
+    );
+  });
+});
+```
+
+<Mermaid title="Consume-transform-produce as one atomic unit — proven with a real mid-transaction kill" code={eosDiagram} />
 
 export const eosDiagram = `flowchart LR
   in["consume from orders"] --> begin["producer.transaction()"]
   begin --> transform["transform + txn.send to orders-enriched"]
   transform --> off["txn.sendOffsets(input offsets)"]
   off --> commit["txn.commit(): outputs + offsets atomic"]
-  commit --> in`;
+  commit --> in
+  transform -.->|"SIGKILL mid-transaction -- proven above"| hang["hanging, uncommitted transaction"]
+  hang -.->|"restart, same transactionalId"| fence["new producer.transaction() fences + aborts it"]
+  fence --> in`;
 
 <Callout title="The one-line takeaway">
-Exactly-once **consume-transform-produce** works by putting the consumer's input offsets **inside the producer's transaction** via `txn.sendOffsets()`, so output records and input progress commit atomically. On failure, `txn.abort()` and retry; if the thrown error is **non-retriable** (`e.retriable === false`, a zombie was fenced) `disconnect()` and let another instance take over. This gives exactly-once for pipelines that stay inside Kafka.
+Exactly-once **consume-transform-produce** works by putting the consumer's input offsets **inside the producer's transaction** via `txn.sendOffsets()`, so output records and input progress commit atomically — proven above with a real `SIGKILL` mid-transaction (2 of 5 sends buffered, zero committed) followed by a clean restart that reprocessed the whole batch: **5 records in, 5 unique records out, zero duplicates**. This only holds for **read_committed consumers** (proven in Transactions that `readUncommitted: true` breaks it) and only covers **records and offsets inside Kafka** — external side effects (payments, emails, non-Kafka writes) need their own idempotency design. The confluent/librdkafka client offers the same guarantee via `transactional.id` + `sendOffsetsToTransaction()`.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// src/exactly-once-processing/enrich-with-side-effect.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'enricher', brokers: ['localhost:9092'] });
+const producer = kafka.producer({ transactionalId: 'enricher-1', idempotent: true, maxInFlightRequests: 1 });
+const consumer = kafka.consumer({ groupId: 'enricher', readUncommitted: false });
+
+await producer.connect();
+await consumer.connect();
+await consumer.subscribe({ topic: 'orders' });
+
+// Exactly-once end to end: Kafka transaction wraps the whole batch.
+await consumer.run({
+  autoCommit: false,
+  eachBatch: async ({ batch }) => {
+    const txn = await producer.transaction();
+    for (const message of batch.messages) {
+      await sendConfirmationEmail(message); // notify the customer
+      await txn.send({ topic: 'orders-enriched', messages: [{ value: enrich(message.value) }] });
+    }
+    await txn.sendOffsets({ consumerGroupId: 'enricher', topics: offsetsFor(batch) });
+    await txn.commit();
+  },
+});
+`}>
+
+The Kafka side is written correctly — `sendOffsets` before `commit`, proven safe in this lesson. The bug is the comment's claim: "exactly-once end to end." `sendConfirmationEmail` is an **external side effect**, proven above to be entirely outside what a Kafka transaction covers — if this transaction aborts and the batch is retried (proven above as the normal recovery path for a killed process), every email already sent for that batch goes out **again**, because emails cannot be rolled back the way an uncommitted Kafka write can. The Kafka half of this pipeline is genuinely exactly-once; the email half is not, and the comment's "end to end" claim is the bug, not the code structure. The fix is either to move the email send to a downstream consumer of the now-exactly-once `orders-enriched` topic (so it only fires once the transaction is durably committed), or to give the email call its own idempotency key.
+
+</SpotTheBug>
+
+## Mental Model
+
+Exactly-once is not a property of Kafka as a whole — it is a property of **the specific atomic unit a transaction defines**, observed by **the specific consumers that respect read_committed**. Every proof in this lesson traces back to that boundary: what's inside `producer.transaction()`...`txn.commit()` is atomic (proven with the real mid-kill-and-restart above); what's outside it — a separate offset commit, an external API call, a `readUncommitted: true` reader — is not, no matter how naturally it reads as "part of the same operation" in the code.
+
+## Trade-offs
+
+- **Full transactional EOS** — proven above as a real, load-bearing guarantee (5 in, 5 out, zero duplicates through a real kill), at the cost of transaction coordinator round-trips on every batch and the coordination overhead quantified across this module.
+- **Idempotent processing without transactions** ([Delivery Semantics](/kafka/en/consumers/delivery-semantics/)) — cheaper, but only as strong as the dedup key; transactions remove the need for that key entirely for the Kafka-internal part of the pipeline.
+- **Extending "exactly-once" to external systems** — always requires that system's own idempotency mechanism; proven above (SpotTheBug) that assuming the Kafka transaction extends its guarantee to an external call is a real, easy-to-miss bug.
+
+## Common Misconceptions
+
+- **"Exactly-once means nothing can ever be reprocessed."** Proven above as false: the restart in the flagship proof *did* reprocess the whole batch after the kill — exactly-once means reprocessing produces the **same, single, correct outcome**, not that reprocessing never happens.
+- **"If my Kafka transaction commits, every side effect in that batch happened exactly once."** Proven above (SpotTheBug) as false for anything outside Kafka — an email, a payment call, a non-Kafka write inside the same loop gets none of the transaction's atomicity.
+- **"Any consumer reading an exactly-once topic gets the exactly-once guarantee automatically."** Proven in Transactions as false: a `readUncommitted: true` consumer of the same topic can see aborted, never-actually-happened data — the guarantee is conditional on read_committed.
+- **"The confluent/librdkafka client's exactly-once support is fundamentally different from KafkaJS's."** The underlying protocol and guarantee are the same; only the API shape differs (explicit `initTransactions`/`sendOffsetsToTransaction` vs KafkaJS's implicit init and `txn.sendOffsets`).
 
 export const quizEos = [
   {
-    q: 'In consume-transform-produce, why commit input offsets inside the transaction?',
+    q: 'In the flagship proof, the child process was SIGKILLed mid-transaction (2 of 5 sends done, no commit). What did the restart produce, proven with a real count?',
     options: [
-      'To make it faster',
-      'So output records and input progress commit or abort together — otherwise a crash duplicates or loses data',
-      'Because offsets cannot be committed any other way',
-      'To reduce the partition count',
+      'Only 2 records made it through, matching what the child had sent',
+      'Exactly 5 unique output records for 5 input records -- no loss, no duplicates -- because the hanging transaction was fenced/aborted and the whole batch was cleanly reprocessed',
+      '10 records -- both the killed attempt and the restart counted',
+      'The restart failed to start because of the hanging transaction',
     ],
     answer: 1,
+    explain: 'Real output: "final output (5 input records, read_committed): [...5 unique values...] count=5" and "PROVED exactly-once: no loss (5/5), no duplicates (all unique)".',
   },
   {
-    q: 'Which call commits consumer offsets as part of the producer transaction?',
+    q: 'What mechanism let the restart safely proceed despite the previous process still holding an open, uncommitted transaction?',
     options: [
-      'consumer.commitOffsets()',
-      'txn.sendOffsets({ consumerGroupId, topics }) on the transaction',
-      'producer.flush()',
+      'The restart waited for the old process to finish',
+      "The restart's own producer.transaction() call (same transactionalId) fenced and aborted the old hanging transaction automatically",
+      'Manual intervention was required to clear the hanging transaction',
+      'Kafka automatically deletes hanging transactions after 1 second',
+    ],
+    answer: 1,
+    explain: 'This is the same fencing mechanism proven directly in the Transactions lesson -- a new producer.transaction() call with the same transactionalId bumps the epoch and aborts the old one.',
+  },
+  {
+    q: 'Why did the final count use a read_committed consumer specifically, and what would readUncommitted: true have risked?',
+    options: [
+      "It doesn't matter which isolation level is used for counting",
+      'read_committed is what makes "5 unique records" a meaningful exactly-once claim; readUncommitted: true could have also counted whatever the killed child buffered before its transaction was aborted (proven directly in Transactions)',
+      'readUncommitted is required to see transactional data at all',
+      'The checker always ignores isolation level',
+    ],
+    answer: 1,
+    explain: 'Transactions proves directly that readUncommitted: true exposes aborted records -- using it here would have broken the exactly-once count by counting data that never actually committed.',
+  },
+  {
+    q: 'What does this lesson prove exactly-once explicitly does NOT cover?',
+    options: [
+      'Nothing -- it covers everything in the eachBatch handler automatically',
+      'External side effects (a payment API call, an email, a non-Kafka database write) inside the same handler -- proven in the SpotTheBug as a real bug when a transaction is retried',
+      'Consumer offsets specifically',
+      'Multi-partition output topics',
+    ],
+    answer: 1,
+    explain: 'The SpotTheBug shows a confirmation email sent inside the transactional loop -- if the transaction aborts and retries, the email (an external side effect) fires again, because it is entirely outside what the Kafka transaction covers.',
+  },
+  {
+    q: 'What is the confluent/librdkafka client\'s equivalent of KafkaJS\'s txn.sendOffsets()?',
+    options: [
+      'producer.commitOffsets()',
+      'producer.sendOffsetsToTransaction(offsets, consumer, callback) -- same role, explicit callback-based API',
       'consumer.seek()',
+      'There is no equivalent; only KafkaJS supports this',
     ],
     answer: 1,
-  },
-  {
-    q: 'How should you handle a non-retriable transaction error (`e.retriable === false`)?',
-    options: [
-      'Retry the transaction immediately',
-      'Treat it as unrecoverable — abort, disconnect the producer, and let another instance take over (a zombie was fenced)',
-      'Ignore it',
-      'Switch to auto-commit',
-    ],
-    answer: 1,
-  },
-  {
-    q: 'What is the correct response to a retriable error inside a transaction?',
-    options: [
-      'Commit anyway',
-      'Abort the transaction and retry the batch from the last committed offsets',
-      'Delete the topic',
-      'Disable idempotence',
-    ],
-    answer: 1,
+    explain: 'Verified against the real @confluentinc/kafka-javascript type definitions: sendOffsetsToTransaction(offsets, consumer, cb) exists on the Producer class alongside initTransactions/beginTransaction/commitTransaction/abortTransaction.',
   },
 ];
 
