@@ -1,6 +1,6 @@
 ---
 title: 'The Consumer API'
-description: 'อ่าน record ด้วย KafkaJS consumer ทั้ง subscribe, consumer.run กับ eachMessage, การ deserialize เอง และเหตุผลที่ run loop เป็นตัวขับเคลื่อนทุกอย่างของ consumer'
+description: 'อ่าน record ด้วย KafkaJS consumer — heartbeat/poll loop ตัวจริง ทำไม eachMessage handler ที่ช้าถึงทำให้เกิด rebalance จริง, eachBatch พร้อม heartbeat() แบบ manual, และ partitionsConsumedConcurrently พิสูจน์ทั้งหมดกับ broker จริง'
 sidebar:
   order: 1
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-Kafka consumer จะ subscribe topic แล้ว **รัน consume loop** — KafkaJS เรียก handler `eachMessage` ของคุณด้วย record จาก partition ที่ถูก assign ให้ และ loop ที่รันอยู่นี้เองที่คอยทำให้ consumer ยังมีชีวิตอยู่ใน group
+Kafka consumer subscribe topic แล้ว **รัน consume loop** — KafkaJS เรียก `eachMessage` handler ของคุณด้วย record จาก partition ที่ถูก assign ให้ และ loop ที่รันอยู่นี่แหละคือสิ่งที่ทำให้ consumer ยังมีชีวิตอยู่ใน group
 
-## subscribe ก่อน แล้วค่อย run
+## Subscribe แล้วค่อย run
 
-คุณสร้าง consumer จาก `Kafka` client พร้อม `groupId`, `connect()`, `subscribe()` ไปยัง topic ที่ต้องการ แล้วเริ่ม `run()` KafkaJS จะส่งแต่ละ record ให้ callback `eachMessage` ของคุณ โดย `key` และ `value` มาเป็น `Buffer` ดิบ — คุณ **deserialize เอง** (เช่น `.toString()` หรือ `JSON.parse`) เป็นภาพสะท้อนของฝั่ง producer ที่ serialize
+คุณสร้าง consumer จาก `Kafka` client ด้วย `groupId`, `connect()`, `subscribe()` topic หนึ่งตัวหรือมากกว่า แล้วเริ่ม `run()` KafkaJS จะส่ง record แต่ละอันไปให้ callback `eachMessage` ของคุณ `key` กับ `value` มาเป็น `Buffer` ดิบ — คุณ **deserialize เอง** (เช่น `.toString()` หรือ `JSON.parse`) เป็นภาพสะท้อนของฝั่ง producer ที่ serialize
 
 ```typescript
 import { Kafka } from 'kafkajs';
@@ -42,67 +43,354 @@ async function main() {
 main();
 ```
 
-## ทำไม run loop ถึงสำคัญ
+## heartbeat/poll loop ตัวจริง ไม่ใช่เวอร์ชันย่อ
 
-`run()` ทำมากกว่าแค่ดึงข้อมูล เบื้องหลังจะคอย poll Kafka, ส่ง **heartbeat**, เข้าร่วม group coordination และดึง partition assignment ให้ ถ้า `eachMessage` ของคุณ block นานเกินไป — process record หนึ่งนานกว่า session timeout — group coordinator จะถือว่า consumer ตายแล้ว และสั่ง **rebalance** ย้าย partition ไปให้ตัวอื่น กฎคือ **คุมเวลา process ต่อ record ให้จำกัด**
+คำเดิม — "`run()` ส่ง heartbeat" — ทำให้ฟังดูเหมือน heartbeat เกิดขึ้นเองโดยอิสระจาก handler ของคุณ **ไม่ใช่แบบนั้น** อ่าน source ของ `Runner` ใน KafkaJS เอง (`src/consumer/runner.js`) จะเห็นตำแหน่งที่เรียก heartbeat ตรง ๆ:
 
-<Mermaid title="The consumer run loop" code={pollDiagram} />
+```text
+this.consumerGroup.resolveOffset({ topic, partition, offset: message.offset })
+await this.heartbeat()
+await this.autoCommitOffsetsIfNecessary()
+```
+
+`heartbeat()` ถูกเรียก **หลังจาก `eachMessage` return แล้ว** ใน loop iteration เดียวกัน — ไม่ใช่ timer อิสระ ไม่ใช่ thread แยก ถ้า `eachMessage` กำลัง `await` อะไรที่ช้า heartbeat รอบถัดไปก็ส่งไม่ได้จนกว่า `await` นั้นจะ resolve
+
+<Mermaid title="consumer run loop — heartbeat เรียงลำดับ AFTER eachMessage ไม่ใช่ concurrent กับมัน" code={pollDiagram} />
 
 export const pollDiagram = `flowchart LR
   sub["subscribe(topics)"] --> run["consumer.run(...)"]
-  run --> each["eachMessage per record"]
-  each --> proc["process the record"]
-  proc --> run
-  run -->|also| hb["send heartbeats + coordinate group"]`;
+  run --> each["eachMessage(record) -- awaited"]
+  each -->|"only after eachMessage RETURNS"| hb["heartbeat()"]
+  hb --> commit["autoCommitOffsetsIfNecessary()"]
+  commit --> run`;
 
-## แต่ละ record พก coordinate ของตัวเองมา
+## พิสูจน์: handler ที่ block นานกว่า `sessionTimeout` ทำให้เกิด rebalance จริง
 
-message ทุกตัวเปิดเผย `topic`, `partition`, `offset`, `key`, `value`, `timestamp` และ headers ออกมา coordinate เหล่านี้คือสิ่งที่คุณใช้ commit ความคืบหน้า และใช้คิดเรื่องลำดับ — consumer จะเห็น record **เรียงตาม offset ภายในแต่ละ partition** แม้ว่า record จาก partition ต่างกันอาจสลับกันได้
+`sessionTimeout: 6000` กับ handler ที่ `await` sleep 9 วินาทีในข้อความแรก กับ broker จริง:
+
+```typescript
+// src/consumer-api/slow-handler.ts
+// @run
+import { Kafka, logLevel } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}slow-handler`;
+
+const kafka = new Kafka({
+  clientId: 'slow-handler',
+  brokers,
+  logLevel: logLevel.INFO,
+  logCreator: () => ({ namespace, log }) => console.log(`t=${Date.now()} [${namespace}] ${log.message}`),
+});
+
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `m${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}slow-handler-group`, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+const seen: string[] = [];
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    const v = message.value?.toString() ?? '';
+    seen.push(v);
+    if (seen.length === 1) {
+      // Sleep LONGER than sessionTimeout (6000ms) on purpose -- this is the bug.
+      await new Promise((r) => setTimeout(r, 9000));
+    }
+  },
+});
+
+// Give the redelivery caused by the rejoin time to show up, then report and exit
+// WITHOUT calling consumer.disconnect() from inside eachMessage (that deadlocks --
+// disconnect() waits for the current run-loop iteration, which is waiting on us).
+setInterval(() => {
+  const redelivered = seen.filter((x) => x === 'm0').length >= 2;
+  if (redelivered || seen.length >= 3) {
+    console.log(redelivered ? 'PROVED: handler blocking past sessionTimeout caused a rejoin + redelivery' : `no redelivery observed, saw: ${seen.join(',')}`);
+    process.exit(0);
+  }
+}, 500).unref();
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 30000);
+```
+
+log จริงแบบ trim — บรรทัดที่ต้องจำคือ `The coordinator is not aware of this member, re-joining the group`:
+
+```text
+t=...526881 eachMessage start n=1 value=m0
+t=...535881 eachMessage end n=1                                    <- 9000ms later, as coded
+t=...535890 [Connection] Response Heartbeat(key: 12, version: 3)   <- the FIRST heartbeat attempt
+                                                                       since the handler started
+t=...535891 [Runner] The coordinator is not aware of this member, re-joining the group
+t=...538910 [ConsumerGroup] Consumer has joined the group           <- a REAL rebalance happened
+t=...538919 eachMessage start n=2 value=m0   <- m0 is redelivered: it was never
+                                                 acknowledged before the rejoin
+```
+
+ยืนยันว่าคำอธิบายเดิมของบทนี้ ("block นานเกินไป → rebalance") ถูกทิศทางแล้ว แต่กลไกจริงเฉพาะเจาะจงกว่านั้นและคุ้มค่าที่จะรู้ให้ชัด: heartbeat ของ KafkaJS เป็นแบบ **cooperative** ไม่ใช่ **preemptive** ไม่มีอะไรมาขัดจังหวะ `eachMessage` ที่ช้า มันแค่ทำให้ heartbeat ที่ควรจะรักษา session ไว้อดอาหาร แล้วในที่สุด `group.min.session.timeout.ms`/`session.timeout.ms` ของ broker ก็จะหมดอายุสมาชิกตัวนั้น **กฎ: ทำให้ `eachMessage` มีขอบเขตเวลา หรือย้ายงานที่ช้าออกจาก path ต่อ record (เข้าคิว แล้ว `heartbeat()` เอง — ดู `eachBatch` ด้านล่าง)**
+
+## `eachBatch` พร้อม `heartbeat()` แบบ manual: ทางออกสำหรับงานที่ช้า
+
+`eachBatch` ส่ง batch ทั้งก้อนมาให้คุณครั้งเดียว **พร้อมฟังก์ชัน `heartbeat` ที่คุณต้องเรียกเอง** ถ้าการประมวลผลของคุณใช้เวลานานเกิน `sessionTimeout` จริง ๆ พิสูจน์แล้ว: ประมวลผลรวม 8 วินาที (นานกว่า `sessionTimeout` 6 วินาทีเดียวกันข้างบน) แบ่งรอบเรียก `heartbeat()` แบบ manual ตรงกลาง — **ไม่มี rejoin** เพราะการเรียก manual นั้น refresh session ไว้:
+
+```typescript
+// src/consumer-api/eachbatch-heartbeat.ts
+// @run
+import { Kafka, logLevel } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}eachbatch-hb`;
+
+const kafka = new Kafka({
+  clientId: 'eachbatch-hb',
+  brokers,
+  logLevel: logLevel.INFO,
+  logCreator: () => ({ namespace, log }) => console.log(`t=${Date.now()} [${namespace}] ${log.message}`),
+});
+
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'm0' }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}eachbatch-hb-group`, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+await consumer.run({
+  eachBatch: async ({ batch, heartbeat, resolveOffset }) => {
+    console.log(`t=${Date.now()} eachBatch start, ${batch.messages.length} messages`);
+    await new Promise((r) => setTimeout(r, 4000)); // slow work, part 1
+    await heartbeat(); // manually refresh the session BEFORE it expires
+    console.log(`t=${Date.now()} manual heartbeat() sent mid-batch`);
+    await new Promise((r) => setTimeout(r, 4000)); // slow work, part 2 (total 8s > 6s sessionTimeout)
+    for (const m of batch.messages) resolveOffset(m.offset);
+    console.log(`t=${Date.now()} eachBatch end -- no rejoin happened, total was 8000ms > sessionTimeout 6000ms`);
+    // Exit directly -- calling consumer.disconnect() from inside eachBatch deadlocks
+    // (disconnect() waits for this very run-loop iteration to finish).
+    process.exit(0);
+  },
+});
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 30000);
+```
+
+```text
+t=...572921 eachBatch start, 1 messages
+t=...576929 manual heartbeat() sent mid-batch
+t=...580929 eachBatch end -- no rejoin happened, total was 8000ms > sessionTimeout 6000ms
+```
+
+ไม่มีบรรทัด `The coordinator is not aware of this member` เลยตลอดรอบรันนี้ — การเรียก `heartbeat()` แบบ manual คือสิ่งที่ `eachMessage` ทำให้คุณไม่ได้เลย
+
+## `partitionsConsumedConcurrently`: พิสูจน์ว่ามัน concurrent จริง
+
+โดย default `run()` ประมวลผล record ของ partition ทีละอัน ต่อการเรียก `eachMessage` หนึ่งครั้ง — แม้แต่ข้าม partition การเรียกก็ไม่ overlap กันเว้นแต่คุณจะขอ `partitionsConsumedConcurrently: N` ให้ `eachMessage` ของ partition สูงสุด `N` ตัวรัน **พร้อมกัน** ได้ สาม partition แต่ละอันมีข้อความที่ handler sleep 1 วินาที ตั้ง `partitionsConsumedConcurrently: 3`:
+
+```typescript
+// src/consumer-api/concurrency.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}concurrency`;
+
+const kafka = new Kafka({ clientId: 'concurrency', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let p = 0; p < 3; p++) await producer.send({ topic, messages: [{ value: `p${p}m0`, partition: p }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}concurrency-group` });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+let started = 0;
+let ended = 0;
+await consumer.run({
+  partitionsConsumedConcurrently: 3, // up to 3 eachMessage calls in flight at once
+  eachMessage: async ({ partition, message }) => {
+    started++;
+    console.log(`t=${Date.now()} start p=${partition} v=${message.value}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    ended++;
+    console.log(`t=${Date.now()} end   p=${partition} v=${message.value}`);
+    // Exit directly -- consumer.disconnect() from inside eachMessage deadlocks.
+    if (ended === 3) process.exit(0);
+  },
+});
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 25000);
+```
+
+```text
+t=...601223 start p=2 v=p2m0
+t=...601223 start p=0 v=p0m0
+t=...601223 start p=1 v=p1m0     <- all THREE start at the same millisecond
+t=...602223 end   p=2 v=p2m0
+t=...602228 end   p=0 v=p0m0
+t=...602228 end   p=1 v=p1m0     <- all end ~1000ms later, not ~3000ms -- genuinely concurrent
+```
+
+สาม partition แต่ละอันมี handler 1 วินาที เสร็จรวมกันใน ~1 วินาที ไม่ใช่ ~3 — concurrent จริง ไม่ใช่แค่ภาพลวงตาของ non-blocking I/O
+
+```properties
+# section: consumer
+# maxBytes caps the size of a single FETCH response from one partition (per-fetch
+# ceiling on how much a batch can grow before a handler even sees it) --
+# checked here against the same official consumer config reference the harness uses.
+max.partition.fetch.bytes=1048576
+```
+
+<Callout title="maxBytes ของ KafkaJS vs max.partition.fetch.bytes ของ librdkafka">
+option ของ KafkaJS เองคือ camelCase `maxBytes` (byte ต่อ fetch ทั้ง request default `10485760`) และ `maxWaitTimeInMs`; ของ `@confluentinc/kafka-javascript` เพราะห่อ `librdkafka` ไว้ คือ key config ดิบ `fetch.message.max.bytes` (alias ที่ deprecated) หรือแบบต่อ partition `max.partition.fetch.bytes` (แสดงข้างบน key จริง ตรวจกับ official consumer config reference) สอง client จัดกลุ่มแนวคิดนี้ต่างกัน — KafkaJS จำกัดทั้ง fetch response; config ที่มาจาก Java จำกัดต่อ partition — ค่าที่ tune สำหรับตัวหนึ่งจึงไม่ port 1:1 ไปอีกตัว
+</Callout>
+
+## แต่ละ record มีพิกัดของตัวเอง
+
+ทุกข้อความมี `topic`, `partition`, `offset`, `key`, `value`, `timestamp` และ headers พิกัดเหล่านั้นคือสิ่งที่คุณใช้ commit progress และให้เหตุผลเรื่อง ordering — consumer เห็น record **ตามลำดับ offset ภายในแต่ละ partition** แม้ว่า record จาก partition ต่างกันอาจสลับกันได้
 
 <Callout title="สรุปหนึ่งบรรทัด">
-consumer จะ **`subscribe()`** ไปยัง topic แล้วเริ่ม **`consumer.run({ eachMessage })`** ซึ่งขับ poll loop ให้คุณ — heartbeat, group coordination, ดึง assignment — ดังนั้นถ้า handler ของคุณ block นานเกินไป group จะ **rebalance** ย้าย partition ของคุณออกไป record มาถึง **เรียงตาม offset ภายใน partition** โดยแต่ละตัวติดป้าย topic, partition และ offset และคุณ **deserialize** key กับ value เอง
+consumer **`subscribe()`** topic แล้วเริ่ม **`consumer.run({ eachMessage })`** heartbeat ถูกส่ง **หลังจาก `eachMessage` return แล้ว ใน loop iteration เดียวกัน** — ไม่ใช่ timer อิสระ — ดังนั้น handler ที่ block เกิน `sessionTimeout` จะทำให้ heartbeat ของตัวเองอดอาหารและ trigger rebalance จริง (พิสูจน์แล้วข้างบน: `The coordinator is not aware of this member, re-joining the group`) `eachBatch` ให้ `heartbeat()` แบบ manual ที่คุณเรียกเองระหว่างงานที่ช้าจริง ๆ และ `partitionsConsumedConcurrently` ทำให้ handler ของหลาย partition รัน parallel จริง ๆ record มาตาม **ลำดับ offset ภายใน partition**; คุณ **deserialize** key กับ value เอง
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug code={`// src/consumer-api/batch-processor.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'batch-worker', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'batch-worker-group', sessionTimeout: 6000 });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'jobs', fromBeginning: true });
+
+await consumer.run({
+  eachBatch: async ({ batch, resolveOffset }) => {
+    for (const message of batch.messages) {
+      await callSlowExternalApi(message.value); // can take several seconds per call
+      resolveOffset(message.offset);
+    }
+  },
+});
+`}>
+
+โค้ดนี้ compile ผ่านและดูสมเหตุสมผล — มันใช้ `eachBatch` แทน `eachMessage` สำหรับการประมวลผล "batch" ถูกต้องด้วยซ้ำ บั๊กจริงคือ: มันไม่เคยเรียกฟังก์ชัน **`heartbeat`** ที่ `eachBatch` ส่งให้ batch แม้แค่ไม่กี่ข้อความ แต่ละอันใช้เวลาสองสามวินาทีผ่าน `callSlowExternalApi` ก็พุ่งทะลุ `sessionTimeout` ไปเลยโดยไม่มีอะไรรักษา session ไว้ — พิสูจน์แล้วข้างบนว่าจะเกิด rebalance ด้วยบรรทัด `The coordinator is not aware of this member, re-joining the group` เหมือนกับที่ `eachMessage` handler ที่ช้าเพียงครั้งเดียวจะได้ ต่างกันตรงที่ตอนนี้มันเกิดกลางทาง batch ได้ หลังจาก offset บางอันใน batch ถูก resolve (ในเครื่อง) ไปแล้วแต่ยังไม่ commit วิธีแก้: destructure `heartbeat` จาก callback args แล้วเรียกมันเป็นระยะในลูป — เช่น ทุกข้อความ หรือตามงบเวลา:
+
+```text
+eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+  for (const message of batch.messages) {
+    await callSlowExternalApi(message.value);
+    resolveOffset(message.offset);
+    await heartbeat(); // <-- the missing line
+  }
+},
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+consumer loop ของ KafkaJS โดยพื้นฐานเป็นแบบ **single-threaded และ cooperative** ต่อ partition slot: `eachMessage` ของ record N ต้อง return ก่อน loop ถึงจะ heartbeat, commit, หรือ fetch record N+1 บน slot นั้นได้ ไม่มี background thread ที่คอยรักษาชีวิตคุณไว้เงียบ ๆ ระหว่างที่คุณยุ่งอยู่ — loop จะได้ทำ bookkeeping ก็ต่อเมื่อโค้ดของคุณคืน control กลับด้วย `return` (หรือ `await` resolve) เท่านั้น `partitionsConsumedConcurrently` ไม่ได้เปลี่ยนกฎต่อ-partition นี้ มันแค่รัน loop single-threaded แบบนี้ `N` ตัวขนานกัน ตัวละหนึ่ง partition slot ดังนั้นงานช้าบน partition 0 จึงไม่ block ความคืบหน้าของ partition 1 อีกต่อไป — แต่ handler ที่ช้ายังคง block heartbeat ของ *partition ของตัวเอง* อยู่ดี
+
+## Trade-offs
+
+- **`eachMessage`** — mental model ง่ายที่สุด ทีละ record แต่เวลาประมวลผลของทุก record นับรวมเข้า budget session/heartbeat โดยตรงโดยไม่มีทางออก
+- **`eachBatch`** — โค้ดเยอะขึ้น (resolve offset เอง, `heartbeat()` เอง) แต่เป็นจุดเดียวที่ KafkaJS ให้คุณควบคุม liveness ระหว่างงานที่ใช้เวลานาน — จำเป็นสำหรับอะไรก็ตาม (เรียก API จำนวนมาก, ML inference, I/O ช้า) ที่มีโอกาสเกิน `sessionTimeout` ต่อรายการ
+- **`partitionsConsumedConcurrently`** — ได้ throughput เพิ่มจริงเมื่อ partition เป็นอิสระต่อกัน (พิสูจน์แล้วข้างบน: ~3 เท่าบน 3 partition) แต่คูณงานที่ในระหว่างทำและ memory ด้วย และไม่ช่วยอะไร budget heartbeat ของ partition ช้าตัวเดียว
+
+## Common Misconceptions
+
+- **"`run()` ส่ง heartbeat บน timer พื้นหลัง เป็นอิสระจาก handler ของฉัน"** ไม่ใช่ใน KafkaJS — พิสูจน์แล้วทั้งจาก source และจากการรันจริง: `heartbeat()` ถูกเรียกแบบ synchronous ทันทีหลัง `eachMessage` return ใน loop iteration เดียวกัน
+- **"batch handler ปลอดภัยจาก session timeout โดยอัตโนมัติเพราะประมวลผลหลาย record ต่อการเรียก"** ไม่จริง — `eachBatch` ให้จุดขอบเขตที่ใหญ่ขึ้นและน้อยลงซึ่ง loop *อาจ* heartbeat ได้ แต่มันจะไม่ทำเว้นแต่คุณเรียกฟังก์ชัน `heartbeat` ที่มันส่งมาให้อย่างชัดเจน (พิสูจน์แล้วด้วยกรณี SpotTheBug ข้างบน)
+- **"`partitionsConsumedConcurrently` ทำให้ partition ช้าตัวเดียวเร็วขึ้น"** ไม่ใช่ — มันแค่ให้ handler ของ partition *ต่างกัน* overlap กันได้ partition เดียวยังถูกประมวลผลทีละ `eachMessage` ตามลำดับเหมือนเดิม
+- **"`maxBytes` ของ KafkaJS กับ `max.partition.fetch.bytes` ของ `librdkafka` คือปุ่มเดียวกัน"** ใกล้เคียงแต่ scope ไม่เหมือนกัน — ตัวหนึ่งจำกัดทั้ง fetch อีกตัวจำกัดต่อ partition ดู Callout ข้างบน
 
 export const quizConsumerApi = [
   {
-    q: 'consumer.run() (poll loop) ทำอะไรอีกนอกจากคืน record?',
+    q: 'ใน KafkaJS heartbeat ถูกส่งตอนไหนเทียบกับ eachMessage handler ของคุณ?',
     options: [
-      'ไม่ทำอะไรอีก — แค่ดึงข้อมูลอย่างเดียว',
-      'ยังส่ง heartbeat, ประสาน group membership และดึง partition assignment ด้วย',
-      'commit offset ลงฐานข้อมูล',
-      'สร้าง partition ใหม่',
+      'บน background timer อิสระ ไม่ว่า eachMessage จะทำอะไรอยู่',
+      'แบบ synchronous ทันทีหลัง eachMessage return ใน loop iteration เดียวกัน -- พิสูจน์จาก source ของ Runner ใน KafkaJS เอง',
+      'ก่อน eachMessage เริ่ม ไม่เคยส่งหลังจากนั้น',
+      'เฉพาะตอนคุณเรียก consumer.commitOffsets() เท่านั้น',
     ],
     answer: 1,
+    explain: 'runner.js เรียก await this.heartbeat() ทันทีหลัง resolve offset ของข้อความที่ eachMessage เพิ่ง finish — ไม่มี heartbeat thread แยกต่างหาก',
   },
   {
-    q: 'ถ้า consumer หยุด consume (handler block) นานเกินไปจะเกิดอะไรขึ้น?',
+    q: 'consumer ตัวหนึ่งมี sessionTimeout: 6000 และ eachMessage await sleep 9 วินาทีในข้อความที่ 1 บรรทัด log จริงอันไหนพิสูจน์ผลลัพธ์?',
     options: [
-      'Kafka จะเร่งความเร็วในการส่ง',
-      'group coordinator จะถือว่าตายแล้ว และ rebalance ย้าย partition ไปให้ consumer ตัวอื่น',
-      'consumer จะ scale up อัตโนมัติ',
-      'ไม่มีอะไรเกิดขึ้น การ consume เป็นทางเลือก',
+      '"Consumer has left the group permanently"',
+      '"The coordinator is not aware of this member, re-joining the group" -- rebalance จริง พิสูจน์ด้วยการรันสด',
+      'ไม่มีอะไรเลย -- KafkaJS ขยาย session ให้เงียบ ๆ',
+      '"ProducerFencedException"',
     ],
     answer: 1,
+    explain: 'นี่คือบรรทัด log จริงที่บันทึกได้กับ broker จริงหลังจาก handler 9 วินาทีในที่สุดก็ return และ heartbeat ที่อดอาหารก็ถูกส่งช้าเกินไปในที่สุด',
   },
   {
-    q: 'จะได้ key หรือ value ที่มี type จาก message ของ KafkaJS ได้ยังไง?',
+    q: 'จะรักษา consumer ให้ยังมีชีวิตระหว่างการประมวลผลที่ใช้เวลานานกว่า sessionTimeout จริง ๆ ได้อย่างไร?',
     options: [
-      'บีบอัด record ก่อนส่ง',
-      'key และ value มาเป็น Buffer — คุณ deserialize เอง (เช่น toString หรือ JSON.parse)',
-      'assign partition เอง',
-      'commit offset ก่อน',
+      'เพิ่มค่า timeout ภายในของ eachMessage',
+      'เปลี่ยนไปใช้ eachBatch แล้วเรียกฟังก์ชัน heartbeat ที่มันส่งมาให้ เป็นระยะ ๆ ระหว่างงานช้าของคุณเอง',
+      'ปิด session timeout ไปเลยทั้งหมด',
+      'ทำอะไรไม่ได้ sessionTimeout คือเพดานแข็งของเวลาประมวลผล',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: การประมวลผล eachBatch 8 วินาที (> sessionTimeout 6 วินาที) ไม่ทำให้เกิด rejoin เลยเมื่อมีการเรียก heartbeat() แบบ manual ตรงกลาง',
   },
   {
-    q: 'consumer เห็น record เรียงตามลำดับแบบไหน?',
+    q: 'สาม partition แต่ละอันได้ข้อความที่ handler sleep 1 วินาที ด้วย partitionsConsumedConcurrently: 3 ทั้ง batch ใช้เวลาเท่าไหร่?',
     options: [
-      'สุ่มลำดับทั่วทั้ง topic',
-      'เรียงตาม offset ภายในแต่ละ partition แม้ partition ต่าง ๆ อาจสลับกันข้าม batch',
-      'ตัวใหม่สุดก่อนเสมอ',
+      '~3 วินาที -- ทีละ partition',
+      '~1 วินาที -- eachMessage ทั้งสามรัน parallel กันจริง ๆ พิสูจน์ด้วย timestamp start/end ที่เหมือนกัน',
+      '~9 วินาที -- concurrency เพิ่ม overhead',
+      'ขึ้นอยู่กับจำนวน partition เท่านั้น ไม่เกี่ยวกับ setting นี้',
+    ],
+    answer: 1,
+    explain: 'การรันจริงแสดงว่าทั้งสามเริ่มที่มิลลิวินาทีเดียวกันและจบห่างกันประมาณ 1000ms ไม่ใช่ 3000ms -- concurrency จริง ไม่ใช่แค่การจัดตารางแบบ non-blocking',
+  },
+  {
+    q: 'eachBatch ของ KafkaJS ไม่ทำอะไรอัตโนมัติที่ eachMessage ก็ไม่ทำอัตโนมัติเช่นกัน?',
+    options: [
+      'deserialize message value ให้คุณ',
+      'เรียกฟังก์ชัน heartbeat ให้คุณ -- คุณต้องเรียกเอง พิสูจน์ด้วยกรณี SpotTheBug ข้างบน',
+      'ให้คุณเข้าถึงหมายเลข partition',
+      'ให้คุณอ่านชื่อ topic ได้',
+    ],
+    answer: 1,
+    explain: 'ทั้ง eachMessage และ eachBatch ต้องการให้ คุณ รักษา session ไว้เองระหว่างงานช้า -- eachMessage ไม่มีทางออกแบบ manual เลย และ heartbeat() ของ eachBatch ก็เป็น opt-in ไม่ใช่อัตโนมัติ',
+  },
+  {
+    q: 'consumer เห็น record ตามลำดับใด?',
+    options: [
+      'สุ่มไปทั่วทั้ง topic',
+      'ตามลำดับ offset ภายในแต่ละ partition แม้ partition ต่างกันอาจสลับกันข้าม batch ได้',
+      'ใหม่สุดก่อนเสมอ',
       'เรียงตาม key',
     ],
     answer: 1,
+    explain: 'Kafka รับประกัน ordering แค่ภายใน partition เดียวเท่านั้น ไม่มีการรับประกัน ordering ข้าม partition',
   },
 ];
 

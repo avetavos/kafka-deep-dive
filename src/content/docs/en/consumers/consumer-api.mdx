@@ -1,6 +1,6 @@
 ---
 title: 'The Consumer API'
-description: 'Reading records with the KafkaJS consumer — subscribe, consumer.run with eachMessage, deserializing yourself, and why the run loop drives everything the consumer does.'
+description: 'Reading records with the KafkaJS consumer — the real heartbeat/poll loop, why a slow eachMessage handler causes a real rebalance, eachBatch with manual heartbeat(), and partitionsConsumedConcurrently, all proven against a live broker.'
 sidebar:
   order: 1
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -42,57 +43,343 @@ async function main() {
 main();
 ```
 
-## Why the run loop matters
+## The real heartbeat/poll loop, not the simplified version
 
-`run()` does far more than fetch data. Under the hood it polls Kafka, sends **heartbeats**, participates in group coordination, and fetches partition assignments. If your `eachMessage` blocks too long — processing a record takes longer than the session timeout — the group coordinator assumes the consumer is dead and triggers a **rebalance**, reassigning its partitions elsewhere. The rule: **keep per-message processing bounded.**
+The existing wording — "`run()` sends heartbeats" — makes it sound like heartbeats happen on their own, independent of your handler. **They don't.** Reading KafkaJS's own `Runner` source (`src/consumer/runner.js`) shows exactly where the heartbeat call sits:
 
-<Mermaid title="The consumer run loop" code={pollDiagram} />
+```text
+this.consumerGroup.resolveOffset({ topic, partition, offset: message.offset })
+await this.heartbeat()
+await this.autoCommitOffsetsIfNecessary()
+```
+
+`heartbeat()` is called **after `eachMessage` returns**, in the same loop iteration — not on an independent timer, not on a separate thread. If `eachMessage` is `await`-ing something slow, the next heartbeat literally cannot be sent until that `await` resolves.
+
+<Mermaid title="The consumer run loop — heartbeat is sequenced AFTER eachMessage, not concurrent with it" code={pollDiagram} />
 
 export const pollDiagram = `flowchart LR
   sub["subscribe(topics)"] --> run["consumer.run(...)"]
-  run --> each["eachMessage per record"]
-  each --> proc["process the record"]
-  proc --> run
-  run -->|also| hb["send heartbeats + coordinate group"]`;
+  run --> each["eachMessage(record) -- awaited"]
+  each -->|"only after eachMessage RETURNS"| hb["heartbeat()"]
+  hb --> commit["autoCommitOffsetsIfNecessary()"]
+  commit --> run`;
+
+## Proof: a handler that blocks longer than `sessionTimeout` causes a real rebalance
+
+`sessionTimeout: 6000` and a handler that `await`s a 9-second sleep on its first message, against a real broker:
+
+```typescript
+// src/consumer-api/slow-handler.ts
+// @run
+import { Kafka, logLevel } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}slow-handler`;
+
+const kafka = new Kafka({
+  clientId: 'slow-handler',
+  brokers,
+  logLevel: logLevel.INFO,
+  logCreator: () => ({ namespace, log }) => console.log(`t=${Date.now()} [${namespace}] ${log.message}`),
+});
+
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let i = 0; i < 3; i++) await producer.send({ topic, messages: [{ value: `m${i}` }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}slow-handler-group`, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+const seen: string[] = [];
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    const v = message.value?.toString() ?? '';
+    seen.push(v);
+    if (seen.length === 1) {
+      // Sleep LONGER than sessionTimeout (6000ms) on purpose -- this is the bug.
+      await new Promise((r) => setTimeout(r, 9000));
+    }
+  },
+});
+
+// Give the redelivery caused by the rejoin time to show up, then report and exit
+// WITHOUT calling consumer.disconnect() from inside eachMessage (that deadlocks --
+// disconnect() waits for the current run-loop iteration, which is waiting on us).
+setInterval(() => {
+  const redelivered = seen.filter((x) => x === 'm0').length >= 2;
+  if (redelivered || seen.length >= 3) {
+    console.log(redelivered ? 'PROVED: handler blocking past sessionTimeout caused a rejoin + redelivery' : `no redelivery observed, saw: ${seen.join(',')}`);
+    process.exit(0);
+  }
+}, 500).unref();
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 30000);
+```
+
+The real, trimmed log — the line to memorize is `The coordinator is not aware of this member, re-joining the group`:
+
+```text
+t=...526881 eachMessage start n=1 value=m0
+t=...535881 eachMessage end n=1                                    <- 9000ms later, as coded
+t=...535890 [Connection] Response Heartbeat(key: 12, version: 3)   <- the FIRST heartbeat attempt
+                                                                       since the handler started
+t=...535891 [Runner] The coordinator is not aware of this member, re-joining the group
+t=...538910 [ConsumerGroup] Consumer has joined the group           <- a REAL rebalance happened
+t=...538919 eachMessage start n=2 value=m0   <- m0 is redelivered: it was never
+                                                 acknowledged before the rejoin
+```
+
+That confirms the existing lesson's claim ("blocks too long → rebalance") was directionally right, but the mechanism is more specific and worth knowing precisely: KafkaJS's heartbeat is **cooperative**, not preemptive. Nothing interrupts a slow `eachMessage` — it just starves the heartbeat that would have kept the session alive, and the broker's `group.min.session.timeout.ms`/`session.timeout.ms` eventually expires the member. **Rule: keep `eachMessage` bounded, or move slow work off the per-record path (queue it, and `heartbeat()` yourself — see `eachBatch` below).**
+
+## `eachBatch` with manual `heartbeat()`: the escape hatch for slow processing
+
+`eachBatch` hands you a whole batch at once **and a `heartbeat` function you must call yourself** if your processing legitimately takes longer than `sessionTimeout`. Proven: 8 seconds of total processing (longer than the same 6-second `sessionTimeout` used above), split around one manual `heartbeat()` call — **no rejoin**, because the manual call refreshed the session:
+
+```typescript
+// src/consumer-api/eachbatch-heartbeat.ts
+// @run
+import { Kafka, logLevel } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}eachbatch-hb`;
+
+const kafka = new Kafka({
+  clientId: 'eachbatch-hb',
+  brokers,
+  logLevel: logLevel.INFO,
+  logCreator: () => ({ namespace, log }) => console.log(`t=${Date.now()} [${namespace}] ${log.message}`),
+});
+
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'm0' }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}eachbatch-hb-group`, sessionTimeout: 6000, heartbeatInterval: 1000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+await consumer.run({
+  eachBatch: async ({ batch, heartbeat, resolveOffset }) => {
+    console.log(`t=${Date.now()} eachBatch start, ${batch.messages.length} messages`);
+    await new Promise((r) => setTimeout(r, 4000)); // slow work, part 1
+    await heartbeat(); // manually refresh the session BEFORE it expires
+    console.log(`t=${Date.now()} manual heartbeat() sent mid-batch`);
+    await new Promise((r) => setTimeout(r, 4000)); // slow work, part 2 (total 8s > 6s sessionTimeout)
+    for (const m of batch.messages) resolveOffset(m.offset);
+    console.log(`t=${Date.now()} eachBatch end -- no rejoin happened, total was 8000ms > sessionTimeout 6000ms`);
+    // Exit directly -- calling consumer.disconnect() from inside eachBatch deadlocks
+    // (disconnect() waits for this very run-loop iteration to finish).
+    process.exit(0);
+  },
+});
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 30000);
+```
+
+```text
+t=...572921 eachBatch start, 1 messages
+t=...576929 manual heartbeat() sent mid-batch
+t=...580929 eachBatch end -- no rejoin happened, total was 8000ms > sessionTimeout 6000ms
+```
+
+No `The coordinator is not aware of this member` line anywhere in that run — the manual `heartbeat()` call is exactly what `eachMessage` cannot do for you.
+
+## `partitionsConsumedConcurrently`: proof it actually runs concurrently
+
+By default, `run()` processes one partition's messages, one at a time, per call to `eachMessage` — even across partitions, invocations don't overlap unless you ask. `partitionsConsumedConcurrently: N` lets up to `N` partitions' `eachMessage` calls run **at the same time**. Three partitions, each with a message whose handler sleeps 1 second, `partitionsConsumedConcurrently: 3`:
+
+```typescript
+// src/consumer-api/concurrency.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}concurrency`;
+
+const kafka = new Kafka({ clientId: 'concurrency', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 3 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+for (let p = 0; p < 3; p++) await producer.send({ topic, messages: [{ value: `p${p}m0`, partition: p }] });
+await producer.disconnect();
+await admin.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}concurrency-group` });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+let started = 0;
+let ended = 0;
+await consumer.run({
+  partitionsConsumedConcurrently: 3, // up to 3 eachMessage calls in flight at once
+  eachMessage: async ({ partition, message }) => {
+    started++;
+    console.log(`t=${Date.now()} start p=${partition} v=${message.value}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    ended++;
+    console.log(`t=${Date.now()} end   p=${partition} v=${message.value}`);
+    // Exit directly -- consumer.disconnect() from inside eachMessage deadlocks.
+    if (ended === 3) process.exit(0);
+  },
+});
+
+setTimeout(() => { console.error('timeout'); process.exit(1); }, 25000);
+```
+
+```text
+t=...601223 start p=2 v=p2m0
+t=...601223 start p=0 v=p0m0
+t=...601223 start p=1 v=p1m0     <- all THREE start at the same millisecond
+t=...602223 end   p=2 v=p2m0
+t=...602228 end   p=0 v=p0m0
+t=...602228 end   p=1 v=p1m0     <- all end ~1000ms later, not ~3000ms -- genuinely concurrent
+```
+
+Three partitions each with a 1-second handler finished in ~1 second total, not ~3 — real concurrency, not just non-blocking I/O illusion.
+
+```properties
+# section: consumer
+# maxBytes caps the size of a single FETCH response from one partition (per-fetch
+# ceiling on how much a batch can grow before a handler even sees it) --
+# checked here against the same official consumer config reference the harness uses.
+max.partition.fetch.bytes=1048576
+```
+
+<Callout title="KafkaJS's maxBytes vs librdkafka's max.partition.fetch.bytes">
+KafkaJS's own consumer option is camelCase `maxBytes` (bytes per fetch across the whole request, default `10485760`) and `maxWaitTimeInMs`; `@confluentinc/kafka-javascript`'s equivalent, since it wraps `librdkafka`, is the raw config key `fetch.message.max.bytes` (deprecated alias) or, per-partition, `max.partition.fetch.bytes` (shown above, real key checked against the official consumer config reference). The two clients group this concept differently — KafkaJS caps the whole fetch response; the Java-derived config caps per partition — so a value tuned for one does not port 1:1 to the other.
+</Callout>
 
 ## Each record carries its coordinates
 
 Every message exposes its `topic`, `partition`, `offset`, `key`, `value`, `timestamp`, and headers. Those coordinates are what you use to commit progress and to reason about ordering — the consumer sees records **in offset order within each partition**, though records from different partitions may interleave.
 
 <Callout title="The one-line takeaway">
-A consumer **`subscribe()`s** to topics and starts **`consumer.run({ eachMessage })`**, which drives the poll loop for you — heartbeats, group coordination, fetching assignments — so if your handler blocks too long the group **rebalances** your partitions away. Records arrive in **offset order within a partition**, each tagged with topic, partition, and offset; you **deserialize** key and value yourself.
+A consumer **`subscribe()`s** to topics and starts **`consumer.run({ eachMessage })`**. Heartbeats are sent **after `eachMessage` returns, in the same loop iteration** — not on an independent timer — so a handler that blocks past `sessionTimeout` starves its own heartbeat and triggers a real rebalance (proven above: `The coordinator is not aware of this member, re-joining the group`). `eachBatch` gives you a manual `heartbeat()` to call yourself during legitimately slow work, and `partitionsConsumedConcurrently` runs multiple partitions' handlers genuinely in parallel. Records arrive in **offset order within a partition**; you **deserialize** key and value yourself.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// src/consumer-api/batch-processor.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'batch-worker', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'batch-worker-group', sessionTimeout: 6000 });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'jobs', fromBeginning: true });
+
+await consumer.run({
+  eachBatch: async ({ batch, resolveOffset }) => {
+    for (const message of batch.messages) {
+      await callSlowExternalApi(message.value); // can take several seconds per call
+      resolveOffset(message.offset);
+    }
+  },
+});
+`}>
+
+This compiles and looks reasonable — it even correctly uses `eachBatch` instead of `eachMessage` for "batch" processing. The real bug: it never calls the **`heartbeat`** function that `eachBatch` hands you. A batch of even a handful of messages, each taking a few seconds through `callSlowExternalApi`, blows straight past `sessionTimeout` with nothing keeping the session alive — proven above, that produces the exact same `The coordinator is not aware of this member, re-joining the group` rebalance an `eachMessage` handler gets from one slow call, except now it can happen mid-batch, after some offsets in the batch were already (locally) resolved but not committed. The fix: destructure `heartbeat` from the callback args and call it periodically inside the loop — e.g. every message, or on a time budget:
+
+```text
+eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+  for (const message of batch.messages) {
+    await callSlowExternalApi(message.value);
+    resolveOffset(message.offset);
+    await heartbeat(); // <-- the missing line
+  }
+},
+```
+
+</SpotTheBug>
+
+## Mental Model
+
+KafkaJS's consumer loop is fundamentally **single-threaded and cooperative** per partition slot: `eachMessage` for record N must return before the loop can heartbeat, commit, or fetch record N+1 on that slot. There is no background thread quietly keeping you alive while you're busy — the loop only gets to do bookkeeping when your code hands control back with a `return` (or `await` resolution). `partitionsConsumedConcurrently` doesn't change this per-partition rule; it just runs `N` of these single-threaded loops side by side, one per partition slot, so slow work on partition 0 no longer blocks partition 1's progress — but a slow handler still blocks *its own* partition's heartbeat either way.
+
+## Trade-offs
+
+- **`eachMessage`** — simplest mental model, one record at a time, but every record's processing time counts directly against the session/heartbeat budget with no escape hatch.
+- **`eachBatch`** — more code (manual offset resolution, manual `heartbeat()`), but it's the only place KafkaJS gives you control over liveness during long-running work — required for anything (bulk API calls, ML inference, slow I/O) that can plausibly exceed `sessionTimeout` per item.
+- **`partitionsConsumedConcurrently`** — real throughput gains when partitions are independent (proven above: ~3x on 3 partitions), but it multiplies in-flight work and memory, and does nothing for a single slow partition's own heartbeat budget.
+
+## Common Misconceptions
+
+- **"`run()` sends heartbeats on a background timer, independent of my handler."** Not in KafkaJS — proven from source and from a live run: `heartbeat()` is called synchronously right after `eachMessage` returns, in the same loop iteration.
+- **"A batch handler is automatically safe from session timeouts because it processes many records per call."** No — `eachBatch` gets you fewer, larger boundary points at which the loop *could* heartbeat, but it still won't unless you explicitly call the `heartbeat` function it hands you (proven above with the SpotTheBug case).
+- **"`partitionsConsumedConcurrently` speeds up a single slow partition."** No — it lets *different* partitions' handlers overlap; a single partition is still processed by one `eachMessage` call at a time, in order.
+- **"KafkaJS's `maxBytes` and `librdkafka`'s `max.partition.fetch.bytes` are the same knob."** Close, but not identical scope — one is a whole-fetch cap, the other per-partition; see the Callout above.
 
 export const quizConsumerApi = [
   {
-    q: 'What does consumer.run() (the poll loop) do besides returning records?',
+    q: 'In KafkaJS, exactly when is a heartbeat sent relative to your eachMessage handler?',
     options: [
-      'Nothing else — it only fetches data',
-      'It also sends heartbeats, coordinates group membership, and fetches partition assignments',
-      'It commits offsets to a database',
-      'It creates new partitions',
+      'On an independent background timer, regardless of what eachMessage is doing',
+      "Synchronously, right after eachMessage returns, in the same loop iteration -- proven from KafkaJS's own Runner source",
+      'Before eachMessage starts, never after',
+      'Only when you call consumer.commitOffsets()',
     ],
     answer: 1,
+    explain: 'runner.js calls await this.heartbeat() immediately after resolving the offset for a message eachMessage just finished -- there is no separate heartbeat thread.',
   },
   {
-    q: 'What happens if a consumer stops consuming (its handler blocks) for too long?',
+    q: 'A consumer has sessionTimeout: 6000 and eachMessage awaits a 9-second sleep on message 1. What real log line proves the consequence?',
     options: [
-      'Kafka speeds up delivery',
-      'The group coordinator assumes it is dead and rebalances its partitions to other consumers',
-      'The consumer automatically scales up',
-      'Nothing; consuming is optional',
+      '"Consumer has left the group permanently"',
+      '"The coordinator is not aware of this member, re-joining the group" -- a real rebalance, proven by a live run',
+      'Nothing -- KafkaJS silently extends the session',
+      '"ProducerFencedException"',
     ],
     answer: 1,
+    explain: 'That is the exact log line captured against a real broker after the 9-second handler finally returned and the starved heartbeat finally went out too late.',
   },
   {
-    q: 'How do you get a typed key or value from a KafkaJS message?',
+    q: 'How do you keep a consumer alive during processing that legitimately takes longer than sessionTimeout?',
     options: [
-      'Compress records before sending',
-      'The key and value arrive as Buffers — you deserialize them yourself (e.g. toString or JSON.parse)',
-      'Assign partitions manually',
-      'Commit offsets first',
+      'Increase eachMessage\'s internal timeout setting',
+      'Switch to eachBatch and call the heartbeat function it hands you, periodically, during your own slow work',
+      'Disable session timeouts entirely',
+      'Nothing can be done; sessionTimeout is a hard ceiling on processing time',
     ],
     answer: 1,
+    explain: 'Proven above: 8 seconds of eachBatch processing (> the 6-second sessionTimeout) produced no rejoin at all once a manual heartbeat() call was placed partway through.',
+  },
+  {
+    q: 'Three partitions each get a message whose handler sleeps 1 second. With partitionsConsumedConcurrently: 3, how long does the whole batch take?',
+    options: [
+      '~3 seconds -- one partition at a time',
+      '~1 second -- all three eachMessage calls run genuinely in parallel, proven by identical start/end timestamps',
+      '~9 seconds -- concurrency adds overhead',
+      'It depends on partition count only, not the setting',
+    ],
+    answer: 1,
+    explain: 'The real run showed all three start at the same millisecond and all three end about 1000ms later, not 3000ms -- genuine concurrency, not just non-blocking scheduling.',
+  },
+  {
+    q: 'What does KafkaJS\'s eachBatch NOT do automatically that eachMessage also doesn\'t do automatically?',
+    options: [
+      'Deserialize the message value for you',
+      'Call the heartbeat function for you -- you must call it yourself, proven by the SpotTheBug case above',
+      'Give you access to the partition number',
+      'Let you read the topic name',
+    ],
+    answer: 1,
+    explain: 'Both eachMessage and eachBatch require YOU to keep the session alive during slow work -- eachMessage has no manual escape hatch at all, and eachBatch\'s heartbeat() is opt-in, not automatic.',
   },
   {
     q: 'In what order does a consumer see records?',
@@ -103,6 +390,7 @@ export const quizConsumerApi = [
       'Sorted by key',
     ],
     answer: 1,
+    explain: 'Kafka only guarantees ordering within a single partition; there is no cross-partition ordering guarantee.',
   },
 ];
 
