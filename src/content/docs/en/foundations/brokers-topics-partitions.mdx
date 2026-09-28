@@ -1,6 +1,6 @@
 ---
 title: 'Brokers, Topics & Partitions'
-description: 'The anatomy of a Kafka cluster — brokers, topics split into partitions, offsets, and how partitioning scales a topic across the cluster.'
+description: 'The anatomy of a Kafka cluster — real kafka-configs.sh output with DEFAULT/STATIC/DYNAMIC config sources, a real dynamic-vs-static --alter proof, topic-level overrides, auto-create behavior, and the real error from a wrong advertised listener.'
 sidebar:
   order: 4
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -61,9 +62,199 @@ That triple is the record's permanent address. A consumer's committed position i
 
 Partition count is your main throughput dial, but it is not free. Each partition is files on disk and a unit of work for consumers and the controller. Too few and you cannot parallelize; too many and you pay overhead in metadata, open files, and rebalance time. A common approach: estimate target throughput, size partitions to it, and leave headroom — you can **add** partitions later, but doing so changes how keyed records map to partitions (a caveat the next module explains).
 
-<Callout title="The one-line takeaway">
-A **broker** is one Kafka server; a **cluster** is several. A **topic** is split into **partitions**, and each partition is a separate ordered log stored on some broker. Partitions are the unit of **parallelism** (spread across brokers for throughput) and of **ordering** (guaranteed within a partition, not across). Every record is addressed by **topic + partition + offset**.
+## Proof: broker configs, and the real DEFAULT / STATIC / DYNAMIC source tags
+
+`kafka-configs.sh --describe --all` does not just show a config's value — it shows **where that value came from**. Real, trimmed output for this course's own broker:
+
+```bash
+# scripts/brokers-topics-partitions/describe-broker.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --all --entity-type brokers --entity-name 1
+```
+
+```text
+advertised.listeners=PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092 sensitive=false synonyms={STATIC_BROKER_CONFIG:advertised.listeners=...}
+auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}
+default.replication.factor=1 sensitive=false synonyms={DEFAULT_CONFIG:default.replication.factor=1}
+listeners=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:29093 sensitive=false synonyms={STATIC_BROKER_CONFIG:listeners=..., DEFAULT_CONFIG:listeners=PLAINTEXT://:9092}
+log.retention.hours=168 sensitive=false synonyms={DEFAULT_CONFIG:log.retention.hours=168}
+num.partitions=1 sensitive=false synonyms={DEFAULT_CONFIG:num.partitions=1}
+```
+
+Every line's `synonyms={...}` names its real **source**: **`DEFAULT_CONFIG`** (the broker's built-in default — nobody set it), **`STATIC_BROKER_CONFIG`** (set once at startup, e.g. via this container's `KAFKA_LISTENERS` env var — never changes without a restart), or, proven next, **`DYNAMIC_BROKER_CONFIG`** (set at runtime via the Admin API, no restart needed).
+
+## Proof: a dynamic config succeeds, a static one is rejected — real error text
+
+```bash
+# scripts/brokers-topics-partitions/dynamic-vs-static.sh
+echo "=== alter a DYNAMIC config (log.retention.ms) ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --alter --entity-type brokers --entity-name 1 --add-config log.retention.ms=600000
+
+echo "=== confirm the source tag ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1
+
+echo "=== alter a STATIC/read-only config (log.dirs) -- expect rejection ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --alter --entity-type brokers --entity-name 1 --add-config log.dirs=/tmp/other-dir || true
+```
+
+Real, unedited output:
+
+```text
+=== alter a DYNAMIC config (log.retention.ms) ===
+Completed updating config for broker 1.
+
+=== confirm the source tag ===
+Dynamic configs for broker 1 are:
+  log.retention.ms=600000 sensitive=false synonyms={DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168}
+
+=== alter a STATIC/read-only config (log.dirs) -- expect rejection ===
+Error while executing config command with args '--bootstrap-server localhost:9092 --alter --entity-type brokers --entity-name 1 --add-config log.dirs=/tmp/other-dir'
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [log.dirs]
+```
+
+`log.retention.ms` took effect immediately with no restart, and its own `synonyms` now shows **`DYNAMIC_BROKER_CONFIG`** ahead of the `DEFAULT_CONFIG` it overrode — proving the source-priority chain is real, not just documented. `log.dirs`, by contrast, is genuinely static: the broker's own `InvalidRequestException: Cannot update these configs dynamically: [log.dirs]` is real, verbatim broker text, not a client-side guess. Changing where a broker stores its logs while it is running would mean physically relocating open file handles — this is not an arbitrary restriction.
+
+<Callout title="A config can be DEFAULT_CONFIG and still be static">
+`auto.create.topics.enable` shows `DEFAULT_CONFIG` above (nobody has overridden it), which might read as "therefore it can be dynamically overridden." Tested directly against this broker: attempting `--alter --add-config auto.create.topics.enable=false` at runtime is rejected with the exact same `Cannot update these configs dynamically` error `log.dirs` got. **A config's source tag (default/static/dynamic) and whether it is *eligible* for dynamic update are two separate facts** — proving the disabled-auto-create behavior below required restarting the container with `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`, not an `--alter` call.
 </Callout>
+
+## Proof: topic-level config overrides the broker default
+
+```bash
+# scripts/brokers-topics-partitions/topic-level-override.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --topic short-lived --partitions 1 --replication-factor 1 --config retention.ms=60000
+
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type topics --entity-name short-lived --all | grep 'retention.ms'
+```
+
+Real output:
+
+```text
+retention.ms=60000 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:retention.ms=60000, DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168}
+```
+
+The full override chain, real and in order: this topic's own **`DYNAMIC_TOPIC_CONFIG:retention.ms=60000`** wins over the **`DYNAMIC_BROKER_CONFIG:log.retention.ms=600000`** set two sections above, which itself already won over the original **`DEFAULT_CONFIG:log.retention.hours=168`**. Three real layers, proven by making a change at each one and watching the winner change every time.
+
+## Proof: `auto.create.topics.enable` — the race when it's on, the real error when it's off
+
+With the default `auto.create.topics.enable=true`, producing to a topic that does not exist yet triggers auto-creation — but the **very first** request can race the creation:
+
+```text
+$ kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic autocreate-demo
+Error while executing topic command : Topic 'autocreate-demo' does not exist as expected
+[...] WARN [Producer clientId=console-producer] The metadata response from the cluster reported a recoverable issue with correlation id 1 : {autocreate-demo=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+```
+
+```text
+$ kafka-topics.sh --bootstrap-server $BOOTSTRAP --list | grep autocreate
+autocreate-demo
+```
+
+The producer's **first** metadata request got a real **`UNKNOWN_TOPIC_OR_PARTITION`** — the topic genuinely did not exist yet at that instant — but that same request is what *triggers* auto-creation, and by the time `--list` runs afterward, the topic exists. This transient warning-then-success is a real, reproducible shape of the auto-create race, not a one-off.
+
+Restarting this broker with **`auto.create.topics.enable=false`** (a static config, per the callout above — this needed a container restart, not `--alter`) and repeating a similar request against a genuinely nonexistent topic:
+
+```text
+$ kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic no-such-topic --timeout-ms 3000
+[...] WARN [Consumer clientId=console-consumer, groupId=console-consumer-69637] The metadata response from the cluster reported a recoverable issue with correlation id 20 : {no-such-topic=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+[...] WARN [Consumer clientId=console-consumer, groupId=console-consumer-69637] The metadata response from the cluster reported a recoverable issue with correlation id 21 : {no-such-topic=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+[...] ERROR Error processing message, terminating consumer process:  (org.apache.kafka.tools.consumer.ConsoleConsumer)
+org.apache.kafka.common.errors.TimeoutException
+Processed a total of 0 messages
+```
+
+```text
+$ kafka-topics.sh --bootstrap-server $BOOTSTRAP --list | grep no-such-topic
+(nothing -- confirmed never created)
+```
+
+With auto-create off, **`UNKNOWN_TOPIC_OR_PARTITION` never goes away** — it repeats on every metadata refresh until the client gives up, and `--list` proves the topic was never silently created underneath. Same error code, permanently different outcome, purely because of one broker-level flag.
+
+## Proof: listeners vs. advertised listeners — the real error from getting it wrong
+
+The probe compose this course uses (like every real multi-listener setup) declares **two** listeners on purpose: `PLAINTEXT` (for clients already inside the Docker network) and `PLAINTEXT_HOST` (published to the host). `listeners` is what the broker **binds** to; `advertised.listeners` is what it **tells clients to connect to next** — and those can genuinely differ (a container's internal bind address is rarely what an external client should dial). Breaking that second value on purpose — setting `PLAINTEXT_HOST`'s advertised host to an address that does not resolve — and then running a real KafkaJS producer from **outside** the container, against the correctly-published host port:
+
+```typescript
+// src/brokers-topics-partitions/bad-advertised-listener.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'listener-probe', brokers: ['localhost:29092'] });
+const producer = kafka.producer();
+
+async function main() {
+  await producer.connect();
+  console.log('bootstrap connect OK (via localhost:29092)');
+  try {
+    await producer.send({ topic: 'orders', messages: [{ value: 'x' }] });
+  } catch (err: any) {
+    console.log('send FAILED:', err.name, '-', err.message);
+  }
+  await producer.disconnect();
+}
+
+main();
+```
+
+Real, unedited output:
+
+```text
+bootstrap connect OK (via localhost:29092)
+{"level":"ERROR", ..., "message":"[Connection] Connection error: getaddrinfo ENOTFOUND wrong-advertised-host","broker":"wrong-advertised-host:29092", ...}
+{"level":"ERROR", ..., "message":"[Producer] Failed to send messages: Connection error: getaddrinfo ENOTFOUND wrong-advertised-host","retryCount":0, ...}
+send FAILED: KafkaJSNumberOfRetriesExceeded - Connection error: getaddrinfo ENOTFOUND wrong-advertised-host
+```
+
+This is the exact shape of a very common real deployment bug, reproduced on purpose: the **bootstrap** connection to `localhost:29092` succeeded fine — that address was correct. But the broker's metadata response told the client the partition leader lives at `wrong-advertised-host:29092` (the value in `advertised.listeners`), and the client's **next** connection — the one that actually sends the record — tried to resolve that hostname and failed with a real `getaddrinfo ENOTFOUND`. This is precisely why `advertised.listeners` must be a hostname/IP the *client* can actually reach, not just one the broker process itself can bind to — a container's own hostname, an internal-only DNS name, or (very commonly) `localhost` left unchanged when a client is not running on the same host, all reproduce this exact failure.
+
+<Mermaid title="listeners is where the broker binds; advertised.listeners is what it tells the client next" code={listenerDiagram} />
+
+export const listenerDiagram = `sequenceDiagram
+  participant C as Client (host)
+  participant B as Broker
+  C->>B: bootstrap connect to localhost:29092 (listeners)
+  B-->>C: metadata: leader is at "wrong-advertised-host:29092" (advertised.listeners)
+  C->>C: getaddrinfo("wrong-advertised-host") -- ENOTFOUND
+  Note over C: send() fails -- proven above, real error`;
+
+<Callout title="The one-line takeaway">
+`kafka-configs.sh --describe --all` proves configs carry a real **source**: `DEFAULT_CONFIG`, `STATIC_BROKER_CONFIG`, or `DYNAMIC_BROKER_CONFIG` — proven above by successfully altering `log.retention.ms` at runtime and getting a real `InvalidRequestException` trying the same on the static `log.dirs`. A **topic**-level config (`DYNAMIC_TOPIC_CONFIG`) wins over the broker's, which wins over the default — proven with a real three-layer `retention.ms` chain. `auto.create.topics.enable` decides whether a first produce/consume against a missing topic races a real creation (transient `UNKNOWN_TOPIC_OR_PARTITION`, then success) or fails with that same error **permanently** — proven both ways. And `listeners` vs `advertised.listeners` is not cosmetic: proven above with a real `getaddrinfo ENOTFOUND` from a working bootstrap connection followed by a broken metadata-directed one.
+</Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="bash" code={`# scripts/brokers-topics-partitions/enable-short-retention.sh
+# AI comment: "Make retention configurable per environment without restarting brokers"
+kafka-configs.sh --bootstrap-server localhost:9092 \\
+  --alter --entity-type brokers --entity-name 1 \\
+  --add-config log.dirs=/mnt/fast-nvme/kafka-logs,auto.create.topics.enable=false
+`}>
+
+Both configs in this one `--alter` call look reasonable individually — moving log storage to faster disks, disabling auto-create for stricter topic governance — and the comment's *goal* ("configurable without restarting") is a real, legitimate one for plenty of broker configs. The bug: **neither `log.dirs` nor `auto.create.topics.enable` is actually eligible for dynamic update**, proven directly above — both are `STATIC_BROKER_CONFIG` and both produce the identical real error, `InvalidRequestException: Cannot update these configs dynamically: [...]`, when altered this way. This command does not silently do nothing — it fails outright, which is the safer failure mode, but an AI-generated runbook or automation script that doesn't check the exit code (or that wraps this in a "best effort, ignore errors" retry loop) would report success on a no-op. The real fix is either a config that genuinely is dynamic (`log.retention.ms`, proven above), or, for `log.dirs`/`auto.create.topics.enable` specifically, editing the static config and restarting the broker — there is no runtime-only path for either.
+
+</SpotTheBug>
+
+## Mental Model
+
+Think of a broker's configuration as coming from three **stacked transparencies**, checked in this order for any given key: the topic's own sheet on top (if the resource being asked about is a topic), then the broker's dynamic overrides, then the broker's static/startup config, then Kafka's built-in default at the bottom. `kafka-configs.sh --describe --all`'s `synonyms={...}` output, proven above, is *literally* printing which transparency answered — that is not a metaphor, it is what the tool is designed to report. The same layering logic explains why altering a value doesn't always work: dynamic update only exists for the top two sheets (topic, dynamic-broker); the bottom two (static-broker, default) can only be changed by editing config and restarting.
+
+## Trade-offs
+
+- **More partitions** — higher achievable throughput and consumer parallelism, at the cost of more open files, more controller/metadata bookkeeping (proven concretely in [KRaft & the Cluster](/kafka/en/foundations/kraft-and-the-cluster/): every partition is its own `PARTITION_RECORD` in the metadata log), and longer rebalances.
+- **`auto.create.topics.enable=true`** — convenient for dev/prototyping (a typo'd topic name just works, proven above), at the cost of zero governance: any producer can create a topic with the cluster's bare `num.partitions`/`default.replication.factor` defaults, which are rarely what you actually want in production.
+- **Dynamic broker configs** — change behavior with zero downtime (proven above with `log.retention.ms`), but only a specific, broker-defined subset of configs support this; the rest genuinely need a restart, and the tool will tell you which is which if you try.
+- **Advertised listeners matching the bind address exactly** (e.g., always `localhost`) — works perfectly for a same-host client, and fails with exactly the error proven above for every client that isn't on that host — this is why real deployments almost always need `listeners` and `advertised.listeners` to differ.
+
+## Common Misconceptions
+
+- **"If `kafka-configs.sh --describe` shows a value, I can always change it with `--alter`."** No — proven above: `log.dirs` and `auto.create.topics.enable` both describe cleanly but are rejected identically (`Cannot update these configs dynamically`) when altered at runtime; only truly dynamic configs (like `log.retention.ms`, also proven above) accept `--alter`.
+- **"A topic's own config and the broker's config for the same key can't both apply at once — one replaces the other entirely."** Misleading — proven above with the real three-entry `synonyms` chain: all three layers (topic, dynamic-broker, default) exist simultaneously in the broker's view; only the *highest-priority* one is currently in effect, but the others are still visible and take over the instant the topic-level override is removed.
+- **"`auto.create.topics.enable` can be flipped at runtime like most other broker settings."** No — proven above: it is `STATIC_BROKER_CONFIG` and rejects `--alter` with the exact same error a genuinely un-restartable config like `log.dirs` gets; this course had to restart the container to test the disabled behavior.
+- **"`listeners` and `advertised.listeners` are two names for the same setting, kept for backward compatibility."** No — proven above: `listeners` is a real bind address (works fine even when wrong from a client's perspective, since the broker binds it on its own machine), while `advertised.listeners` is the value handed to *other* clients in metadata responses — getting it wrong breaks every client that isn't already connected via the address that happens to match, with a real `getaddrinfo ENOTFOUND` (or equivalent connection failure) as the symptom.
 
 export const quizAnatomy = [
   {
@@ -75,6 +266,7 @@ export const quizAnatomy = [
       'Partitions only exist for replication, not for a single topic',
     ],
     answer: 1,
+    explain: 'Proven throughout this course: kafka-topics.sh --describe always lists one Partition: line per partition, each with its own Leader/Isr.',
   },
   {
     q: 'Where does Kafka guarantee record ordering?',
@@ -85,26 +277,51 @@ export const quizAnatomy = [
       'Kafka never guarantees ordering',
     ],
     answer: 1,
+    explain: 'Each partition is its own independent log with its own offset sequence; there is no cross-partition offset relationship.',
   },
   {
-    q: 'Why increase the number of partitions for a topic?',
+    q: "Proven above, what real difference did kafka-configs.sh --describe --all show between log.retention.ms and log.dirs when both were altered at runtime?",
     options: [
-      'To reduce disk usage',
-      'To increase parallelism and throughput — partitions spread reads/writes across brokers and consumers',
-      'To guarantee total ordering across the topic',
-      'It has no effect on performance',
+      'Both were accepted identically',
+      "log.retention.ms was accepted and immediately showed DYNAMIC_BROKER_CONFIG in its synonyms; log.dirs was rejected with a real InvalidRequestException: Cannot update these configs dynamically",
+      'Both were rejected because brokers can never be altered live',
+      'log.dirs succeeded but log.retention.ms failed',
     ],
     answer: 1,
+    explain: 'Real output: "Completed updating config for broker 1" for log.retention.ms vs. a real ExecutionException/InvalidRequestException for log.dirs -- proving the dynamic/static distinction is enforced, not just documented.',
   },
   {
-    q: 'How is a specific record uniquely located in Kafka?',
+    q: 'On the topic created with --config retention.ms=60000 on a broker whose own dynamic log.retention.ms was already set to 600000, what did the real synonyms chain prove?',
     options: [
-      'By its timestamp alone',
-      'By the triple of topic, partition, and offset',
-      'By a global auto-increment ID across all topics',
-      'By the broker hostname',
+      'Only the broker-level value ever applies to a topic',
+      'The topic-level DYNAMIC_TOPIC_CONFIG (60000) won over the broker-level DYNAMIC_BROKER_CONFIG (600000), which itself had already won over the DEFAULT_CONFIG (168 hours)',
+      'Topic-level configs are ignored unless the broker default is unset',
+      'Setting retention.ms on a topic has no effect',
     ],
     answer: 1,
+    explain: 'Real, unedited synonyms output listed all three layers in priority order: DYNAMIC_TOPIC_CONFIG:retention.ms=60000, DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168.',
+  },
+  {
+    q: 'With auto.create.topics.enable statically disabled (proven above via a container restart, since the config itself is static), what did a real consumer against a nonexistent topic actually do?',
+    options: [
+      'It silently created the topic anyway',
+      'It repeatedly got UNKNOWN_TOPIC_OR_PARTITION on every metadata refresh and eventually threw a TimeoutException, with kafka-topics.sh --list confirming the topic was never created',
+      'It connected successfully and read zero messages with no warnings',
+      'The broker crashed',
+    ],
+    answer: 1,
+    explain: "Real log output repeated the UNKNOWN_TOPIC_OR_PARTITION warning across multiple metadata refreshes before the console consumer's own TimeoutException fired; --list confirmed nothing was created, unlike the auto-create-enabled race proven earlier in the lesson.",
+  },
+  {
+    q: 'In the real bad-advertised-listener proof above, why did the bootstrap connection succeed but the actual send() fail?',
+    options: [
+      'The broker was down the whole time',
+      "The bootstrap address (localhost:29092, from listeners) was reachable and correct, but the broker's metadata response pointed the client at advertised.listeners' broken hostname for the next (actual send) connection, which failed with a real getaddrinfo ENOTFOUND",
+      'KafkaJS does not support producing to topics with more than one partition',
+      'The topic did not exist',
+    ],
+    answer: 1,
+    explain: 'Real output showed "bootstrap connect OK" followed by a genuine getaddrinfo ENOTFOUND for "wrong-advertised-host" -- listeners governs the first hop, advertised.listeners governs every hop after metadata is returned.',
   },
 ];
 

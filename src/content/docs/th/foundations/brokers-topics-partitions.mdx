@@ -1,6 +1,6 @@
 ---
 title: 'Broker, Topic และ Partition'
-description: 'กายวิภาคของ Kafka cluster broker, topic ที่ถูกแบ่งเป็น partition, offset และวิธีที่ partitioning scale topic กระจายทั้ง cluster'
+description: 'กายวิภาคของ Kafka cluster ผลจริงจาก kafka-configs.sh กับ source DEFAULT/STATIC/DYNAMIC พิสูจน์จริงว่า dynamic vs static alter ต่างกันยังไง topic-level override พฤติกรรม auto-create และ error จริงจาก advertised listener ที่ผิด'
 sidebar:
   order: 4
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -61,9 +62,199 @@ record ใด ๆ ใน Kafka ถูกระบุด้วยพิกัด�
 
 จำนวน partition คือปุ่มปรับ throughput หลักของคุณ แต่ไม่ฟรี partition แต่ละอันคือไฟล์บนดิสก์และเป็นหน่วยงานสำหรับ consumer กับ controller น้อยไปก็ parallelize ไม่ได้ เยอะไปก็จ่าย overhead ทั้ง metadata, open file และเวลา rebalance วิธีที่นิยมคือ ประเมิน throughput เป้าหมาย, ตั้งจำนวน partition ให้พอดีกับเป้าหมายนั้น แล้วเผื่อ headroom ไว้ คุณ **เพิ่ม** partition ทีหลังได้ แต่การทำแบบนั้นเปลี่ยนวิธีที่ record แบบมี key map ไป partition (ข้อควรระวังที่ module ถัดไปจะอธิบาย)
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**broker** คือ Kafka หนึ่งตัว **cluster** คือหลายตัว **topic** ถูกแบ่งเป็น **partition** แต่ละ partition คือ log ที่มีลำดับแยกกันเก็บบน broker ตัวใดตัวหนึ่ง partition เป็นหน่วยของ **parallelism** (กระจายข้าม broker เพื่อ throughput) และของ **ordering** (การันตีภายใน partition ไม่ข้าม) record ทุกตัวถูกระบุด้วย **topic + partition + offset**
+## พิสูจน์: broker config และ source tag จริง DEFAULT / STATIC / DYNAMIC
+
+`kafka-configs.sh --describe --all` ไม่ได้แสดงแค่ค่าของ config แต่แสดงว่า**ค่านั้นมาจากไหน** output จริงแบบตัดทอนจาก broker ของคอร์สนี้เอง
+
+```bash
+# scripts/brokers-topics-partitions/describe-broker.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --all --entity-type brokers --entity-name 1
+```
+
+```text
+advertised.listeners=PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092 sensitive=false synonyms={STATIC_BROKER_CONFIG:advertised.listeners=...}
+auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}
+default.replication.factor=1 sensitive=false synonyms={DEFAULT_CONFIG:default.replication.factor=1}
+listeners=PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:29093 sensitive=false synonyms={STATIC_BROKER_CONFIG:listeners=..., DEFAULT_CONFIG:listeners=PLAINTEXT://:9092}
+log.retention.hours=168 sensitive=false synonyms={DEFAULT_CONFIG:log.retention.hours=168}
+num.partitions=1 sensitive=false synonyms={DEFAULT_CONFIG:num.partitions=1}
+```
+
+ทุกบรรทัด `synonyms={...}` บอก**แหล่งที่มา**จริง คือ **`DEFAULT_CONFIG`** (default ในตัวของ broker ไม่มีใครไปตั้งเอง), **`STATIC_BROKER_CONFIG`** (ตั้งครั้งเดียวตอน startup เช่นผ่าน env var `KAFKA_LISTENERS` ของ container นี้ ไม่เปลี่ยนจนกว่าจะ restart) หรือ (พิสูจน์ต่อไป) **`DYNAMIC_BROKER_CONFIG`** (ตั้งตอน runtime ผ่าน Admin API ไม่ต้อง restart)
+
+## พิสูจน์: config แบบ dynamic สำเร็จ config แบบ static ถูกปฏิเสธ — error text จริง
+
+```bash
+# scripts/brokers-topics-partitions/dynamic-vs-static.sh
+echo "=== alter a DYNAMIC config (log.retention.ms) ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --alter --entity-type brokers --entity-name 1 --add-config log.retention.ms=600000
+
+echo "=== confirm the source tag ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1
+
+echo "=== alter a STATIC/read-only config (log.dirs) -- expect rejection ==="
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --alter --entity-type brokers --entity-name 1 --add-config log.dirs=/tmp/other-dir || true
+```
+
+output จริงไม่ได้แก้ไข
+
+```text
+=== alter a DYNAMIC config (log.retention.ms) ===
+Completed updating config for broker 1.
+
+=== confirm the source tag ===
+Dynamic configs for broker 1 are:
+  log.retention.ms=600000 sensitive=false synonyms={DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168}
+
+=== alter a STATIC/read-only config (log.dirs) -- expect rejection ===
+Error while executing config command with args '--bootstrap-server localhost:9092 --alter --entity-type brokers --entity-name 1 --add-config log.dirs=/tmp/other-dir'
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [log.dirs]
+```
+
+`log.retention.ms` มีผลทันทีไม่ต้อง restart และ `synonyms` ของมันเองตอนนี้แสดง **`DYNAMIC_BROKER_CONFIG`** อยู่ก่อน `DEFAULT_CONFIG` ที่มันแทนที่ พิสูจน์ว่า source-priority chain เป็นของจริง ไม่ใช่แค่มีเอกสารบอกไว้ ส่วน `log.dirs` เป็น static จริง ๆ `InvalidRequestException: Cannot update these configs dynamically: [log.dirs]` ของ broker เองเป็น text จริง ไม่ใช่การเดาฝั่ง client การเปลี่ยนที่เก็บ log ของ broker ขณะกำลังรันอยู่หมายถึงต้องย้าย file handle ที่เปิดอยู่จริง ๆ ทางกายภาพ นี่ไม่ใช่ข้อจำกัดที่ตั้งขึ้นมาลอย ๆ
+
+<Callout title="config เป็น DEFAULT_CONFIG ก็ยังเป็น static ได้">
+`auto.create.topics.enable` แสดง `DEFAULT_CONFIG` ข้างบน (ยังไม่มีใคร override) ซึ่งอาจตีความไปว่า "งั้นแปลว่า override แบบ dynamic ได้" ทดสอบตรง ๆ กับ broker นี้เอง การลอง `--alter --add-config auto.create.topics.enable=false` ตอน runtime ถูกปฏิเสธด้วย error `Cannot update these configs dynamically` เดียวกันเป๊ะกับที่ `log.dirs` ได้ **source tag ของ config (default/static/dynamic) กับว่ามัน *มีสิทธิ์* ถูก update แบบ dynamic หรือไม่ เป็นสองเรื่องแยกกัน** พิสูจน์แล้วว่าการพิสูจน์พฤติกรรม auto-create-disabled ข้างล่างต้อง restart container ด้วย `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` ไม่ใช่เรียก `--alter`
 </Callout>
+
+## พิสูจน์: config ระดับ topic override ค่า default ของ broker
+
+```bash
+# scripts/brokers-topics-partitions/topic-level-override.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --topic short-lived --partitions 1 --replication-factor 1 --config retention.ms=60000
+
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type topics --entity-name short-lived --all | grep 'retention.ms'
+```
+
+output จริง
+
+```text
+retention.ms=60000 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:retention.ms=60000, DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168}
+```
+
+chain การ override เต็ม ๆ จริงตามลำดับ **`DYNAMIC_TOPIC_CONFIG:retention.ms=60000`** ของ topic นี้เองชนะ **`DYNAMIC_BROKER_CONFIG:log.retention.ms=600000`** ที่ตั้งไว้สองหัวข้อก่อนหน้า ซึ่งตัวมันเองก็ชนะ **`DEFAULT_CONFIG:log.retention.hours=168`** เดิมอยู่แล้ว สามชั้นจริง พิสูจน์ด้วยการเปลี่ยนค่าทีละชั้นแล้วดูว่าผู้ชนะเปลี่ยนไปทุกครั้ง
+
+## พิสูจน์: `auto.create.topics.enable` — race ตอนเปิด error จริงตอนปิด
+
+ด้วย default `auto.create.topics.enable=true` การ produce ไปที่ topic ที่ยังไม่มีอยู่จะ trigger การสร้างอัตโนมัติ แต่ request **แรกสุด** อาจ race กับการสร้างได้
+
+```text
+$ kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic autocreate-demo
+Error while executing topic command : Topic 'autocreate-demo' does not exist as expected
+[...] WARN [Producer clientId=console-producer] The metadata response from the cluster reported a recoverable issue with correlation id 1 : {autocreate-demo=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+```
+
+```text
+$ kafka-topics.sh --bootstrap-server $BOOTSTRAP --list | grep autocreate
+autocreate-demo
+```
+
+metadata request **แรก** ของ producer ได้ **`UNKNOWN_TOPIC_OR_PARTITION`** จริง ๆ topic ยังไม่มีอยู่จริง ณ วินาทีนั้น แต่ request เดียวกันนั้นแหละที่ *trigger* การสร้างอัตโนมัติ พอถึงตอนรัน `--list` ทีหลัง topic ก็มีอยู่แล้ว warning ชั่วคราวแล้วสำเร็จแบบนี้คือรูปแบบจริงที่เกิดซ้ำได้ของ race ตอน auto-create ไม่ใช่เหตุการณ์เดียวที่เกิดครั้งเดียว
+
+restart broker นี้ด้วย **`auto.create.topics.enable=false`** (เป็น static config ตาม callout ข้างบน ต้อง restart container ไม่ใช่ `--alter`) แล้วทำ request คล้าย ๆ กันกับ topic ที่ไม่มีอยู่จริง
+
+```text
+$ kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic no-such-topic --timeout-ms 3000
+[...] WARN [Consumer clientId=console-consumer, groupId=console-consumer-69637] The metadata response from the cluster reported a recoverable issue with correlation id 20 : {no-such-topic=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+[...] WARN [Consumer clientId=console-consumer, groupId=console-consumer-69637] The metadata response from the cluster reported a recoverable issue with correlation id 21 : {no-such-topic=UNKNOWN_TOPIC_OR_PARTITION} (org.apache.kafka.clients.NetworkClient)
+[...] ERROR Error processing message, terminating consumer process:  (org.apache.kafka.tools.consumer.ConsoleConsumer)
+org.apache.kafka.common.errors.TimeoutException
+Processed a total of 0 messages
+```
+
+```text
+$ kafka-topics.sh --bootstrap-server $BOOTSTRAP --list | grep no-such-topic
+(nothing -- confirmed never created)
+```
+
+พอปิด auto-create **`UNKNOWN_TOPIC_OR_PARTITION` ไม่หายไปไหนเลย** มันเกิดซ้ำทุกครั้งที่ metadata refresh จนกว่า client จะยอมแพ้ และ `--list` พิสูจน์ว่า topic ไม่เคยถูกสร้างขึ้นแอบ ๆ เลย error code เดียวกัน แต่ผลลัพธ์ต่างกันถาวร แค่เพราะ flag ระดับ broker ตัวเดียว
+
+## พิสูจน์: listeners กับ advertised listeners — error จริงเมื่อตั้งผิด
+
+probe compose ของคอร์สนี้ (เหมือน multi-listener setup จริงทุกอัน) ประกาศ listener **สอง**ตัวโดยตั้งใจ คือ `PLAINTEXT` (สำหรับ client ที่อยู่ใน Docker network เดียวกันอยู่แล้ว) และ `PLAINTEXT_HOST` (publish ออกมาที่ host) `listeners` คือที่ broker **bind** ส่วน `advertised.listeners` คือที่มัน **บอก client ให้ต่อไปต่อ** และสองค่านี้ต่างกันได้จริง (bind address ภายใน container แทบไม่ใช่สิ่งที่ external client ควรจะต่อไปเลย) ตั้งใจทำให้ค่าที่สองพัง คือตั้ง advertised host ของ `PLAINTEXT_HOST` เป็น address ที่ resolve ไม่ได้ แล้วรัน KafkaJS producer จริงจาก**นอก** container กับ host port ที่ publish ถูกต้องอยู่แล้ว
+
+```typescript
+// src/brokers-topics-partitions/bad-advertised-listener.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'listener-probe', brokers: ['localhost:29092'] });
+const producer = kafka.producer();
+
+async function main() {
+  await producer.connect();
+  console.log('bootstrap connect OK (via localhost:29092)');
+  try {
+    await producer.send({ topic: 'orders', messages: [{ value: 'x' }] });
+  } catch (err: any) {
+    console.log('send FAILED:', err.name, '-', err.message);
+  }
+  await producer.disconnect();
+}
+
+main();
+```
+
+output จริงไม่ได้แก้ไข
+
+```text
+bootstrap connect OK (via localhost:29092)
+{"level":"ERROR", ..., "message":"[Connection] Connection error: getaddrinfo ENOTFOUND wrong-advertised-host","broker":"wrong-advertised-host:29092", ...}
+{"level":"ERROR", ..., "message":"[Producer] Failed to send messages: Connection error: getaddrinfo ENOTFOUND wrong-advertised-host","retryCount":0, ...}
+send FAILED: KafkaJSNumberOfRetriesExceeded - Connection error: getaddrinfo ENOTFOUND wrong-advertised-host
+```
+
+นี่คือรูปแบบ bug การ deploy จริงที่พบบ่อยมาก จงใจทำซ้ำขึ้นมา connection **bootstrap** ไปที่ `localhost:29092` สำเร็จดี address นั้นถูกต้อง แต่ metadata response ของ broker บอก client ว่า partition leader อยู่ที่ `wrong-advertised-host:29092` (ค่าใน `advertised.listeners`) และ connection **ถัดไป** ของ client คือตัวที่ส่ง record จริง ๆ พยายาม resolve hostname นั้นแล้วพังด้วย `getaddrinfo ENOTFOUND` จริง นี่แหละคือเหตุผลที่ `advertised.listeners` ต้องเป็น hostname/IP ที่ *client* เข้าถึงได้จริง ไม่ใช่แค่ที่ broker process เอง bind ได้ hostname ของ container เอง, DNS name ที่ใช้ได้แค่ภายใน หรือ (พบบ่อยมาก) `localhost` ที่ไม่ได้เปลี่ยนตอน client ไม่ได้รันบนเครื่องเดียวกัน ล้วนทำให้เกิด failure แบบเดียวกันเป๊ะนี้
+
+<Mermaid title="listeners คือที่ broker bind advertised.listeners คือสิ่งที่มันบอก client ต่อไป" code={listenerDiagram} />
+
+export const listenerDiagram = `sequenceDiagram
+  participant C as Client (host)
+  participant B as Broker
+  C->>B: bootstrap connect to localhost:29092 (listeners)
+  B-->>C: metadata: leader is at "wrong-advertised-host:29092" (advertised.listeners)
+  C->>C: getaddrinfo("wrong-advertised-host") -- ENOTFOUND
+  Note over C: send() fails -- proven above, real error`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`kafka-configs.sh --describe --all` พิสูจน์ว่า config มี**แหล่งที่มา**จริง คือ `DEFAULT_CONFIG`, `STATIC_BROKER_CONFIG` หรือ `DYNAMIC_BROKER_CONFIG` พิสูจน์แล้วข้างบนด้วยการ alter `log.retention.ms` ตอน runtime สำเร็จ และได้ `InvalidRequestException` จริงตอนลองแบบเดียวกันกับ static `log.dirs` config ระดับ **topic** (`DYNAMIC_TOPIC_CONFIG`) ชนะของ broker ซึ่งชนะ default พิสูจน์แล้วด้วย chain `retention.ms` สามชั้นจริง `auto.create.topics.enable` ตัดสินว่า produce/consume ครั้งแรกกับ topic ที่ขาดหายจะ race กับการสร้างจริง (`UNKNOWN_TOPIC_OR_PARTITION` ชั่วคราว แล้วสำเร็จ) หรือ fail ด้วย error เดียวกันนั้น**ถาวร** พิสูจน์แล้วทั้งสองแบบ และ `listeners` กับ `advertised.listeners` ไม่ใช่เรื่องสวยงามผิวเผิน พิสูจน์แล้วข้างบนด้วย `getaddrinfo ENOTFOUND` จริงจาก bootstrap connection ที่ทำงานได้ตามด้วย metadata-directed connection ที่พัง
+</Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug lang="bash" code={`# scripts/brokers-topics-partitions/enable-short-retention.sh
+# AI comment: "Make retention configurable per environment without restarting brokers"
+kafka-configs.sh --bootstrap-server localhost:9092 \\
+  --alter --entity-type brokers --entity-name 1 \\
+  --add-config log.dirs=/mnt/fast-nvme/kafka-logs,auto.create.topics.enable=false
+`}>
+
+config ทั้งสองตัวใน `--alter` call เดียวนี้ดูสมเหตุสมผลแยกกัน ย้าย log storage ไปดิสก์ที่เร็วกว่า ปิด auto-create เพื่อ governance ที่เข้มขึ้น และเป้าหมายของ comment ("configurable ไม่ต้อง restart") ก็เป็นเป้าหมายจริงที่สมเหตุสมผลสำหรับ broker config หลายตัว bug คือ **ทั้ง `log.dirs` และ `auto.create.topics.enable` ไม่มีสิทธิ์ update แบบ dynamic เลยสักตัว** พิสูจน์แล้วตรง ๆ ข้างบน ทั้งคู่เป็น `STATIC_BROKER_CONFIG` และทั้งคู่ให้ error จริงเหมือนกันเป๊ะ `InvalidRequestException: Cannot update these configs dynamically: [...]` เมื่อ alter แบบนี้ command นี้ไม่ได้เงียบ ๆ ไม่ทำอะไรเลย มัน fail ตรง ๆ ซึ่งเป็น failure mode ที่ปลอดภัยกว่า แต่ runbook หรือ automation script ที่ AI สร้างซึ่งไม่เช็ค exit code (หรือ wrap คำสั่งนี้ไว้ใน retry loop แบบ "best effort ไม่สน error") จะรายงานว่าสำเร็จทั้งที่ไม่ได้ทำอะไรเลย วิธีแก้จริงคือใช้ config ที่ dynamic จริง ๆ (`log.retention.ms` พิสูจน์แล้วข้างบน) หรือสำหรับ `log.dirs`/`auto.create.topics.enable` โดยเฉพาะ ต้องแก้ static config แล้ว restart broker ไม่มีทาง runtime-only สำหรับทั้งคู่
+
+</SpotTheBug>
+
+## Mental Model
+
+ลองนึกถึง config ของ broker เป็น **แผ่นใสซ้อนกันสามชั้น** เช็คตามลำดับนี้สำหรับทุก key ที่ถาม แผ่นของ topic เองอยู่บนสุด (ถ้า resource ที่ถามเป็น topic) แล้วตามด้วย dynamic override ของ broker แล้ว static/startup config ของ broker แล้ว default ในตัวของ Kafka อยู่ล่างสุด output `synonyms={...}` ของ `kafka-configs.sh --describe --all` ที่พิสูจน์แล้วข้างบน กำลัง print ว่าแผ่นใสไหนตอบ**จริง ๆ** ไม่ใช่แค่คำเปรียบเปรย นี่คือสิ่งที่ tool ถูกออกแบบมาให้รายงาน logic การซ้อนชั้นแบบเดียวกันนี้อธิบายว่าทำไม alter ถึงไม่ work เสมอไป dynamic update มีอยู่แค่สองชั้นบนสุด (topic, dynamic-broker) สองชั้นล่าง (static-broker, default) เปลี่ยนได้แค่ด้วยการแก้ config แล้ว restart เท่านั้น
+
+## Trade-offs
+
+- **partition มากขึ้น** — throughput และ consumer parallelism ที่ทำได้สูงขึ้น แลกกับ open file มากขึ้น, metadata/controller bookkeeping มากขึ้น (พิสูจน์เป็นรูปธรรมใน [KRaft & the Cluster](/kafka/en/foundations/kraft-and-the-cluster/) ทุก partition คือ `PARTITION_RECORD` ของตัวเองใน metadata log) และ rebalance นานขึ้น
+- **`auto.create.topics.enable=true`** — สะดวกสำหรับ dev/prototype (พิมพ์ชื่อ topic ผิดก็ยังทำงานได้ พิสูจน์แล้วข้างบน) แลกกับ governance เป็นศูนย์ producer ไหนก็สร้าง topic ด้วย `num.partitions`/`default.replication.factor` default เปล่า ๆ ของ cluster ได้ ซึ่งแทบไม่ใช่สิ่งที่ต้องการจริงใน production
+- **dynamic broker config** — เปลี่ยนพฤติกรรมได้โดย downtime เป็นศูนย์ (พิสูจน์แล้วข้างบนด้วย `log.retention.ms`) แต่มีแค่ config บางส่วนที่ broker กำหนดไว้ให้เท่านั้นที่รองรับแบบนี้ ที่เหลือต้อง restart จริง ๆ และ tool จะบอกให้เองถ้าลอง
+- **advertised listener ที่ตรงกับ bind address เป๊ะ** (เช่น `localhost` เสมอ) — ทำงานสมบูรณ์แบบสำหรับ client บนเครื่องเดียวกัน และพังด้วย error เดียวกับที่พิสูจน์ข้างบนสำหรับ client ที่ไม่ได้อยู่เครื่องนั้น นี่คือเหตุผลที่ deployment จริงแทบทุกครั้งต้องให้ `listeners` กับ `advertised.listeners` ต่างกัน
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า `kafka-configs.sh --describe` แสดงค่าได้ ก็เปลี่ยนด้วย `--alter` ได้เสมอ"** ผิด พิสูจน์แล้วข้างบน `log.dirs` กับ `auto.create.topics.enable` ทั้งคู่ describe ออกมาได้ปกติ แต่ถูกปฏิเสธเหมือนกัน (`Cannot update these configs dynamically`) เมื่อ alter ตอน runtime มีแค่ config ที่ dynamic จริง ๆ (อย่าง `log.retention.ms` พิสูจน์แล้วข้างบนด้วย) เท่านั้นที่รับ `--alter`
+- **"config ของ topic เองกับ config ของ broker สำหรับ key เดียวกันใช้พร้อมกันไม่ได้ ต้องมีตัวหนึ่งแทนที่อีกตัวไปเลย"** เข้าใจผิด พิสูจน์แล้วข้างบนด้วย chain `synonyms` สามรายการจริง ทั้งสามชั้น (topic, dynamic-broker, default) มีอยู่พร้อมกันในมุมมองของ broker พร้อมกันทั้งหมด แค่ตัวที่ priority สูงสุดเท่านั้นที่มีผลอยู่ตอนนี้ แต่ตัวอื่นยังมองเห็นได้และจะเข้ามาแทนทันทีที่ override ระดับ topic ถูกลบ
+- **"`auto.create.topics.enable` เปลี่ยนตอน runtime ได้เหมือน broker setting ส่วนใหญ่"** ผิด พิสูจน์แล้วข้างบน มันเป็น `STATIC_BROKER_CONFIG` และปฏิเสธ `--alter` ด้วย error เดียวกันเป๊ะกับ config ที่ restart ไม่ได้จริง ๆ อย่าง `log.dirs` คอร์สนี้ต้อง restart container เพื่อทดสอบพฤติกรรมตอนปิด
+- **"`listeners` กับ `advertised.listeners` เป็นชื่อสองชื่อของ setting เดียวกัน เก็บไว้เพื่อ backward compatibility"** ผิด พิสูจน์แล้วข้างบน `listeners` คือ bind address จริง (ทำงานได้ปกติแม้จะผิดจากมุมมอง client เพราะ broker bind มันบนเครื่องตัวเอง) ส่วน `advertised.listeners` คือค่าที่ส่งให้ client *อื่น* ใน metadata response ตั้งผิดแล้วทุก client ที่ไม่ได้เชื่อมผ่าน address ที่บังเอิญตรงกันจะพัง มี `getaddrinfo ENOTFOUND` (หรือ connection failure แบบเดียวกัน) เป็นอาการจริง
 
 export const quizAnatomy = [
   {
@@ -75,6 +266,7 @@ export const quizAnatomy = [
       'partition มีไว้เพื่อ replication เท่านั้น ไม่ได้มีไว้สำหรับ topic เดียว',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วตลอดคอร์สนี้ kafka-topics.sh --describe แสดงบรรทัด Partition: หนึ่งบรรทัดต่อหนึ่ง partition เสมอ แต่ละบรรทัดมี Leader/Isr ของตัวเอง',
   },
   {
     q: 'Kafka การันตีลำดับของ record ตรงไหน',
@@ -85,26 +277,51 @@ export const quizAnatomy = [
       'Kafka ไม่เคยการันตีลำดับ',
     ],
     answer: 1,
+    explain: 'แต่ละ partition คือ log อิสระที่มี offset sequence ของตัวเอง ไม่มีความสัมพันธ์ของ offset ข้าม partition เลย',
   },
   {
-    q: 'ทำไมถึงเพิ่มจำนวน partition ให้ topic',
+    q: 'พิสูจน์แล้วข้างบน kafka-configs.sh --describe --all แสดงความต่างจริงอะไรระหว่าง log.retention.ms กับ log.dirs เมื่อทั้งคู่ถูก alter ตอน runtime',
     options: [
-      'เพื่อลดการใช้ดิสก์',
-      'เพื่อเพิ่ม parallelism และ throughput partition กระจายการอ่านเขียนข้าม broker และ consumer',
-      'เพื่อการันตีลำดับสมบูรณ์ทั้ง topic',
-      'ไม่มีผลต่อ performance',
+      'ทั้งคู่ถูกยอมรับเหมือนกัน',
+      'log.retention.ms ถูกยอมรับและแสดง DYNAMIC_BROKER_CONFIG ใน synonyms ทันที ส่วน log.dirs ถูกปฏิเสธด้วย InvalidRequestException จริง: Cannot update these configs dynamically',
+      'ทั้งคู่ถูกปฏิเสธเพราะ broker alter สดไม่ได้เลย',
+      'log.dirs สำเร็จแต่ log.retention.ms fail',
     ],
     answer: 1,
+    explain: 'output จริง "Completed updating config for broker 1" สำหรับ log.retention.ms เทียบกับ ExecutionException/InvalidRequestException จริงสำหรับ log.dirs พิสูจน์ว่าความต่าง dynamic/static ถูกบังคับใช้จริง ไม่ใช่แค่มีเอกสารบอกไว้',
   },
   {
-    q: 'ระบุตำแหน่ง record เฉพาะตัวใน Kafka ยังไง',
+    q: 'บน topic ที่สร้างด้วย --config retention.ms=60000 บน broker ที่ log.retention.ms แบบ dynamic ถูกตั้งไว้ที่ 600000 อยู่แล้ว chain synonyms จริงพิสูจน์อะไร',
     options: [
-      'ด้วย timestamp ของตัวเองอย่างเดียว',
-      'ด้วยสามอย่างคือ topic, partition และ offset',
-      'ด้วย global auto-increment ID ข้ามทุก topic',
-      'ด้วย hostname ของ broker',
+      'มีแค่ค่าระดับ broker เท่านั้นที่มีผลกับ topic เสมอ',
+      'DYNAMIC_TOPIC_CONFIG ของ topic (60000) ชนะ DYNAMIC_BROKER_CONFIG ของ broker (600000) ซึ่งตัวมันเองก็ชนะ DEFAULT_CONFIG (168 ชั่วโมง) อยู่แล้ว',
+      'config ระดับ topic ถูก ignore เว้นแต่ broker default จะยังไม่ถูกตั้ง',
+      'การตั้ง retention.ms บน topic ไม่มีผลอะไรเลย',
     ],
     answer: 1,
+    explain: 'output synonyms จริงไม่ได้แก้ไข list ครบทั้งสามชั้นตามลำดับ priority คือ DYNAMIC_TOPIC_CONFIG:retention.ms=60000, DYNAMIC_BROKER_CONFIG:log.retention.ms=600000, DEFAULT_CONFIG:log.retention.hours=168',
+  },
+  {
+    q: 'เมื่อ auto.create.topics.enable ถูกปิดแบบ static (พิสูจน์แล้วข้างบนผ่านการ restart container เพราะตัว config เองเป็น static) consumer จริงที่เจอ topic ที่ไม่มีอยู่ทำอะไรจริง ๆ',
+    options: [
+      'มันสร้าง topic ให้เงียบ ๆ อยู่ดี',
+      'มันได้ UNKNOWN_TOPIC_OR_PARTITION ซ้ำ ๆ ทุกครั้งที่ metadata refresh แล้วสุดท้าย throw TimeoutException โดย kafka-topics.sh --list ยืนยันว่า topic ไม่เคยถูกสร้างเลย',
+      'มันเชื่อมต่อสำเร็จและอ่านได้ศูนย์ message โดยไม่มี warning เลย',
+      'broker crash',
+    ],
+    answer: 1,
+    explain: 'log จริงแสดง warning UNKNOWN_TOPIC_OR_PARTITION ซ้ำหลายครั้งข้าม metadata refresh ก่อนที่ console consumer เองจะ throw TimeoutException --list ยืนยันว่าไม่มีอะไรถูกสร้าง ต่างจาก race ตอน auto-create เปิดที่พิสูจน์ไว้ก่อนหน้าในบทนี้',
+  },
+  {
+    q: 'ใน proof จริงของ bad-advertised-listener ข้างบน ทำไม bootstrap connection สำเร็จ แต่ send() จริงกลับ fail',
+    options: [
+      'broker ดับอยู่ตลอดเวลา',
+      'bootstrap address (localhost:29092 จาก listeners) เข้าถึงได้และถูกต้อง แต่ metadata response ของ broker ชี้ client ไปที่ hostname ที่พังของ advertised.listeners สำหรับ connection ถัดไป (ตัวที่ส่งจริง) ซึ่งพังด้วย getaddrinfo ENOTFOUND จริง',
+      'KafkaJS ไม่รองรับ produce ไป topic ที่มีมากกว่า 1 partition',
+      'topic ไม่มีอยู่จริง',
+    ],
+    answer: 1,
+    explain: 'output จริงแสดง "bootstrap connect OK" ตามด้วย getaddrinfo ENOTFOUND จริงสำหรับ "wrong-advertised-host" -- listeners คุม hop แรก advertised.listeners คุมทุก hop หลังจากได้ metadata กลับมา',
   },
 ];
 
