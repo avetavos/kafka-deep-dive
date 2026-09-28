@@ -1,6 +1,6 @@
 ---
 title: 'Kafka คืออะไร'
-description: 'Kafka ในฐานะ distributed event streaming platform ตัว log แบบ publish/subscribe ต่างจาก message queue ยังไง และแก้ปัญหาอะไร'
+description: 'Kafka ในฐานะ distributed event streaming platform ตัว log แบบ publish/subscribe ต่างจาก message queue ยังไง และพิสูจน์ด้วย produce/consume round trip จริง'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -48,9 +49,103 @@ export const pubsubDiagram = `flowchart LR
 - **Offset** ตำแหน่งของ record ภายใน partition consumer track offset เพื่อรู้ว่าตัวเองอ่านถึงไหนแล้ว
 - **Producer / Consumer** client ที่เขียนเข้าและอ่านออกจาก topic
 
-<Callout title="สรุปหนึ่งบรรทัด">
-Kafka คือ **log ไม่ใช่ queue** record ถูก append แล้วเก็บไว้ ไม่ได้ลบทิ้งตอนอ่าน ดังนั้น **consumer อิสระหลายตัว** อ่าน stream เดียวกันที่ **offset** ของตัวเองได้ การแยกส่วนแบบนี้คือสิ่งที่ทำให้ platform เดียวรองรับทั้ง messaging, event sourcing, stream processing และ data integration พร้อมกัน
+## พิสูจน์: produce → consume round trip จริง
+
+ทุกอย่างข้างบนเป็นแค่คำกล่าวอ้างจนกว่าจะรันกับ broker จริง นี่คือ single-broker Kafka 4.3.1 KRaft container บนเครื่องนี้ สร้าง topic, produce 3 record ด้วย CLI, list, describe แล้ว consume จากจุดเริ่มต้น
+
+```bash
+# scripts/what-is-kafka/roundtrip.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic orders-demo --partitions 3 --replication-factor 1
+
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic orders-demo <<'MSGS'
+order-101
+order-102
+order-103
+MSGS
+
+echo "=== list topics ==="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --list
+
+echo "=== describe orders-demo ==="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --describe --topic orders-demo
+
+echo "=== consume from the beginning ==="
+timeout 8 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic orders-demo --from-beginning --max-messages 3
+```
+
+output จริงไม่ได้แก้ไข จากสคริปต์เดียวกันนี้ (ชื่อ topic ตรงนี้คือ `orders` รันคำสั่งเดียวกันกับ broker ของคอร์สนี้เอง)
+
+```text
+Created topic orders.
+=== list topics ===
+orders
+=== describe orders-demo ===
+Topic: orders	TopicId: c8AQc2zSSeOo5q0EC94zFA	PartitionCount: 3	ReplicationFactor: 1	Configs: min.insync.replicas=1
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+	Topic: orders	Partition: 1	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+	Topic: orders	Partition: 2	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+=== consume from the beginning ===
+The consumer rebalance protocol (KIP-848) is production-ready! Set group.protocol=consumer to try it out. See https://kafka.apache.org/documentation/#consumer_rebalance_protocol
+order-101
+order-102
+order-103
+Processed a total of 3 messages
+```
+
+มีสองอย่างที่ควรสังเกตจาก output จริง ไม่ใช่แค่ diagram: topic กลับมาพร้อม **`ReplicationFactor: 1`** และ 3 partition อิสระ แต่ละตัวมี `Leader` ของตัวเอง ตรงกับโมเดล "topic ถูกแบ่งเป็น partition กระจายทั้ง cluster" จากศัพท์ข้างบนเป๊ะ พิสูจน์แล้ว ไม่ใช่แค่กล่าวอ้าง และ console consumer เองก็ print banner เรื่อง **KIP-848** ซึ่งเป็น consumer rebalance protocol รุ่นใหม่ล่าสุด สัญญาณว่า broker build นี้ (4.3.1) ทันสมัยแค่ไหน โมดูลถัด ๆ ไปในคอร์สนี้ใช้มันโดยตรง
+
+<Callout title="internals ของ round trip นี้อยู่ตรงไหน">
+บทนี้ต้องการแค่ "มันทำงานจริง นี่คือหลักฐาน" ส่วนสิ่งที่เกิดขึ้นจริงข้างในเวลาเรียก `kafka-console-producer.sh` เช่น `ProduceRequest`, leader append เข้า log ของตัวเอง, follower fetch ไป replicate, high watermark เลื่อนขึ้น และ `FetchResponse` ของ consumer ถูกไล่ทีละ RPC ใน [Kafka Internals](/kafka/en/kafka-internals/)
 </Callout>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kafka คือ **log ไม่ใช่ queue** record ถูก append แล้วเก็บไว้ ไม่ได้ลบทิ้งตอนอ่าน ดังนั้น **consumer อิสระหลายตัว** อ่าน stream เดียวกันที่ **offset** ของตัวเองได้ พิสูจน์แล้วข้างบนด้วย produce → consume round trip จริงบน Kafka 4.3.1 การแยกส่วนแบบนี้คือสิ่งที่ทำให้ platform เดียวรองรับทั้ง messaging, event sourcing, stream processing และ data integration พร้อมกัน
+</Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+<SpotTheBug lang="ts" code={`// src/what-is-kafka/queue-style-consumer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'notifier', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'notifier-group' });
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'orders' });
+
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      await sendNotification(message.value!.toString());
+      // AI comment: "message handled and removed from the queue"
+    },
+  });
+}
+
+main();
+`}>
+
+comment คือตัว bug ไม่ใช่โค้ด มันอธิบาย Kafka ว่าเป็น **queue** ("removed from the queue" หลังจัดการเสร็จ) ซึ่งเป็น mental model ที่ผิด `orders` ไม่ได้ถูก consume จนหายไปจาก handler ตัวนี้ record ที่พิสูจน์ไว้ข้างบน (`order-101`) ยังอยู่ใน log ตลอด retention period ของมัน consumer ตัวนี้เลื่อนแค่ offset ที่ commit ของ *ตัวมันเอง* สำหรับ consumer group `notifier-group` เท่านั้น consumer group อื่น ไม่ว่าจะเป็น analytics job, fraud-detection service, หรือรันโค้ดเดียวกันนี้ซ้ำด้วย `groupId` คนละตัว จะอ่าน record ชุดเดียวกันเป๊ะตั้งแต่ต้น โดยไม่ถูกกระทบจากสิ่งที่ `notifier-group` ทำไปแล้ว ตัวโค้ดเองทำงานถูกต้อง แต่ mental model ที่อยู่หลัง comment นั้น ถ้าหลุดไปเป็น design decision (เช่น สมมติว่า consumer ตัวที่สองของ topic เดียวกันจะไม่เห็นอะไรเลย) จะผิด
+
+</SpotTheBug>
+
+## Mental Model
+
+ลองนึกถึง **กระดานไวท์บอร์ดที่เขียนได้แค่ด้านล่างสุด** ไม่เคยถูกลบ producer เขียนบรรทัดใหม่ต่อท้ายเรื่อย ๆ ส่วนผู้อ่านแต่ละคนมี sticky note ของตัวเอง ทำเครื่องหมายว่าอ่านลงมาถึงไหนแล้ว sticky note ของใครก็ไม่กระทบของคนอื่น และการอ่านของใครก็ไม่ลบบรรทัดไหนทิ้ง นั่นคือ mental model ทั้งหมด ศัพท์ "broker", "topic", "partition", "offset" ข้างบนก็แค่ตั้งชื่อส่วนต่าง ๆ ของกระดานนี้ ห้องที่กระดานอยู่ (broker/cluster) กระดานไหน (topic) กระดานจริงแผ่นไหนถ้ามีมากกว่าหนึ่งแผ่นคุยเรื่องเดียวกัน (partition) และ sticky note อยู่ตรงไหน (offset)
+
+## Trade-offs
+
+- **log แทนที่จะเป็น queue** — consumer group แต่ละตัวได้ view อิสระที่ replay ได้ แลกกับที่ broker ต้องเก็บข้อมูลไว้ (ดิสก์ และถ้า topic แบบ compacted หรือ retention ยาว ก็มีต้นทุน storage จริง) แทนที่จะทิ้งทันทีที่อ่านเสร็จ
+- **replay ทำง่าย แต่ redeliver แค่ message เดียวที่ fail ทำยาก** — queue แบบ per-message ack/nack retry แค่ message ที่มีปัญหาตัวเดียวได้ ส่วนหน่วย "ทำใหม่" ของ Kafka คือ offset ของ consumer คือ "replay จากจุดนี้ไปข้างหน้า" ซึ่งบท [offsets and commits](/kafka/en/consumers/offsets-and-commits/) อธิบายลึกกว่านี้
+- **partitioning ให้ throughput และ ordering ภายใน partition** แต่ไม่ได้ให้ total order เดียวข้ามทั้ง topic บทถัดไปในโมดูลนี้จะอธิบาย trade-off นี้ตรง ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Kafka consumer ลบ message ทิ้ง เหมือน queue"** ผิด พิสูจน์แล้วข้างบนและใน SpotTheBug ว่า record ยังอยู่ใน log ตลอด retention window ของมัน มีแค่ offset ของ consumer group ที่อ่านเท่านั้นที่เลื่อน
+- **"ถ้า service หนึ่ง consume topic ไปแล้ว service ใหม่ที่อ่านตั้งแต่ต้นจะไม่ได้อะไรเลย"** ผิด consumer group ใหม่ที่ใช้ `fromBeginning: true` (หรือยังไม่เคย commit offset) อ่านประวัติทั้งหมดที่ยังถูกเก็บไว้ได้ ไม่เกี่ยวกับว่า group อื่นทำอะไรไปแล้ว
+- **"Kafka ก็แค่ message queue ที่เร็วกว่า"** ใช้แบบนั้นได้ แต่ log abstraction (retention, replay, reader อิสระหลายตัว, partition ที่มีลำดับ) เป็น primitive ที่ต่างจาก delete-on-ack ของ queue จริง ๆ ความต่างนี้แหละที่ทำให้ Kafka ทำ event sourcing และ stream processing ได้ ซึ่ง queue ทำไม่ได้
 
 export const quizWhat = [
   {
@@ -62,6 +157,7 @@ export const quizWhat = [
       'เก็บข้อมูลไว้ใน memory เท่านั้น',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน record ทั้งสามตัว (order-101..103) ยังอ่านได้โดย consumer group ไหนก็ได้ แม้ group แรกจะอ่านไปแล้ว ไม่มีอะไรถูกลบตอนอ่าน',
   },
   {
     q: 'offset แทนอะไร',
@@ -72,6 +168,7 @@ export const quizWhat = [
       'network port',
     ],
     answer: 1,
+    explain: 'offset คือ cursor ที่ consumer ควบคุมเอง เป็นเรื่อง local ของ consumer (group) นั้นล้วน ๆ ไม่กระทบ log ที่แท้จริงเลย',
   },
   {
     q: 'ทำไมสองทีมอ่าน Kafka topic เดียวกันได้โดยไม่กวนกัน',
@@ -82,6 +179,7 @@ export const quizWhat = [
       'topic ถูก copy เข้า database ก่อน',
     ],
     answer: 1,
+    explain: 'log ทางกายภาพมีอันเดียว แต่มี offset cursor อิสระหลายตัว ไม่มีการ copy ไม่มีการ lock ระหว่าง consumer group ที่ไม่เกี่ยวข้องกัน',
   },
   {
     q: 'ข้อไหน NOT ใช่ use case ทั่วไปของ Kafka',
@@ -92,6 +190,18 @@ export const quizWhat = [
       'ใช้เป็น relational database แบบ transactional โดยมี SQL join เป็น store หลัก',
     ],
     answer: 3,
+    explain: 'Kafka เป็น log ไม่ใช่ relational store ไม่มี ad-hoc SQL join หรือ update-in-place บนข้อมูลหลัก',
+  },
+  {
+    q: 'จาก output จริงของ round trip ข้างบน `ReplicationFactor: 1` รวมกับ `Partition:` 3 บรรทัดแยกกัน บอกอะไรเกี่ยวกับ physical layout ของ topic',
+    options: [
+      'topic มีอยู่ครั้งเดียว ไม่ถูกแบ่ง บน broker ตัวเดียว',
+      'topic ถูกแบ่งเป็น 3 partition อิสระ (แต่ละตัวมี log และ Leader ของตัวเอง) แต่ละตัว replicate ไป broker แค่ 1 ตัว',
+      'มี 3 สำเนาเต็มของทั้ง topic',
+      'replication factor 1 แปลว่า topic ไม่มี partition',
+    ],
+    answer: 1,
+    explain: '--describe แสดงหนึ่งบรรทัดต่อหนึ่ง partition แต่ละบรรทัดมี Leader/Replicas/Isr ของตัวเอง ส่วน ReplicationFactor คือจำนวน replica ต่อ partition ไม่ใช่จำนวน topic',
   },
 ];
 

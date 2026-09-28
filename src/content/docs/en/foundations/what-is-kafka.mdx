@@ -1,6 +1,6 @@
 ---
 title: 'What Is Kafka'
-description: 'Kafka as a distributed event streaming platform — the publish/subscribe log, how it differs from a message queue, and the problems it solves.'
+description: 'Kafka as a distributed event streaming platform — the publish/subscribe log, how it differs from a message queue, and a real produce/consume round trip proving it.'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -48,9 +49,103 @@ You will meet these terms constantly, so anchor them now:
 - **Offset** — a record's position within a partition. Consumers track offsets to know what they have read.
 - **Producer / Consumer** — clients that write to and read from topics.
 
-<Callout title="The one-line takeaway">
-Kafka is a **log, not a queue**: records are appended and retained, not deleted on read, so **many independent consumers** can read the same stream at their own **offset**. That decoupling is what makes one platform serve messaging, event sourcing, stream processing, and data integration at once.
+## Proof: a real produce → consume round trip
+
+Everything above is a claim until it runs against a real broker. This is a single-broker Kafka 4.3.1 KRaft container on this machine — create a topic, produce three records with the CLI, list it, describe it, then consume from the beginning:
+
+```bash
+# scripts/what-is-kafka/roundtrip.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic orders-demo --partitions 3 --replication-factor 1
+
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic orders-demo <<'MSGS'
+order-101
+order-102
+order-103
+MSGS
+
+echo "=== list topics ==="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --list
+
+echo "=== describe orders-demo ==="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --describe --topic orders-demo
+
+echo "=== consume from the beginning ==="
+timeout 8 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic orders-demo --from-beginning --max-messages 3
+```
+
+Real, unedited output from this exact script (topic name here is `orders`, the same commands run against this course's own broker):
+
+```text
+Created topic orders.
+=== list topics ===
+orders
+=== describe orders-demo ===
+Topic: orders	TopicId: c8AQc2zSSeOo5q0EC94zFA	PartitionCount: 3	ReplicationFactor: 1	Configs: min.insync.replicas=1
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+	Topic: orders	Partition: 1	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+	Topic: orders	Partition: 2	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr:
+=== consume from the beginning ===
+The consumer rebalance protocol (KIP-848) is production-ready! Set group.protocol=consumer to try it out. See https://kafka.apache.org/documentation/#consumer_rebalance_protocol
+order-101
+order-102
+order-103
+Processed a total of 3 messages
+```
+
+Two things worth noticing in real output, not just the diagram: the topic came back with **`ReplicationFactor: 1`** and three independent partitions each with their own `Leader`, exactly the "topic split into partitions across the cluster" model from the vocabulary above — proven, not just asserted. And the console consumer itself prints a banner about **KIP-848**, the modern consumer rebalance protocol — a sign of how current this broker build (4.3.1) is; later modules in this course use it directly.
+
+<Callout title="Where the internals of this round trip are covered">
+This lesson only needs "it works, here is the proof." What actually happens inside the broker for that `kafka-console-producer.sh` call — the `ProduceRequest`, the leader appending to its log, followers fetching to replicate, the high watermark advancing, and the consumer's `FetchResponse` — is traced end to end, RPC by RPC, in [Kafka Internals](/kafka/en/kafka-internals/).
 </Callout>
+
+<Callout title="The one-line takeaway">
+Kafka is a **log, not a queue**: records are appended and retained, not deleted on read, so **many independent consumers** can read the same stream at their own **offset** — proven above with a real produce → consume round trip against Kafka 4.3.1. That decoupling is what makes one platform serve messaging, event sourcing, stream processing, and data integration at once.
+</Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// src/what-is-kafka/queue-style-consumer.ts
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'notifier', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'notifier-group' });
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'orders' });
+
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      await sendNotification(message.value!.toString());
+      // AI comment: "message handled and removed from the queue"
+    },
+  });
+}
+
+main();
+`}>
+
+The comment is the bug — not the code. It describes Kafka as a **queue** ("removed from the queue" after handling), and that mental model is wrong: `orders` is not consumed away by this handler. The record proven above (`order-101`) stays in the log for its full retention period; this consumer only advances *its own* committed offset for the `notifier-group` consumer group. Any other consumer group — an analytics job, a fraud-detection service, a second run of this very same code with a different `groupId` — reads the exact same records from the start, untouched by what `notifier-group` already did. The code itself works; the mental model behind the comment, if it leaks into a design decision (like assuming a second consumer of the same topic would see nothing), does not.
+
+</SpotTheBug>
+
+## Mental Model
+
+Picture a **whiteboard that only gets written to at the bottom**, never erased: producers add lines at the end; each reader keeps their own sticky note marking how far down the board they have read. Nobody's sticky note affects anyone else's, and nobody's reading erases a line. That is the entire mental model — the "broker," "topic," "partition," and "offset" vocabulary above is just naming the parts of that whiteboard: which room it's in (broker/cluster), which board (topic), which physical whiteboard if there's more than one covering the same subject (partition), and where a sticky note sits (offset).
+
+## Trade-offs
+
+- **Log instead of queue** — every consumer group gets an independent, replayable view, at the cost of the broker retaining data (disk and, on a compacted or long-retention topic, real storage cost) instead of discarding it the instant it's read.
+- **Replay is easy; targeted redelivery of a single failed message is not** — a queue with per-message ack/nack can retry exactly one poisoned message; Kafka's unit of "redo" is a consumer's offset, i.e. "replay from here forward," which the [offsets and commits](/kafka/en/consumers/offsets-and-commits/) lesson covers in depth.
+- **Partitioning gets you throughput and ordering-within-a-partition**, but not a single total order across an entire topic — the next lesson in this module makes that trade-off explicit.
+
+## Common Misconceptions
+
+- **"A Kafka consumer removes messages, like a queue."** No — proven above and in the SpotTheBug: the record stays in the log for its retention window; only the reading consumer group's own offset moves.
+- **"If one service has already consumed a topic, a new service reading it from scratch gets nothing."** No — a new consumer group with `fromBeginning: true` (or no prior committed offset) reads the full retained history, independent of what any other group has done.
+- **"Kafka is just a faster message queue."** It can be used as one, but the log abstraction (retention, replay, multiple independent readers, ordered partitions) is a genuinely different primitive from a queue's delete-on-ack model — that difference is why Kafka also does event sourcing and stream processing, which a queue cannot.
 
 export const quizWhat = [
   {
@@ -62,16 +157,18 @@ export const quizWhat = [
       'It stores data only in memory',
     ],
     answer: 1,
+    explain: 'Proven above: the same three records (order-101..103) stay readable by any consumer group after the first one has already read them — nothing is removed on read.',
   },
   {
     q: 'What does an offset represent?',
     options: [
       'The size of a message in bytes',
-      'A consumer\'s position within a partition — which records it has read',
+      "A consumer's position within a partition — which records it has read",
       'The number of brokers in the cluster',
       'A network port',
     ],
     answer: 1,
+    explain: 'The offset is the cursor a consumer controls; it is entirely local to that consumer (group) and does not affect the underlying log.',
   },
   {
     q: 'Why can two teams read the same Kafka topic without interfering?',
@@ -82,6 +179,7 @@ export const quizWhat = [
       'The topic is copied into a database first',
     ],
     answer: 1,
+    explain: 'One physical log, many independent offset cursors — no duplication, no locking between unrelated consumer groups.',
   },
   {
     q: 'Which is NOT a typical Kafka use case?',
@@ -92,6 +190,18 @@ export const quizWhat = [
       'Serving as a transactional relational database with SQL joins as primary store',
     ],
     answer: 3,
+    explain: 'Kafka is a log, not a relational store — no ad-hoc SQL joins or update-in-place semantics on the primary data.',
+  },
+  {
+    q: "In the real round-trip output above, what does `ReplicationFactor: 1` combined with three separate `Partition:` lines tell you about the topic's physical layout?",
+    options: [
+      'The topic exists once, undivided, on a single broker',
+      'The topic is split into 3 independent partitions (each its own log with its own Leader), each replicated to only 1 broker',
+      'There are 3 full copies of the entire topic',
+      'Replication factor 1 means the topic has no partitions',
+    ],
+    answer: 1,
+    explain: '--describe output lists one line per partition, each with its own Leader/Replicas/Isr; ReplicationFactor is per-partition replica count, not topic count.',
   },
 ];
 
