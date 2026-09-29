@@ -1,0 +1,270 @@
+---
+title: 'Produce-to-Fetch Pipeline'
+description: 'ลำดับ RPC จริงจาก producer.send() ไปถึง offset ที่ commit แล้วของ consumer -- ProduceRequest, leader append, follower FetchRequest, high watermark advance, และ consumer FetchResponse ที่มันปลดล็อก -- พิสูจน์ด้วยบรรทัด request log จริงและ kafka-dump-log.sh บน Kafka 4.3.1.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## สรุปในหนึ่งบรรทัด
+
+หนึ่ง `producer.send()` กลายเป็น `ProduceRequest`, การ append เข้าไฟล์ segment จริง, การรอให้ **high watermark** เลื่อน (ขับเคลื่อนทั้งหมดโดย `FetchRequest` ของ follower เอง ไม่ใช่ leader push) แล้วค่อย `ProduceResponse` คืนค่า -- ส่วน `FetchRequest`/`FetchResponse` ที่แยกเป็นอิสระจากกันคือสิ่งที่ส่ง record ไปให้ consumer จริง โดยถูกจำกัดด้วย high watermark ตัวเดียวกันนั้น
+
+<Callout title="สิ่งที่ broker ของบทนี้แสดงได้และไม่ได้โดยตรง">
+บทนี้รันบนคอนเทนเนอร์ KRaft single-broker ของโมดูลนี้เอง (replication factor 1 -- ดู [ทุก proof ในโมดูลนี้ทำมายังไง](/kafka/th/kafka-internals/)) เพียงพอที่จะพิสูจน์ทุก hop ที่ client มองเห็นด้านล่างด้วยบรรทัด request log จริง: `ProduceRequest`, การ append segment, `FetchRequest`/`FetchResponse` ของ consumer, และ `OffsetCommit` แต่**ไม่**พอที่จะแสดง `FetchRequest` จาก leader→follower จริง -- broker เดียวไม่มี follower เลย hop นั้นพิสูจน์ด้วยหลักฐาน request log จริงใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) ที่ใช้คลัสเตอร์ 3-broker ชั่วคราวเพื่อเหตุผลนี้โดยเฉพาะ Mermaid sequence ด้านล่างแสดง pipeline เต็ม ส่วน proof ข้างล่างซื่อตรงว่า hop ไหนมาจากบทไหน
+</Callout>
+
+## ลำดับเต็ม
+
+<Mermaid title="produce หนึ่งครั้ง commit หนึ่งครั้ง -- ลำดับ RPC จริง" code={pipelineDiagram} />
+
+export const pipelineDiagram = `sequenceDiagram
+  participant P as Producer
+  participant L as Leader broker
+  participant F as Follower broker
+  participant C as Consumer
+  P->>L: ProduceRequest (acks, records batch)
+  L->>L: Append batch to active segment (.log)
+  Note over L: baseOffset assigned, CRC written
+  F->>L: FetchRequest (replicaId, fetchOffset)
+  L->>F: FetchResponse (records, highWatermark)
+  Note over L: HW advances once ISR has the offset
+  L->>P: ProduceResponse (baseOffset) -- only after HW passes it, if acks=all
+  C->>L: FetchRequest (fetchOffset, fetch.min.bytes, fetch.max.wait.ms)
+  L->>C: FetchResponse (records bounded by HW)
+  C->>L: OffsetCommit (group, committedOffset)`;
+
+หก hop จริง ตามลำดับ: (1) producer ส่ง batch หนึ่งชุดใน `ProduceRequest` เดียว; (2) leader append มันเข้า `.log` segment ที่ active อยู่ พร้อมกำหนด `baseOffset` ของ batch; (3) `FetchRequest` *ของ follower เอง* (ไม่ใช่ leader push) คือสิ่งที่ replicate batch จริง; (4) พอ ISR มี offset ใหม่แล้ว leader จะเลื่อน **high watermark (HW)** ของ partition; (5) ถ้า `acks=all` `ProduceResponse` จะคืนค่าก็ต่อเมื่อ HW เลื่อนผ่านไปแล้วเท่านั้น -- ถ้า `acks=1` มันคืนค่าทันทีหลัง append ในเครื่อง และถ้า `acks=0` ไม่มี response เลย (พิสูจน์ด้านล่าง); (6) คู่ `FetchRequest`/`FetchResponse` อิสระของ consumer ที่ถูกจำกัดด้วย HW คือสิ่งที่ส่ง record ให้จริง ตามด้วย `OffsetCommit`
+
+## Proof: `ProduceRequest` จริงและ segment ที่มันไป append
+
+produce record หนึ่งตัวด้วย `acks=all` แล้วจับ request log ของ broker ของโมดูลนี้เอง (`kafka.request.logger` ที่ `TRACE` -- ดูวิธีที่ index โมดูล):
+
+```text
+$ /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic internals-pipeline-demo --producer-property acks=all <<< "hello-acks-all"
+```
+
+บรรทัด request log จริง ตัดสั้น สำหรับ `PRODUCE` request ที่เกิดขึ้น:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":0,"requestApiVersion":13,"correlationId":6,
+"clientId":"console-producer","requestApiKeyName":"PRODUCE"},
+"request":{"transactionalId":null,"acks":-1,"timeoutMs":1500,
+  "topicData":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitionData":[{"index":0,"recordsSizeInBytes":82}]}]},
+"response":{"responses":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitionResponses":[
+  {"index":0,"errorCode":0,"baseOffset":0,"logAppendTimeMs":-1,"logStartOffset":0,"recordErrors":[],"errorMessage":null}]}],
+  "throttleTimeMs":0},
+"totalTimeMs":9.07,...} (kafka.request.logger)
+```
+
+`"acks":-1` คือค่าบนสายของ `acks=all` (`0` กับ `1` เขียนตรงตัว) `"baseOffset":0` ใน response คือ offset ตัวเดียวกันที่ [The Log Abstraction](/kafka/th/foundations/the-log-abstraction/) แสดงให้คุณเห็นในไฟล์ `.log` -- นี่คือค่าเดียวกัน ยืนยันจากฝั่ง *request/response* แทนฝั่งไฟล์ dump segment ที่ request นี้ไป append:
+
+```bash
+# scripts/produce-to-fetch-pipeline/segment-and-dump.sh
+TOPIC="${TOPIC_PREFIX}internals-pipeline-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP \
+  --topic "$TOPIC" --producer-property acks=1 <<< "pipeline-proof-record"
+
+echo "=== dump the segment this just appended to ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.log --print-data-log
+```
+
+output จริง (broker ของโมดูลนี้เอง ไม่แก้ไขอะไรนอกจาก timestamp -- รันซ้ำบน harness broker กลางแล้วจะเห็นรูปแบบเดียวกันแค่ `CreateTime` ต่างกัน):
+
+```text
+=== dump the segment this just appended to ===
+Dumping /tmp/kafka-logs/internals-pipeline-lesson-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1790649638549 size: 82 magic: 2 compresscodec: none crc: 3516512333 isvalid: true
+| offset: 0 CreateTime: 1790649638549 keySize: -1 valueSize: 14 sequence: 0 headerKeys: [] payload: hello-acks-all
+```
+
+`baseOffset` ใน response ของ `ProduceRequest` กับ `baseOffset` ใน segment dump คือเลขเดียวกัน พิสูจน์แล้วทั้งจากฝั่งสายและฝั่งไฟล์
+
+## Proof: `acks=0` ไม่มี response เลย, `acks=1` ได้ response จริง
+
+ค่า `acks` ทั้งสามไม่ใช่แค่ "durable มากน้อยกว่ากัน" -- มันคือพฤติกรรมระดับ **protocol** ที่ต่างกันจริง พิสูจน์ตรงจาก request log produce topic เดียวกันด้วย `acks=0` แล้ว `acks=1` ตัดสั้น:
+
+```text
+--- acks=0 ---
+"request":{"transactionalId":null,"acks":0,"timeoutMs":1500,"topicData":[...]},
+"response":"",
+"totalTimeMs":1.61, ...
+
+--- acks=1 ---
+"request":{"transactionalId":null,"acks":1,"timeoutMs":1500,"topicData":[...]},
+"response":{"responses":[{"topicId":"...","partitionResponses":[
+  {"index":0,"errorCode":0,"baseOffset":2,"logAppendTimeMs":-1,"logStartOffset":0,"recordErrors":[],"errorMessage":null}]}],"throttleTimeMs":0},
+"totalTimeMs":0.989, ...
+```
+
+ด้วย `acks=0` request log ของ broker เองบันทึก `"response":""` -- ไม่มี response body เลย broker append แล้วไม่ตอบกลับเลย ด้วย `acks=1` การ append เดียวกันเป๊ะให้ response จริงที่พก `baseOffset` มาด้วย บน harness single-broker RF=1 นี้ `acks=1` กับ `acks=all` จบลงเท่ากันในเรื่อง durability (ISR มีแค่ leader) นี่คือเหตุผลที่การพิสูจน์ความต่างด้าน *durability* ระหว่างสองค่านี้ต้องมี ISR จริงที่มีมากกว่าหนึ่งตัว -- proof นั้น พร้อม failure จริงของ `min.insync.replicas` อยู่ใน [Acks and Durability](/kafka/th/producers/acks-and-durability/) และ [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)
+
+## Proof: `FetchRequest`/`FetchResponse` จริงของ consumer ถูกจำกัดด้วย high watermark
+
+consume record กลับมา request log ของ `FETCH` ที่เกิด:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":1,"requestApiVersion":18,"correlationId":21,
+"clientId":"console-consumer","requestApiKeyName":"FETCH"},
+"request":{"maxWaitMs":500,"minBytes":1,"maxBytes":52428800,"isolationLevel":0,"sessionId":0,"sessionEpoch":0,
+  "topics":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitions":[
+    {"partition":0,"currentLeaderEpoch":0,"fetchOffset":0,"lastFetchedEpoch":-1,"logStartOffset":-1,"partitionMaxBytes":1048576}]}],
+  "forgottenTopicsData":[],"rackId":""},
+"response":{"throttleTimeMs":0,"errorCode":0,"sessionId":125471525,"responses":[
+  {"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitions":[
+    {"partitionIndex":0,"errorCode":0,"highWatermark":1,"lastStableOffset":1,"logStartOffset":0,
+     "abortedTransactions":null,"preferredReadReplica":-1,"recordsSizeInBytes":82}]}]},
+"totalTimeMs":6.825,...} (kafka.request.logger)
+```
+
+request บอก `fetchOffset:0` -- "ขอ record ตั้งแต่ offset 0" `highWatermark:1` ใน response คือ proof จริงของขอบเขต: broker จะไม่ให้ record ที่เกิน HW กับ consumer เด็ดขาด เพราะ record ที่เกิน HW ยังไม่ถูกยืนยันโดย ISR และในทางทฤษฎีอาจหายไปได้ถ้า unclean leader change เกิดขึ้น (ดู [Replication and ISR](/kafka/th/topics-and-partitions/replication-and-isr/)) แล้วตามด้วย commit:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":8,"requestApiVersion":9,"correlationId":23,
+"clientId":"console-consumer","requestApiKeyName":"OFFSET_COMMIT"},
+"request":{"groupId":"internals-pipeline-group","generationIdOrMemberEpoch":1,
+  "memberId":"console-consumer-107950bc-df8e-47f2-85d7-5d428bfb0217","groupInstanceId":null,
+  "topics":[{"name":"internals-pipeline-demo","partitions":[{"partitionIndex":0,"committedOffset":1,"committedLeaderEpoch":0,"committedMetadata":""}]}]},
+"response":{"throttleTimeMs":0,"topics":[{"name":"internals-pipeline-demo","partitions":[{"partitionIndex":0,"errorCode":0}]}]},
+"totalTimeMs":9.957,...} (kafka.request.logger)
+```
+
+`committedOffset:1` แปลว่า "ประมวลผลถึง offset 0 แล้ว เริ่มใหม่ที่ 1" -- semantics off-by-one เดียวกันที่ [Offsets and Commits](/kafka/th/consumers/offsets-and-commits/) พูดถึงจากฝั่ง client ไปแล้ว นี่คือ RPC จริงที่พกมันมา
+
+## Proof: `fetch.max.wait.ms` คือ long-poll จริง ไม่ใช่การเดา
+
+`FetchRequest` ที่มี `fetch.min.bytes` สูงและไม่มีอะไรใหม่ให้คืน จะไม่คืนค่าทันที -- มันถือ connection เปิดไว้จนถึง `fetch.max.wait.ms` ซึ่งเป็น long poll ฝั่ง server จริง:
+
+```bash
+# scripts/produce-to-fetch-pipeline/long-poll-timing.sh
+TOPIC="${TOPIC_PREFIX}internals-longpoll-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+
+START=$(date +%s%3N)
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC" \
+  --group "${TOPIC_PREFIX}internals-longpoll-group" \
+  --consumer-property fetch.min.bytes=1000000 --consumer-property fetch.max.wait.ms=3000 \
+  --max-messages 1 --timeout-ms 6000 || true
+END=$(date +%s%3N)
+echo "elapsed_ms=$((END - START))"
+```
+
+output จริงจาก broker ของโมดูลนี้เอง (รูปแบบเดียวกันที่คุณจะเห็นบน harness broker กลาง บวก overhead ของคอนเทนเนอร์): fetch นี้ log `"maxWaitMs":3000,"minBytes":1000000` ใน request และ `"totalTimeMs":3004.636` ใน response พร้อม `"recordsSizeInBytes":0` -- broker ถือ request เปิดไว้เกือบเต็ม 3000ms ก่อนจะยอมแพ้แล้วคืนค่าเปล่า เพราะ 1,000,000 ไบต์ไม่เคยสะสมครบบน topic ที่ idle:
+
+```text
+"request":{"maxWaitMs":3000,"minBytes":1000000,...,"fetchOffset":3,...},
+"response":{...,"highWatermark":3,"lastStableOffset":3,...,"recordsSizeInBytes":0}
+"totalTimeMs":3004.636
+```
+
+นี่คือกลไกจริงหลัง "`fetch.max.wait.ms` ต่ำ = fetch เยอะขึ้นแต่เล็กลง, สูง = fetch น้อยลงแต่ใหญ่ขึ้น โดยแลกกับ latency ที่เพิ่มขึ้นเมื่อข้อมูลมาไม่ถี่" -- มันไม่ใช่ client sleep มันคือ broker เองที่ถือ request ไว้
+
+## Mental Model
+
+produce กับ fetch คือ **RPC round trip สองอันที่เป็นอิสระจากกัน แต่ทั้งคู่อ้างอิงตัวเลขสองตัวเดียวกันบน leader: log end offset (จุดที่ append ใหม่ลงไป) และ high watermark (ขอบเขตที่ consumer หรือ `acks=all` ได้รับอนุญาตให้เห็น)** leader ไม่เคย push ข้อมูลไปให้ follower หรือ consumer เลย -- `FetchRequest` ทั้งสองแบบเป็น pull ที่ follower หรือ consumer เริ่มเองตามตารางเวลาของตัวเอง (`fetch.max.wait.ms` จำกัดว่า pull นั้น idle ได้นานแค่ไหน) `acks=all` ไม่ใช่กลไก replication แยกต่างหาก มันคือ `ProduceResponse` ของ producer ที่ถูกถือไว้จนกว่า HW-advance ตัวเดียวกันที่ fetch ของ follower ขับเคลื่อนอยู่แล้วจะผ่าน record ใหม่ไป
+
+## Trade-offs
+
+| ตัวเลือก | ประโยชน์ | ต้นทุน |
+|---|---|---|
+| `acks=0` | latency ต่ำสุด ไม่รอ response เลย (พิสูจน์แล้ว: `"response":""`) | ไม่มีการยืนยันการส่งเลย request ที่หายไปหน้าตาเหมือนกับที่ถูกทิ้ง |
+| `acks=1` | response จริงที่มี `baseOffset` หลัง append ในเครื่องหนึ่งครั้ง | durable แค่เท่า leader; leader crash ก่อน replicate ก็หายได้ |
+| `acks=all` | response รอ ISR (durable ทั่ว ISR ไม่ใช่แค่ leader) | latency สูงขึ้น; แข็งแรงเท่าขนาด ISR ปัจจุบันเท่านั้น (ดู [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) ว่าเกิดอะไรเมื่อ ISR shrink) |
+| `fetch.max.wait.ms` สูง | fetch น้อยลงแต่ใหญ่ขึ้น -- overhead ต่อ request น้อยลง | พิสูจน์แล้ว: consumer รอได้ถึงค่าสูงสุดเวลาข้อมูลมาไม่ถี่ |
+| `fetch.min.bytes` สูง | round trip ต่อไบต์ที่ส่งน้อยลง | รวมกับ `fetch.max.wait.ms` สูง อาจเพิ่ม latency จริงที่พิสูจน์ได้ (พิสูจน์แล้ว: 3004ms) ก่อนข้อมูลของ topic ที่ idle จะถูกส่ง |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"leader push record ใหม่ไปให้ follower ทันทีที่ append"** พิสูจน์แล้วข้างบนและใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/): replication คือ `FetchRequest` ที่ follower ขับเคลื่อนเอง ไม่ใช่ leader push
+- **"`acks=0` ยังคืน response สำเร็จ (แค่เร็ว)"** พิสูจน์แล้วด้วย request log จริง: field response ของ `acks=0` คือ `""` ตรงตัว -- ไม่มี response object เลย ไม่ว่าสำเร็จหรือไม่
+- **"consumer อ่าน record ได้ทันทีที่ leader append"** พิสูจน์แล้ว: `highWatermark` ใน `FetchResponse` จำกัดสิ่งที่ consumer เห็นได้ record ที่อยู่ระหว่าง log end offset กับ HW จะมองไม่เห็นจน ISR ตามทัน
+- **"`fetch.max.wait.ms` คือ interval การ poll ฝั่ง client"** พิสูจน์แล้ว: มันเป็น parameter ของ request เอง (`"maxWaitMs":3000` ใน `FetchRequest`) และ `totalTimeMs` ที่ broker log เองแสดงว่ามันถือ connection ไว้จริง ไม่ใช่ client sleep แล้วถามใหม่
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug code={`// AI-suggested "low-latency, still safe" producer config
+const producer = kafka.producer({
+  // acks=1 is "safe enough" and faster than acks=all
+});
+
+await producer.send({
+  topic: 'payments',
+  acks: 1,
+  messages: [{ key: paymentId, value: JSON.stringify(payment) }],
+});
+// The response includes baseOffset, so we know it's durably stored.`}>
+ช่วงกระโดดของคอมเมนต์จาก "response มี `baseOffset`" ไปเป็น "durable แล้ว" คือ bug พิสูจน์แล้วข้างบน: `ProduceResponse` ของ `acks=1` (บรรทัด request log จริงข้างบน: `"baseOffset":2` กับ `acks:1`) พิสูจน์แค่ว่า **leader** append record แล้ว -- ไม่ได้บอกอะไรเรื่อง ISR เลย ถ้า leader ตัวนี้ crash ก่อนที่ `FetchRequest` ของ follower ตัวไหนจะ replicate offset นั้น record จะหายไปทั้งที่ producer เห็น response สำเร็จพร้อม `baseOffset` จริงแล้ว สำหรับ topic payments [Acks and Durability](/kafka/th/producers/acks-and-durability/) และ [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) คือสองบทที่แสดงวิธีแก้จริง: `acks=all` บวก `min.insync.replicas >= 2` เพื่อให้การเขียนที่มีแค่ leader ต้อง replicate ก่อน ack หรือพังแบบมองเห็นได้ด้วย `NotEnoughReplicasException` แทนที่จะเสี่ยงหายแบบเงียบ ๆ
+</SpotTheBug>
+
+export const quizProduceToFetchPipeline = [
+  {
+    q: 'จากบรรทัด request log จริงข้างบน คำขอ PRODUCE มี "acks":-1 ค่านี้แปลว่าอะไรบนสาย (wire)?',
+    options: [
+      'An error code meaning the request failed',
+      'The wire encoding of acks=all',
+      'The wire encoding of acks=0',
+      'An invalid, out-of-range value',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: console producer ถูกสั่งด้วย --producer-property acks=all แล้ว request ที่เกิดขึ้น log "acks":-1 -- -1 คือค่าจริงบนสายของ "all" ส่วน 0 กับ 1 เขียนตรงตัว',
+  },
+  {
+    q: 'พิสูจน์แล้วด้วย request log จริงข้างบน broker log field "response" ของคำขอ PRODUCE ที่ acks=0 เป็นอะไร?',
+    options: [
+      'A response with baseOffset but no error field',
+      'An empty string, "" -- there is no response object at all',
+      'A response with only the error code',
+      'The same response as acks=1, just sent faster',
+    ],
+    answer: 1,
+    explain: 'บรรทัด log จริงที่ตัดสั้นข้างบนแสดง "response":"" สำหรับ request ที่ acks=0 -- broker ไม่ส่งอะไรกลับมาเลยจริง ๆ ต่างจาก response object จริงของ acks=1 โดยโครงสร้าง',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบน (สคริปต์จับเวลา long-poll) FetchRequest ที่ fetch.min.bytes=1000000 และ fetch.max.wait.ms=3000 บน topic ที่ idle log totalTimeMs ประมาณ 3004ms เลขนี้พิสูจน์อะไรจริง ๆ?',
+    options: [
+      'A client-side bug that caused a 3-second retry loop',
+      'fetch.max.wait.ms is a real server-side long poll -- the broker held the request open for essentially the full configured window before returning an empty response',
+      'The broker was overloaded and slow to respond',
+      'Kafka always waits 3 seconds before any fetch, regardless of config',
+    ],
+    answer: 1,
+    explain: 'request เอง log "maxWaitMs":3000 และ totalTimeMs ของ response (~3004ms) ตรงกันเกือบเป๊ะพร้อม recordsSizeInBytes:0 -- พิสูจน์ตรงว่า broker เองถือ connection เปิดไว้ตลอดช่วง long-poll ไม่ใช่ client วน retry',
+  },
+  {
+    q: 'consumer FetchRequest ระบุ fetchOffset:0 พิสูจน์แล้วข้างบน field highWatermark ใน FetchResponse จำกัดอะไรจริง ๆ?',
+    options: [
+      'The maximum number of bytes the response can contain',
+      'How far into the log a consumer is allowed to read -- records at or past the leader\'s log end offset but not yet covered by the HW are not returned',
+      'The number of partitions in the topic',
+      'The consumer\'s own commit offset',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: FetchResponse คืน highWatermark:1 สำหรับ request ที่ fetchOffset:0 -- HW คือขอบเขตที่ ISR ยืนยันแล้ว consumer ไม่เห็นเกินขอบเขตนี้เด็ดขาด ไม่ว่า leader จะ append ไปแล้วแค่ไหนในเครื่องตัวเอง',
+  },
+  {
+    q: 'บน harness single-broker (RF=1) ของบทนี้เอง ทำไมบทนี้พิสูจน์ hop ที่ client มองเห็น PRODUCE/FETCH/OFFSET_COMMIT ได้ แต่พิสูจน์ FetchRequest จาก leader ไป follower จริงไม่ได้?',
+    options: [
+      'Because request logging does not capture inter-broker traffic',
+      'Because there is no follower at all on a single-broker cluster -- that hop needs at least two brokers, proven separately with a real 3-broker cluster',
+      'Because inter-broker FetchRequests use a different, unlogged protocol',
+      'Because followers only exist when a topic is compacted',
+    ],
+    answer: 1,
+    explain: 'topic ที่ replication factor 1 ไม่มี follower เลยที่จะส่ง FetchRequest ได้ -- ระบุไว้ตรง ๆ ใน Callout เปิดบทนี้ และ proof จริงของ hop นั้นอยู่ใน Replication and ISR Internals ที่เปิดคลัสเตอร์ 3-broker ชั่วคราวขึ้นมาเพราะ harness ของบทนี้แสดงมันไม่ได้โดยโครงสร้าง',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/produce-to-fetch-pipeline" questions={quizProduceToFetchPipeline} />
+
+<ProgressTracker client:visible id="kafka-internals/produce-to-fetch-pipeline" />

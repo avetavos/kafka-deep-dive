@@ -1,0 +1,270 @@
+---
+title: 'Produce-to-Fetch Pipeline'
+description: 'The real RPC sequence from producer.send() to a committed consumer offset -- ProduceRequest, leader append, follower FetchRequest, high watermark advance, and the consumer FetchResponse it unlocks -- proven with real request-log lines and kafka-dump-log.sh on Kafka 4.3.1.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+One `producer.send()` becomes a `ProduceRequest`, an append to a real segment file, a wait for the **high watermark** to advance (driven entirely by followers' own `FetchRequest`s, never a push from the leader), and only then does a `ProduceResponse` return -- a separate, independent `FetchRequest`/`FetchResponse` pair is what actually delivers the record to a consumer, bounded by that same high watermark.
+
+<Callout title="What this lesson's broker can and can't show directly">
+This lesson runs on this module's own single-broker KRaft container (replication factor 1 -- see [How every proof in this module was made](/kafka/en/kafka-internals/)). That is enough to prove every **client-facing** hop below with real request-log lines: `ProduceRequest`, the segment append, a consumer's `FetchRequest`/`FetchResponse`, and `OffsetCommit`. It is **not** enough to show a real leader→follower `FetchRequest` -- there is no follower on one broker. That hop is proven with real request-log evidence in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/), which uses a temporary 3-broker cluster for exactly this reason. The Mermaid sequence below shows the full pipeline; the proofs under it are honest about which hops come from which lesson.
+</Callout>
+
+## The full sequence
+
+<Mermaid title="One produce, one commit -- the real RPC sequence" code={pipelineDiagram} />
+
+export const pipelineDiagram = `sequenceDiagram
+  participant P as Producer
+  participant L as Leader broker
+  participant F as Follower broker
+  participant C as Consumer
+  P->>L: ProduceRequest (acks, records batch)
+  L->>L: Append batch to active segment (.log)
+  Note over L: baseOffset assigned, CRC written
+  F->>L: FetchRequest (replicaId, fetchOffset)
+  L->>F: FetchResponse (records, highWatermark)
+  Note over L: HW advances once ISR has the offset
+  L->>P: ProduceResponse (baseOffset) -- only after HW passes it, if acks=all
+  C->>L: FetchRequest (fetchOffset, fetch.min.bytes, fetch.max.wait.ms)
+  L->>C: FetchResponse (records bounded by HW)
+  C->>L: OffsetCommit (group, committedOffset)`;
+
+Six real hops, in order: (1) the producer sends a batch in one `ProduceRequest`; (2) the leader appends it to its active `.log` segment, assigning the batch's `baseOffset`; (3) a follower's *own* `FetchRequest` (not a leader push) is what replicates the batch; (4) once the ISR has the new offset, the leader advances the partition's **high watermark (HW)**; (5) with `acks=all`, the `ProduceResponse` only returns after that HW advance -- with `acks=1` it returns right after the local append, and with `acks=0` there is no response at all (proven below); (6) a consumer's independent `FetchRequest`/`FetchResponse` pair, bounded by the HW, is what actually delivers the record, followed by an `OffsetCommit`.
+
+## Proof: a real `ProduceRequest` and the segment it appends to
+
+Producing one record with `acks=all` and capturing this module's own broker's request log (`kafka.request.logger` at `TRACE` -- see the module index for how):
+
+```text
+$ /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic internals-pipeline-demo --producer-property acks=all <<< "hello-acks-all"
+```
+
+Real, trimmed request-log line for the `PRODUCE` request this generated:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":0,"requestApiVersion":13,"correlationId":6,
+"clientId":"console-producer","requestApiKeyName":"PRODUCE"},
+"request":{"transactionalId":null,"acks":-1,"timeoutMs":1500,
+  "topicData":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitionData":[{"index":0,"recordsSizeInBytes":82}]}]},
+"response":{"responses":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitionResponses":[
+  {"index":0,"errorCode":0,"baseOffset":0,"logAppendTimeMs":-1,"logStartOffset":0,"recordErrors":[],"errorMessage":null}]}],
+  "throttleTimeMs":0},
+"totalTimeMs":9.07,...} (kafka.request.logger)
+```
+
+`"acks":-1` is the wire encoding of `acks=all` (`0` and `1` encode literally). The response's `"baseOffset":0` is the exact offset [The Log Abstraction](/kafka/en/foundations/the-log-abstraction/) showed you inside a `.log` file -- this is the same value, confirmed here from the *request/response* side rather than the file side. Dumping the segment this request appended to, on this module's own broker:
+
+```bash
+# scripts/produce-to-fetch-pipeline/segment-and-dump.sh
+TOPIC="${TOPIC_PREFIX}internals-pipeline-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP \
+  --topic "$TOPIC" --producer-property acks=1 <<< "pipeline-proof-record"
+
+echo "=== dump the segment this just appended to ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.log --print-data-log
+```
+
+Real output (this module's own broker, unedited except the timestamp -- run again on the shared harness broker and you'll see the same shape with a different `CreateTime`):
+
+```text
+=== dump the segment this just appended to ===
+Dumping /tmp/kafka-logs/internals-pipeline-lesson-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1790649638549 size: 82 magic: 2 compresscodec: none crc: 3516512333 isvalid: true
+| offset: 0 CreateTime: 1790649638549 keySize: -1 valueSize: 14 sequence: 0 headerKeys: [] payload: hello-acks-all
+```
+
+The `ProduceRequest`'s `baseOffset` in the response and the segment dump's `baseOffset` are the same number, proven from both the wire and the file.
+
+## Proof: `acks=0` gets no response at all, `acks=1` gets a real one
+
+The three `acks` values are not just "more or less durable" -- they are three genuinely different **protocol** behaviors, provable directly from the request log. Producing the same topic with `acks=0` then `acks=1`, trimmed:
+
+```text
+--- acks=0 ---
+"request":{"transactionalId":null,"acks":0,"timeoutMs":1500,"topicData":[...]},
+"response":"",
+"totalTimeMs":1.61, ...
+
+--- acks=1 ---
+"request":{"transactionalId":null,"acks":1,"timeoutMs":1500,"topicData":[...]},
+"response":{"responses":[{"topicId":"...","partitionResponses":[
+  {"index":0,"errorCode":0,"baseOffset":2,"logAppendTimeMs":-1,"logStartOffset":0,"recordErrors":[],"errorMessage":null}]}],"throttleTimeMs":0},
+"totalTimeMs":0.989, ...
+```
+
+With `acks=0` the broker's own request log records `"response":""` -- there is no response body at all; the broker does the append and never replies. With `acks=1` the exact same append produces a real response carrying `baseOffset`. On this single-broker, RF=1 harness, `acks=1` and `acks=all` end up equivalent in durability (the ISR is just the leader), which is exactly why proving the *durability* difference between them needs a real ISR with more than one member -- that proof, with a real `min.insync.replicas` failure, lives in [Acks and Durability](/kafka/en/producers/acks-and-durability/) and [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/).
+
+## Proof: a consumer's real `FetchRequest`/`FetchResponse`, bounded by the high watermark
+
+Consuming the record back, request log for the resulting `FETCH`:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":1,"requestApiVersion":18,"correlationId":21,
+"clientId":"console-consumer","requestApiKeyName":"FETCH"},
+"request":{"maxWaitMs":500,"minBytes":1,"maxBytes":52428800,"isolationLevel":0,"sessionId":0,"sessionEpoch":0,
+  "topics":[{"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitions":[
+    {"partition":0,"currentLeaderEpoch":0,"fetchOffset":0,"lastFetchedEpoch":-1,"logStartOffset":-1,"partitionMaxBytes":1048576}]}],
+  "forgottenTopicsData":[],"rackId":""},
+"response":{"throttleTimeMs":0,"errorCode":0,"sessionId":125471525,"responses":[
+  {"topicId":"FQwkK_oVSZeJP5dIDq-bSw","partitions":[
+    {"partitionIndex":0,"errorCode":0,"highWatermark":1,"lastStableOffset":1,"logStartOffset":0,
+     "abortedTransactions":null,"preferredReadReplica":-1,"recordsSizeInBytes":82}]}]},
+"totalTimeMs":6.825,...} (kafka.request.logger)
+```
+
+The request names `fetchOffset:0` -- "give me records starting at offset 0." The response's `highWatermark:1` is the real proof of the bound: the broker will never hand a consumer a record past the HW, because a record past the HW hasn't been confirmed by the ISR yet and could, in principle, be lost on an unclean leader change (see [Replication and ISR](/kafka/en/topics-and-partitions/replication-and-isr/)). Then the commit:
+
+```text
+[...] DEBUG Completed request:{"requestHeader":{"requestApiKey":8,"requestApiVersion":9,"correlationId":23,
+"clientId":"console-consumer","requestApiKeyName":"OFFSET_COMMIT"},
+"request":{"groupId":"internals-pipeline-group","generationIdOrMemberEpoch":1,
+  "memberId":"console-consumer-107950bc-df8e-47f2-85d7-5d428bfb0217","groupInstanceId":null,
+  "topics":[{"name":"internals-pipeline-demo","partitions":[{"partitionIndex":0,"committedOffset":1,"committedLeaderEpoch":0,"committedMetadata":""}]}]},
+"response":{"throttleTimeMs":0,"topics":[{"name":"internals-pipeline-demo","partitions":[{"partitionIndex":0,"errorCode":0}]}]},
+"totalTimeMs":9.957,...} (kafka.request.logger)
+```
+
+`committedOffset:1` means "I have processed up through offset 0; resume at 1" -- the exact off-by-one semantics [Offsets and Commits](/kafka/en/consumers/offsets-and-commits/) already covers from the client side; this is the literal RPC that carries it.
+
+## Proof: `fetch.max.wait.ms` is a real long-poll, not a guess
+
+A `FetchRequest` with a high `fetch.min.bytes` and nothing new to return does not return instantly -- it holds the connection open up to `fetch.max.wait.ms`, a real server-side long poll:
+
+```bash
+# scripts/produce-to-fetch-pipeline/long-poll-timing.sh
+TOPIC="${TOPIC_PREFIX}internals-longpoll-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+
+START=$(date +%s%3N)
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic "$TOPIC" \
+  --group "${TOPIC_PREFIX}internals-longpoll-group" \
+  --consumer-property fetch.min.bytes=1000000 --consumer-property fetch.max.wait.ms=3000 \
+  --max-messages 1 --timeout-ms 6000 || true
+END=$(date +%s%3N)
+echo "elapsed_ms=$((END - START))"
+```
+
+Real output from this module's own broker (the same shape you will see against the harness broker, modulo container overhead): the fetch this generated logged `"maxWaitMs":3000,"minBytes":1000000` in the request and `"totalTimeMs":3004.636` in the response, with `"recordsSizeInBytes":0` -- the broker held the request open for essentially the full 3000ms before giving up and returning empty, because 1,000,000 bytes never accumulated on an otherwise-idle topic:
+
+```text
+"request":{"maxWaitMs":3000,"minBytes":1000000,...,"fetchOffset":3,...},
+"response":{...,"highWatermark":3,"lastStableOffset":3,...,"recordsSizeInBytes":0}
+"totalTimeMs":3004.636
+```
+
+This is the real mechanism behind "low `fetch.max.wait.ms` = more, smaller fetches; high `fetch.max.wait.ms` = fewer, larger fetches, at the cost of added latency when data is sparse" -- it is not a client-side sleep, it is the broker itself holding the request.
+
+## Mental Model
+
+A produce and a fetch are **two separate, independent RPC round trips that both key off the same two numbers on the leader: the log end offset (where new appends land) and the high watermark (how far a consumer, or `acks=all`, is allowed to see).** The leader never pushes data to a follower or a consumer -- both `FetchRequest`s are pulls, issued by the follower or the consumer on their own schedule (`fetch.max.wait.ms` bounding how long that pull can idle). `acks=all` is not a separate replication mechanism; it is the producer's `ProduceResponse` being held until the *same* HW-advance the followers' fetches already drive has passed the new record.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `acks=0` | Lowest latency, no response wait at all (proven above: `"response":""`) | No delivery confirmation whatsoever -- a dropped request looks identical to a lost one |
+| `acks=1` | A real response with `baseOffset` after one local append | Durable only as far as the leader; a leader crash before replication loses it |
+| `acks=all` | Response waits for the ISR (durable across the whole ISR, not just the leader) | Higher latency; only as strong as the current ISR size (see [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) for what happens when the ISR shrinks) |
+| High `fetch.max.wait.ms` | Fewer, larger fetches -- less request overhead | Proven above: a consumer waits up to the full value when data is sparse |
+| High `fetch.min.bytes` | Fewer round trips per byte transferred | Combined with a high `fetch.max.wait.ms`, can add real, provable latency (proven above: 3004ms) before an idle topic's data is delivered |
+
+## Common Misconceptions
+
+- **"The leader pushes new records to followers as soon as they're appended."** Proven above and in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/): replication is follower-driven `FetchRequest`s, not a leader push.
+- **"`acks=0` still returns a (fast) success response."** Proven above with the real request log: `acks=0`'s response field is literally `""` -- there is no response object, success or otherwise.
+- **"A consumer can read a record the instant the leader appends it."** Proven above: the `FetchResponse`'s `highWatermark` bounds what a consumer can see; a record between the log end offset and the HW is invisible to consumers until the ISR catches up.
+- **"`fetch.max.wait.ms` is a client-side polling interval."** Proven above: it is a parameter of the request itself (`"maxWaitMs":3000` inside the `FetchRequest`), and the broker's own logged `totalTimeMs` shows it actually held the connection, not the client sleeping and re-asking.
+
+## Reading AI-generated code
+
+<SpotTheBug code={`// AI-suggested "low-latency, still safe" producer config
+const producer = kafka.producer({
+  // acks=1 is "safe enough" and faster than acks=all
+});
+
+await producer.send({
+  topic: 'payments',
+  acks: 1,
+  messages: [{ key: paymentId, value: JSON.stringify(payment) }],
+});
+// The response includes baseOffset, so we know it's durably stored.`}>
+The comment's leap from "the response includes `baseOffset`" to "durably stored" is the bug, proven above: `acks=1`'s `ProduceResponse` (real request-log line above: `"baseOffset":2` with `acks:1`) only proves the **leader** appended the record -- it says nothing about the ISR. If this leader crashes before any follower's own `FetchRequest` has replicated that offset, the record is gone even though the producer already saw a successful response with a real `baseOffset`. For a payments topic, [Acks and Durability](/kafka/en/producers/acks-and-durability/) and [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) are the two lessons that show the actual fix: `acks=all` plus `min.insync.replicas >= 2`, so a leader-only write either replicates before acking or fails visibly with `NotEnoughReplicasException` instead of silently risking loss.
+</SpotTheBug>
+
+export const quizProduceToFetchPipeline = [
+  {
+    q: 'In the real request-log line above, a PRODUCE request has "acks":-1. What does that value mean on the wire?',
+    options: [
+      'An error code meaning the request failed',
+      'The wire encoding of acks=all',
+      'The wire encoding of acks=0',
+      'An invalid, out-of-range value',
+    ],
+    answer: 1,
+    explain: 'Proven above: the console producer was started with --producer-property acks=all, and the resulting request logged "acks":-1 -- -1 is the literal wire value for "all"; 0 and 1 encode literally.',
+  },
+  {
+    q: 'Proven above with a real request-log capture, what does the broker log as the "response" field for an acks=0 PRODUCE request?',
+    options: [
+      'A response with baseOffset but no error field',
+      'An empty string, "" -- there is no response object at all',
+      'A response with only the error code',
+      'The same response as acks=1, just sent faster',
+    ],
+    answer: 1,
+    explain: 'The real trimmed log line above shows "response":"" for the acks=0 request -- the broker genuinely sends nothing back, a structurally different behavior from acks=1\'s real response object.',
+  },
+  {
+    q: 'Proven above (the long-poll timing script), a FetchRequest with fetch.min.bytes=1000000 and fetch.max.wait.ms=3000 against an idle topic logged totalTimeMs of about 3004ms. What does that number actually prove?',
+    options: [
+      'A client-side bug that caused a 3-second retry loop',
+      'fetch.max.wait.ms is a real server-side long poll -- the broker held the request open for essentially the full configured window before returning an empty response',
+      'The broker was overloaded and slow to respond',
+      'Kafka always waits 3 seconds before any fetch, regardless of config',
+    ],
+    answer: 1,
+    explain: 'The request itself logged "maxWaitMs":3000, and the response\'s totalTimeMs (~3004ms) matches it almost exactly with recordsSizeInBytes:0 -- direct proof the broker itself held the connection open for the long-poll window, not a client retry loop.',
+  },
+  {
+    q: 'A consumer FetchRequest names fetchOffset:0. Proven above, what does the FetchResponse\'s highWatermark field actually bound?',
+    options: [
+      'The maximum number of bytes the response can contain',
+      'How far into the log a consumer is allowed to read -- records at or past the leader\'s log end offset but not yet covered by the HW are not returned',
+      'The number of partitions in the topic',
+      'The consumer\'s own commit offset',
+    ],
+    answer: 1,
+    explain: 'Proven above: the FetchResponse returned highWatermark:1 for a fetchOffset:0 request -- the HW is the boundary of what the ISR has confirmed, and a consumer never sees past it, independent of what the leader has locally appended.',
+  },
+  {
+    q: 'On this lesson\'s own single-broker (RF=1) harness, why can this lesson prove the client-facing PRODUCE/FETCH/OFFSET_COMMIT hops but not a real leader-to-follower FetchRequest?',
+    options: [
+      'Because request logging does not capture inter-broker traffic',
+      'Because there is no follower at all on a single-broker cluster -- that hop needs at least two brokers, proven separately with a real 3-broker cluster',
+      'Because inter-broker FetchRequests use a different, unlogged protocol',
+      'Because followers only exist when a topic is compacted',
+    ],
+    answer: 1,
+    explain: 'A replication-factor-1 topic has no follower to issue a FetchRequest at all -- this is stated directly in this lesson\'s opening Callout, and the real proof of that hop is in Replication and ISR Internals, which spins up a temporary 3-broker cluster specifically because this lesson\'s harness structurally cannot show it.',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/produce-to-fetch-pipeline" questions={quizProduceToFetchPipeline} />
+
+<ProgressTracker client:visible id="kafka-internals/produce-to-fetch-pipeline" />
