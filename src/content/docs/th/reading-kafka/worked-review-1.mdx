@@ -165,7 +165,7 @@ seq=5 -> partition 1
 ```
 
 <SpotTheBug code={`messages: [{ value: JSON.stringify(order) }],`}>
-Kafka รับประกัน ordering แค่**ภายในพาร์ทิชันเดียว** — consumer ที่อ่าน partition 2, 0, 1, 2, 0, 1 ตามลำดับที่มัน poll ได้ ไม่มีทางประกอบกลับได้ว่า `seq=0` มาก่อน `seq=3` สำหรับลูกค้ารายนี้ ทั้งที่ทั้งคู่ตกที่ partition 2 เหมือนกัน นี่คือเหตุผลที่บท **[Keys and Partitioning](/kafka/th/producers/keys-and-partitioning/)** ปฏิบัติต่อ key เป็นกลไก ordering ไม่ใช่ field ที่จะมีหรือไม่มีก็ได้: ทุก message ที่ key เดียวกัน hash ไปพาร์ทิชันเดียวกัน (พิสูจน์ด้านบน: ทั้ง 6 ตกที่ partition 1) และพาร์ทิชันเดียวถูกอ่านโดย consumer ตัวเดียวใน group ในเวลาเดียว ตามลำดับที่เขียน ทางแก้คือ `key: order.customerId` — field อะไรก็ได้ที่ business ต้องการให้เรียงลำดับด้วยกัน
+Kafka รับประกัน ordering แค่**ภายในพาร์ทิชันเดียว** — consumer ที่อ่าน partition 2, 0, 1, 2, 0, 1 ตามลำดับที่มัน poll ได้ ไม่มีทางประกอบกลับได้ว่า `seq=0` มาก่อน `seq=3` สำหรับลูกค้ารายนี้ ทั้งที่ทั้งคู่ตกที่ partition 2 เหมือนกัน นี่คือเหตุผลที่บท **[Keys and Partitioning](/kafka/th/topics-and-partitions/keys-and-partitioning/)** ปฏิบัติต่อ key เป็นกลไก ordering ไม่ใช่ field ที่จะมีหรือไม่มีก็ได้: ทุก message ที่ key เดียวกัน hash ไปพาร์ทิชันเดียวกัน (พิสูจน์ด้านบน: ทั้ง 6 ตกที่ partition 1) และพาร์ทิชันเดียวถูกอ่านโดย consumer ตัวเดียวใน group ในเวลาเดียว ตามลำดับที่เขียน ทางแก้คือ `key: order.customerId` — field อะไรก็ได้ที่ business ต้องการให้เรียงลำดับด้วยกัน
 </SpotTheBug>
 
 ### ไม่ตั้ง `idempotent` เลย — write ที่ retry กลายเป็นสอง write

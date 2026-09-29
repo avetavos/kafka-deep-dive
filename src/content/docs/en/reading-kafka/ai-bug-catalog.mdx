@@ -508,7 +508,7 @@ await admin.disconnect();
 process.exit(0);
 ```
 
-**Caught by:** only a second restart against the same group and topic — see the off-by-one entry above for the same underlying commit mechanics; **[Error Handling & Retries](/kafka/en/consumers/error-handling-retries/)** for the full DLQ pattern.
+**Caught by:** only a second restart against the same group and topic — see the off-by-one entry above for the same underlying commit mechanics; **[Error Handling & Retries](/kafka/en/delivery-and-transactions/error-handling-retries/)** for the full DLQ pattern.
 
 ## Delivery & transactions
 
@@ -779,7 +779,7 @@ Two separate real effects at once: the original long-lived producer kept sending
 // grow, treat it as a breaking change: drain in-flight per-key state before the change, not after.
 ```
 
-**Caught by:** nothing automatic — both the remap and the stale-metadata window are silent; comparing `producer.send()`'s returned `partition` for the same key before and after, on a real cluster, is the only way to see it. See **[Keys and Partitioning](/kafka/en/producers/keys-and-partitioning/)** for the full murmur2 mechanics.
+**Caught by:** nothing automatic — both the remap and the stale-metadata window are silent; comparing `producer.send()`'s returned `partition` for the same key before and after, on a real cluster, is the only way to see it. See **[Keys and Partitioning](/kafka/en/topics-and-partitions/keys-and-partitioning/)** for the full murmur2 mechanics.
 
 ### 15. Treating `auto.create.topics.enable` as toggleable at runtime
 

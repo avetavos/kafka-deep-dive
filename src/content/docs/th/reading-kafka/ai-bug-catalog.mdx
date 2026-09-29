@@ -508,7 +508,7 @@ await admin.disconnect();
 process.exit(0);
 ```
 
-**จับได้ด้วย:** ต้อง restart ครั้งที่สองกับ group และ topic เดียวกันเท่านั้น — ดูรายการ off-by-one ข้างบนสำหรับกลไก commit เดียวกัน; **[Error Handling & Retries](/kafka/th/consumers/error-handling-retries/)** สำหรับ pattern DLQ เต็มรูปแบบ
+**จับได้ด้วย:** ต้อง restart ครั้งที่สองกับ group และ topic เดียวกันเท่านั้น — ดูรายการ off-by-one ข้างบนสำหรับกลไก commit เดียวกัน; **[Error Handling & Retries](/kafka/th/delivery-and-transactions/error-handling-retries/)** สำหรับ pattern DLQ เต็มรูปแบบ
 
 ## Delivery & transactions
 
@@ -779,7 +779,7 @@ user-99 -> partition 5
 // grow, treat it as a breaking change: drain in-flight per-key state before the change, not after.
 ```
 
-**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — ทั้ง remap และช่วง metadata ค้างเงียบทั้งคู่ การเทียบ `partition` ที่ `producer.send()` คืนมาสำหรับ key เดียวกันก่อนและหลัง บน cluster จริง เป็นวิธีเดียวที่เห็นได้ ดู **[Keys and Partitioning](/kafka/th/producers/keys-and-partitioning/)** สำหรับกลไก murmur2 เต็มรูปแบบ
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — ทั้ง remap และช่วง metadata ค้างเงียบทั้งคู่ การเทียบ `partition` ที่ `producer.send()` คืนมาสำหรับ key เดียวกันก่อนและหลัง บน cluster จริง เป็นวิธีเดียวที่เห็นได้ ดู **[Keys and Partitioning](/kafka/th/topics-and-partitions/keys-and-partitioning/)** สำหรับกลไก murmur2 เต็มรูปแบบ
 
 ### 15. มอง `auto.create.topics.enable` เป็นสิ่งที่สลับได้ตอน runtime
 

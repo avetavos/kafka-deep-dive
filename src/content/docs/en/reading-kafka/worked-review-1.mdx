@@ -165,7 +165,7 @@ seq=5 -> partition 1
 ```
 
 <SpotTheBug code={`messages: [{ value: JSON.stringify(order) }],`}>
-Kafka only guarantees ordering **within a single partition** — a consumer reading partitions 2, 0, 1, 2, 0, 1 in whatever order it happens to poll them has no way to reconstruct that `seq=0` came before `seq=3` for this customer, even though both landed on partition 2. This is exactly why the **[Keys and Partitioning](/kafka/en/producers/keys-and-partitioning/)** lesson treats the key as the ordering mechanism, not an optional field: every message for the same key hashes to the same partition (proven above: all 6 landed on partition 1), and a single partition is read by exactly one consumer in a group at a time, in write order. The fix is `key: order.customerId` — any field the business actually needs ordered together.
+Kafka only guarantees ordering **within a single partition** — a consumer reading partitions 2, 0, 1, 2, 0, 1 in whatever order it happens to poll them has no way to reconstruct that `seq=0` came before `seq=3` for this customer, even though both landed on partition 2. This is exactly why the **[Keys and Partitioning](/kafka/en/topics-and-partitions/keys-and-partitioning/)** lesson treats the key as the ordering mechanism, not an optional field: every message for the same key hashes to the same partition (proven above: all 6 landed on partition 1), and a single partition is read by exactly one consumer in a group at a time, in write order. The fix is `key: order.customerId` — any field the business actually needs ordered together.
 </SpotTheBug>
 
 ### `idempotent` never set — a retried write becomes two writes
