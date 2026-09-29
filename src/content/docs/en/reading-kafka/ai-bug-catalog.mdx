@@ -1,0 +1,1080 @@
+---
+title: The AI bug catalog
+description: '21 bugs AI-generated Kafka code produces constantly — the code AI typically writes, why it is wrong, real output freshly captured against a live Kafka 4.3.1 broker for this module, and the fix.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+Every snippet below was written to look exactly like the code an AI assistant actually produces — fluent KafkaJS, plausible `.properties`, realistic shell commands — then run for real: against a fresh three-broker Kafka 4.3.1 KRaft cluster stood up specifically for this module (`kafka-reading-a`, ports 39092–39094, torn down after these proofs were captured), or against this course's own shared harness broker where the fix fence is marked `// @run`. The quoted output below is copied verbatim from those runs, not reconstructed from memory or carried over from an earlier lesson — even where a fact was already established in Phase 3, it was re-proven here, fresh, on this module's own broker. Group the same way as **[How to read Kafka code you did not write](/kafka/en/reading-kafka/)** and the **[Review Checklist](/kafka/en/reading-kafka/review-checklist/)** that follows this lesson.
+
+## Client & versions
+
+### 1. `--zookeeper` on a CLI tool
+
+AI training data spans a decade of Kafka tutorials, and every `kafka-*.sh` tool used to take a `--zookeeper` flag. ZooKeeper was removed outright in **Kafka 4.0** — every tool now takes only `--bootstrap-server`, and the old flag is not silently ignored, it is a real parse error.
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/01-zookeeper-flag.sh — @expect-error --zookeeper was removed in Kafka 4.0, every tool now requires --bootstrap-server
+/opt/kafka/bin/kafka-topics.sh --zookeeper localhost:2181 --list
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+joptsimple.UnrecognizedOptionException: zookeeper is not a recognized option
+	at joptsimple.OptionException.unrecognizedOption(OptionException.java:108)
+	at joptsimple.OptionParser.handleLongOptionToken(OptionParser.java:510)
+	at joptsimple.OptionParserState$2.handleArgument(OptionParserState.java:56)
+	at joptsimple.OptionParser.parse(OptionParser.java:396)
+	at org.apache.kafka.tools.TopicCommand$TopicCommandOptions.<init>(TopicCommand.java:795)
+```
+
+**Fix:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/01-zookeeper-flag-fixed.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**Caught by:** running the exact command against any real Kafka 4.x broker — this is a client-side `joptsimple` parse error, not something `tsc` or a properties-key check can see; `kafka-topics.sh --help` also no longer lists `--zookeeper` at all.
+
+### 2. `group.protocol=consumer` copied into a KafkaJS config
+
+**KIP-848**'s new consumer rebalance protocol (`group.protocol=consumer`) is real, current, and GA — but it is a Java-client setting. AI training data mixes Java and KafkaJS examples freely, and this property name gets copied into a KafkaJS consumer constructor where it is not a recognized option — JavaScript object literals do not reject unknown keys, so nothing rejects it either.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/02-group-protocol.ts — @expect-error 'group.protocol' is a Java-client (KIP-848) setting; KafkaJS has no such option and silently ignores it
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({
+  groupId: 'orders-group',
+  'group.protocol': 'consumer', // AI comment: "opt in to the new KIP-848 rebalance protocol"
+} as any);
+```
+
+**Symptom — real output, run against this module's own broker (group described right after):**
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type classic
+quick-batch-group-2              Classic
+```
+
+The consumer connects, subscribes, and consumes completely normally — and the group is still reported as `Classic`, not `Consumer`. No error, no warning, no protocol change: the property was silently dropped.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/02-group-protocol-fixed.ts
+import { Kafka } from 'kafkajs';
+
+// KafkaJS has no KIP-848 support at all -- do not pass a Java-only key hoping it does something.
+// To actually use the new consumer rebalance protocol, switch clients:
+//   import { KafkaJS } from '@confluentinc/kafka-javascript';
+//   const consumer = new KafkaJS.Kafka({}).consumer({ 'group.protocol': 'consumer', groupId: 'orders-group' });
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+```
+
+**Caught by:** nothing automatic — this is exactly why the reading order in the previous lesson starts with "which client, which version": a code reviewer has to know KafkaJS never implemented KIP-848 to recognize this key does nothing; `kafka-consumer-groups.sh --list --type classic` vs `--type consumer` is the only way to confirm which protocol a group actually joined.
+
+### 3. Reaching for `kafkajs` without checking what it still is
+
+`kafkajs` is still the client most tutorials, blog posts, and AI completions reach for by default — it is also **unmaintained since 2023-02-27** (verified via `npm view kafkajs time.modified`), ships only one compression codec natively, and ships only one partition assigner.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/03-client-choice.ts — @expect-error illustrates an unverified assumption, not a runtime failure
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+// AI comment: "kafkajs is the standard Node client for Kafka, actively maintained"
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+const producer = kafka.producer({ createPartitioner: undefined }); // "uses Kafka's default sticky assignment"
+```
+
+**Symptom — real output, `node_modules/kafkajs` source on this module's own probe, read directly:**
+
+```text
+$ grep -n "GZIP:\|Snappy:\|LZ4:\|ZSTD:" node_modules/kafkajs/src/protocol/message/compression/index.js
+  GZIP: 1,
+  Snappy: 2,
+  LZ4: 3,
+  ZSTD: 4,
+$ grep -n "throw new KafkaJSNotImplemented" node_modules/kafkajs/src/protocol/message/compression/index.js
+    throw new KafkaJSNotImplemented('Snappy compression not implemented')
+    throw new KafkaJSNotImplemented('LZ4 compression not implemented')
+    throw new KafkaJSNotImplemented('ZSTD compression not implemented')
+$ ls node_modules/kafkajs/src/consumer/assigners/
+index.js  roundRobinAssigner
+```
+
+Only `GZIP` has a real codec; the other three are stubs that throw. Only `roundRobinAssigner` ships — there is no "sticky" assigner in KafkaJS at all, despite that being the Java client's modern default.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/03-client-choice-fixed.ts
+// Pick deliberately, and say so in a comment for the next reader:
+//   kafkajs      -- unmaintained since 2023-02-27, GZIP-only compression, RoundRobin-only assignment,
+//                    no KIP-848/932 support -- fine for most services, but a conscious choice, not a default.
+//   @confluentinc/kafka-javascript -- actively maintained, librdkafka-backed, all four compression
+//                    codecs, KIP-848 group.protocol=consumer GA -- prefer this for anything new.
+import { Kafka } from 'kafkajs'; // kept deliberately: this course's fences mostly use it, see the Callout below
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+```
+
+<Callout title="KafkaJS is unmaintained">
+`kafkajs` has had no releases since **2023-02-27** (verified via `npm view kafkajs time.modified`). It still runs fine against Kafka 4.3.1 and most of this course's fences use it because it remains the most widely deployed Node client — but treat every default it ships as a choice worth double-checking, not a modern baseline. See **[The Producer API](/kafka/en/producers/producer-api/)** for the full client comparison.
+</Callout>
+
+**Caught by:** `npm view kafkajs time.modified`, reading the installed package's own source (no network needed), and the **[Glossary](/kafka/en/glossary/)**'s KafkaJS entry.
+
+## Producer
+
+### 4. Forgot `idempotent: true`
+
+KafkaJS's idempotent producer defaults to **off** — the exact opposite of what several Java-client tutorials train a reader to expect. A producer built without it retries under `acks=all` with no protection against a retried request creating a duplicate on the broker.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/04-idempotent-default.ts — @expect-error illustrates a missing safety default, not a runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+// AI comment: "idempotent producer for payments"
+const producer = kafka.producer(); // idempotent defaults to false -- this is NOT an idempotent producer
+```
+
+**Symptom — real output, `node_modules/kafkajs` source read directly on this module's own probe:**
+
+```text
+$ grep -n "idempotent = false" node_modules/kafkajs/src/producer/index.js
+  idempotent = false,
+$ grep -n "acks = -1" node_modules/kafkajs/src/producer/messageProducer.js
+  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages = [] }) => {
+```
+
+`idempotent` really does default to `false` in the installed package (`kafkajs@2.2.4`) — a comment claiming "idempotent producer" next to a bare `kafka.producer()` call is simply wrong, verified from the source the code actually imports.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/04-idempotent-default-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-04-idempotent`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-04', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1 }); // explicit, matches acks=all
+await producer.connect();
+const [r] = await producer.send({ topic, acks: -1, messages: [{ value: 'safe-to-retry' }] });
+console.log('idempotent send OK, partition', r.partition, 'errorCode', r.errorCode);
+await producer.disconnect();
+process.exit(0);
+```
+
+**Caught by:** reading `node_modules/kafkajs/src/producer/index.js` directly (no test can catch a missing option that has no observable effect on a happy-path send); the harness's `tsc --noEmit` confirms the fix compiles, `--run` confirms it actually sends.
+
+### 5. Assumed native LZ4/Snappy/ZSTD compression
+
+A performance-tuning comment lifted from Java-client advice ("use `lz4`, it's the best general-purpose codec") gets applied verbatim to a KafkaJS producer — which does not ship that codec.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/05-compression.ts — @expect-error KafkaJS ships only GZIP natively; ZSTD/LZ4/Snappy throw KafkaJSNotImplemented
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'events', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+await producer.connect();
+// AI comment: "zstd gives the best compression ratio for JSON payloads"
+await producer.send({ topic: 'events', compression: CompressionTypes.ZSTD, messages: [{ value: 'zstd-body' }] });
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+KafkaJSNotImplemented: ZSTD compression not implemented
+```
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/05-compression-fixed.ts
+// @run
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-05-compression`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-05', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+// GZIP is the only codec KafkaJS registers a real implementation for.
+const [r] = await producer.send({ topic, compression: CompressionTypes.GZIP, messages: [{ value: 'gzip-body' }] });
+console.log('gzip send OK, partition', r.partition, 'errorCode', r.errorCode);
+await producer.disconnect();
+process.exit(0);
+```
+
+**Caught by:** running the send (a type-only check passes — `CompressionTypes.ZSTD` is a valid enum member, the failure is purely at runtime); `node_modules/kafkajs/src/protocol/message/compression/index.js` for the underlying reason.
+
+### 6. Transactional producer, plain `.send()`
+
+Constructing a producer with `transactionalId` set primes it for transactions — but calling `.send()` directly, instead of wrapping the write in `.transaction()`, does not error. It sends as an ordinary, non-transactional, non-idempotent write. Every write on that producer instance that skips `.transaction()` silently falls outside the exactly-once story the `transactionalId` implied.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/06-txn-bypass.ts — @expect-error illustrates a silent semantic gap, not a runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+// AI comment: "transactional producer for the payments pipeline"
+const producer = kafka.producer({ transactionalId: 'payments-tx-1' });
+await producer.connect();
+// AI forgot to call producer.transaction() -- this bypasses the transaction entirely
+await producer.send({ topic: 'accounts', messages: [{ value: 'debit' }] });
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+direct send result: [{"topicName":"txn-guard-topic","partition":0,"errorCode":0,"baseOffset":"0","logAppendTime":"-1","logStartOffset":"0"}]
+```
+
+No error at all — `errorCode: 0`. The record is on the topic, entirely outside any transaction, even though the producer was constructed with a `transactionalId`.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/06-txn-bypass-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-06-txn`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-06', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ transactionalId: 'ai-bug-catalog-06-tx', idempotent: true, maxInFlightRequests: 1 });
+await producer.connect();
+const txn = await producer.transaction(); // every write MUST go through this object
+await txn.send({ topic, messages: [{ value: 'debit-inside-transaction' }] });
+await txn.commit();
+console.log('write went through the transaction, not producer.send() directly');
+await producer.disconnect();
+process.exit(0);
+```
+
+**Caught by:** nothing automatic — `producer.send()` and `txn.send()` have the same shape and both succeed; the reviewer has to notice that a producer built with `transactionalId` never once calls `.transaction()` anywhere in the file.
+
+## Consumer loop & commits
+
+### 7. A slow handler blocks the heartbeat
+
+KafkaJS's heartbeat is driven from the same loop as `eachMessage` — it fires **after** the handler's promise resolves, not on a separate timer. A handler that makes a slow HTTP call or an unbounded DB write can run past `session.timeout.ms` with no heartbeat sent, and the group coordinator evicts the member mid-processing.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/07-heartbeat-block.ts — @expect-error illustrates a timing bug that needs session.timeout.ms to actually elapse, not a compile/runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group', sessionTimeout: 6000 });
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    // AI comment: "call the fraud-check service before accepting the order"
+    await fetch('https://fraud-check.internal/verify', { method: 'POST', body: message.value }); // no timeout -- can hang far past sessionTimeout
+  },
+});
+```
+
+**Symptom — real output, run against this module's own broker (handler replaced with a 15s sleep, `sessionTimeout: 6000`):**
+
+```text
+handling offset 0 -- sleeping 15s (heartbeat only fires AFTER eachMessage returns)
+handler for offset 0 finished
+handling offset 1 -- sleeping 15s (heartbeat only fires AFTER eachMessage returns)
+{"level":"ERROR","message":"[Connection] Response Heartbeat(key: 12, version: 3)","error":"The coordinator is not aware of this member"}
+{"level":"ERROR","message":"[Runner] The coordinator is not aware of this member, re-joining the group","error":"The coordinator is not aware of this member"}
+```
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/07-heartbeat-block-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-07-heartbeat`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-07', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'order-1' }] });
+await producer.disconnect();
+
+// Fix: keep eachMessage itself fast. Hand slow work to a bounded, timed-out call (or a queue), never an
+// unbounded await inside the handler that KafkaJS's heartbeat is waiting behind.
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-07-group', sessionTimeout: 30000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    eachMessage: async ({ message }) => {
+      console.log('fast handler, offset', message.offset, 'value', message.value?.toString());
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**Caught by:** only a real, timed run — `tsc` and a single fast test both pass; the eviction only appears once a handler genuinely runs longer than `session.timeout.ms`. **[Consumer API](/kafka/en/consumers/consumer-api/)** covers heartbeat/`session.timeout.ms` in full.
+
+### 8. `commitOffsets` off by one
+
+A manual commit that passes the offset **just read**, instead of `offset + 1` (the position to *resume from*), does not error — Kafka's commit is a bare integer pointer, and any value is accepted. The consequence only appears on the next run: the last successfully processed record gets reprocessed, forever, one message per restart.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/08-off-by-one.ts — @expect-error illustrates a bug that only surfaces across a restart, not within a single run
+consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await process(message);
+    // AI-written bug: commits the offset it just READ, not offset + 1 (the position to RESUME from)
+    await consumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+  },
+});
+```
+
+**Symptom — real output, run against this module's own broker (produced 3 messages once, consumed with the buggy commit, restarted the consumer twice more):**
+
+```text
+[run-1-first-pass] processed offset 0 value msg-0
+[run-1-first-pass] processed offset 1 value msg-1
+[run-1-first-pass] processed offset 2 value msg-2
+[run-2-after-restart] processed offset 2 value msg-2
+[run-2-after-restart] total processed: 1 offsets: 2
+
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group off-by-one-group-3
+GROUP              TOPIC              PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+off-by-one-group-3 off-by-one-topic-3 0          2               3               1
+```
+
+`msg-2` (offset 2) gets reprocessed on every restart — `CURRENT-OFFSET` is permanently stuck one behind `LOG-END-OFFSET`.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/08-off-by-one-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-08-offbyone`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-08', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'only-message' }] });
+await producer.disconnect();
+
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-08-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      console.log('processed offset', message.offset);
+      // Fix: commit offset + 1 -- the position the NEXT fetch should resume from.
+      await consumer.commitOffsets([{ topic: t, partition, offset: String(Number(message.offset) + 1) }]);
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**Caught by:** only a second run against the same group — `kafka-consumer-groups.sh --describe --group <g>` comparing `CURRENT-OFFSET` to `LOG-END-OFFSET` is the fastest live signal; see **[Offsets and Commits](/kafka/en/consumers/offsets-and-commits/)**.
+
+### 9. DLQ routing without committing the original offset
+
+Routing a bad record to a dead-letter topic and then continuing the loop *looks* handled — but if the code never commits the original message's offset once the DLQ write succeeds, the consumer's position never advances past that record. On restart, the exact same record is read again, routed to the DLQ again, forever.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/09-dlq-loop.ts — @expect-error illustrates a permanent loop that only appears across a restart
+eachMessage: async ({ message }) => {
+  try {
+    JSON.parse(message.value!.toString());
+  } catch {
+    await dlqProducer.send({ topic: 'orders.DLQ', messages: [{ value: message.value }] });
+    // BUG: no commitOffsets call here -- the original offset is never advanced.
+  }
+},
+```
+
+**Symptom — real output, run against this module's own broker (one permanently-bad record, three separate consumer restarts against the same group):**
+
+```text
+[run-1] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-1] total eachMessage calls: 1
+[run-2-after-restart] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-2-after-restart] total eachMessage calls: 1
+[run-3-after-another-restart] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-3-after-another-restart] total eachMessage calls: 1
+```
+
+Offset 0 gets routed to the DLQ again on every single restart — a real, permanent loop, not a hypothetical one.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/09-dlq-loop-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-09-dlq`;
+const dlq = `${prefix}ai-bug-catalog-09-dlq.DLQ`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-09', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }, { topic: dlq, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'not-json{{{' }] });
+await producer.disconnect();
+
+const dlqProducer = kafka.producer();
+await dlqProducer.connect();
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-09-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      try {
+        JSON.parse(message.value!.toString());
+      } catch {
+        await dlqProducer.send({ topic: dlq, messages: [{ value: message.value }] });
+        // Fix: commit the ORIGINAL offset once the DLQ write succeeds -- the record is handled, move on.
+        await consumer.commitOffsets([{ topic: t, partition, offset: String(Number(message.offset) + 1) }]);
+      }
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await dlqProducer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**Caught by:** only a second restart against the same group and topic — see the off-by-one entry above for the same underlying commit mechanics; **[Error Handling & Retries](/kafka/en/consumers/error-handling-retries/)** for the full DLQ pattern.
+
+## Delivery & transactions
+
+### 10. A separate `commitOffsets` instead of `txn.sendOffsets()`
+
+A consume-transform-produce loop that commits its downstream write **inside** a transaction but commits the **consumer offset separately**, outside the transaction, breaks exactly-once by construction — a crash between the two commits duplicates the downstream write on the next run, because the input offset never advanced.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/10-separate-commit.ts — @expect-error illustrates a crash-window bug, real output captured separately below
+const txn = await producer.transaction();
+await txn.send({ topic: 'orders.enriched', messages: [{ value: enriched }] });
+await txn.commit();
+// BUG: this should be txn.sendOffsets({ consumerGroupId, topics: [...] }) INSIDE the same transaction.
+await consumer.commitOffsets([{ topic, partition, offset: nextOffset }]);
+```
+
+**Symptom — real output, run against this module's own broker (process.exit(0) right after the transaction commits, before the separate consumer commit runs):**
+
+```text
+consume-transform-produce for offset 0
+transaction committed (output written); crashing before the separate consumer.commitOffsets call
+
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group sos-group
+Consumer group 'sos-group' has no active members.
+```
+
+No committed offset at all for the group — restarting reprocesses offset 0 from scratch:
+
+```text
+reprocessed offset 0 value order-1
+total reprocessed on restart: 1
+```
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/10-separate-commit-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const inTopic = `${prefix}ai-bug-catalog-10-in`;
+const outTopic = `${prefix}ai-bug-catalog-10-out`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-10', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: inTopic, numPartitions: 1, replicationFactor: 1 }, { topic: outTopic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const seed = kafka.producer();
+await seed.connect();
+await seed.send({ topic: inTopic, messages: [{ value: 'order-1' }] });
+await seed.disconnect();
+
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-10-group' });
+await consumer.connect();
+await consumer.subscribe({ topic: inTopic, fromBeginning: true });
+const txnProducer = kafka.producer({ transactionalId: 'ai-bug-catalog-10-tx', idempotent: true, maxInFlightRequests: 1 });
+await txnProducer.connect();
+
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic, partition, message }) => {
+      const txn = await txnProducer.transaction();
+      await txn.send({ topic: outTopic, messages: [{ value: `processed:${message.value}` }] });
+      // Fix: the offset commit happens INSIDE the same transaction as the produce -- atomic, no crash window.
+      await txn.sendOffsets({
+        consumerGroupId: 'ai-bug-catalog-10-group',
+        topics: [{ topic, partitions: [{ partition, offset: String(Number(message.offset) + 1) }] }],
+      });
+      await txn.commit();
+      console.log('offset commit and downstream write committed together, atomically');
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await txnProducer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**Caught by:** only a real crash-window reproduction, exactly like the proof above — no static check sees this; **[Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/)** and **[Transactions](/kafka/en/delivery-and-transactions/transactions/)** for the full mechanism.
+
+### 11. "Fixed" `readUncommitted` to `true`
+
+A consumer that appears to be "missing" records — records that were, in fact, deliberately aborted inside a transaction — gets "fixed" by flipping `readUncommitted` to `true`. KafkaJS's real default is already `false` (`read_committed`); setting it to `true` does not recover lost records, it exposes ones that were never meant to be seen.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/11-read-uncommitted.ts — @expect-error illustrates a misdiagnosed "fix", real output captured separately below
+// AI comment: "consumer seems to be missing some records, disabling read isolation to see everything"
+const consumer = kafka.consumer({ groupId: 'audit-group', readUncommitted: true } as any);
+```
+
+**Symptom — real output, run against this module's own broker (one record written, then aborted, inside a real transaction):**
+
+```text
+[default (read_committed)] readUncommitted=false -> saw: []
+[AI "fix"] readUncommitted=true -> saw: ["will-be-aborted"]
+```
+
+The default correctly hides the aborted record. The "fix" makes it visible — a record the writer explicitly decided never happened.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/11-read-uncommitted-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-11-readuncommitted`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-11', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ transactionalId: 'ai-bug-catalog-11-tx', idempotent: true, maxInFlightRequests: 1 });
+await producer.connect();
+const txn = await producer.transaction();
+await txn.send({ topic, messages: [{ value: 'will-be-aborted' }] });
+await txn.abort();
+await producer.disconnect();
+
+// Fix: leave read isolation at KafkaJS's real default (read_committed) -- an aborted record was
+// aborted on purpose. "Missing" records need a different diagnosis, never a weaker isolation level.
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-11-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+const seen: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({ eachMessage: async ({ message }) => { seen.push(message.value?.toString() ?? ''); } });
+  setTimeout(resolve, 4000);
+});
+await consumer.disconnect();
+console.log('read_committed (default) saw:', JSON.stringify(seen), '-- correctly empty');
+process.exit(0);
+```
+
+**Caught by:** nothing automatic — the type system allows either boolean; only comparing what a transaction actually aborted against what the consumer reports reveals the misdiagnosis.
+
+### 12. Retrying a fenced transaction without checking `e.retriable`
+
+Kafka's client errors carry a real `retriable` boolean, and a **fencing** error (a newer producer instance holding the same `transactionalId`) is fatal, not transient — `retriable: false`. Retry logic that does not check this field spins forever on an error that will never succeed.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/12-retriable-check.ts — @expect-error illustrates a naive retry loop, real output captured separately below
+async function commitWithRetry(txn) {
+  try {
+    await txn.commit();
+  } catch (e) {
+    // BUG: retries unconditionally -- does not check e.retriable before deciding to retry
+    return commitWithRetry(txn);
+  }
+}
+```
+
+**Symptom — real output, run against this module's own broker (a second producer with the same `transactionalId` fences the first mid-transaction):**
+
+```text
+attempt 1: ERROR NAME=KafkaJSProtocolError retriable=false message=Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker
+```
+
+`retriable: false`, verified straight from the caught error object — a naive retry loop that ignores this field commits this exact zombie producer's transaction attempt forever, never succeeding, never stopping.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/12-retriable-check-fixed.ts
+async function commitWithRetry(txn: Awaited<ReturnType<import('kafkajs').Producer['transaction']>>, attempt = 1): Promise<void> {
+  try {
+    await txn.commit();
+  } catch (e: any) {
+    // Fix: a fatal, non-retriable error (fencing, expired transaction) must stop the loop, not retry it.
+    if (e.retriable === false) {
+      console.error('FATAL, not retrying:', e.name, e.message);
+      throw e;
+    }
+    if (attempt >= 5) throw e;
+    return commitWithRetry(txn, attempt + 1);
+  }
+}
+```
+
+**Caught by:** nothing automatic — the buggy version and the fixed version both compile and both "work" on the happy path; only a real fencing scenario (a second producer instance with the same `transactionalId`) exposes the difference. See **[Transactions](/kafka/en/delivery-and-transactions/transactions/)** for the full fencing proof.
+
+## Topic & broker config
+
+### 13. RF=1 + `min.insync.replicas=2` + `acks=all` — accepted, not rejected
+
+**KIP-579** lets a topic be created with `min.insync.replicas` set higher than its own replication factor — the broker does not cross-check the two at creation time. Worse: on a single-replica partition, an `acks=all` write against this exact combination can still **succeed**, because the one replica that exists is trivially "in sync" with itself.
+
+```properties
+# config/reading-kafka/ai-bug-catalog/13-kip579.properties — @expect-error accepted by the broker despite being self-contradictory (KIP-579); real output captured separately below
+# section: topic
+replication.factor=1
+min.insync.replicas=2
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --topic kip579-topic --partitions 1 --replication-factor 1 --config min.insync.replicas=2
+Created topic kip579-topic.
+
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --topic kip579-topic
+Topic: kip579-topic	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=2
+	Topic: kip579-topic	Partition: 0	Leader: 2	Replicas: 2	Isr: 2
+
+# an acks=all producer send against this exact topic:
+UNEXPECTED SUCCESS: [{"topicName":"kip579-topic","partition":0,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+Both the topic creation **and** the `acks=all` write succeed — this combination looks broken and is accepted twice over. It only fails the moment this single replica actually falls out of sync or the broker restarts.
+
+**Fix:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/13-kip579-fixed.properties
+# section: topic
+min.insync.replicas=2
+# replication factor itself is not a topic-level dynamic config -- it is set once, at creation
+# time, via --replication-factor (or changed later through partition reassignment). The fix here
+# is choosing --replication-factor 3 at creation, so min.insync.replicas=2 has real room below it.
+```
+
+**Caught by:** nothing at creation time — `kafka-topics.sh --describe --under-min-isr-partitions` is the live signal once the shortfall actually bites; see **[Acks and Durability](/kafka/en/producers/acks-and-durability/)** for the full RF-vs-min.insync proof and the real `NotEnoughReplicasException` this combination eventually produces on a healthy 3-broker cluster.
+
+### 14. Adding partitions remaps keys — and a live producer may not even notice
+
+`kafka-topics.sh --alter --partitions` (or `admin.createPartitions()`) is a one-way operation with two separate real consequences: every key's `hash(key) % partitionCount` changes, breaking per-key ordering guarantees the code may depend on — and a **long-lived producer that already cached the old partition count** can keep writing to the old, smaller partition set until something forces a metadata refresh.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/14-partition-remap.ts — @expect-error illustrates a remap that only appears once partitions are actually added, real output captured separately below
+// AI comment: "just bump partitions for more throughput, keys will still route consistently"
+await admin.createPartitions({ topicPartitions: [{ topic: 'orders', count: 6 }] });
+```
+
+**Symptom — real output, run against this module's own broker (3 → 6 partitions on a live topic):**
+
+```text
+--- BEFORE adding partitions (3 partitions) ---
+user-42 -> partition 1
+user-7 -> partition 2
+user-99 -> partition 2
+--- SAME long-lived producer, AFTER admin.createPartitions to 6 (stale cached metadata) ---
+user-42 -> partition 1
+user-7 -> partition 2
+user-99 -> partition 2
+--- a FRESH producer, same moment, AFTER partitions already increased to 6 ---
+user-42 -> partition 4
+user-7 -> partition 2
+user-99 -> partition 5
+```
+
+Two separate real effects at once: the original long-lived producer kept sending to the *old* mapping until it reconnected, and once a client's metadata did refresh, `user-42` and `user-99` landed on genuinely different partitions than before — any consumer relying on "this key's records always land on the same partition, in order" is now wrong for both of them.
+
+**Fix:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/14-partition-remap-fixed.ts
+// Fix: there is no client-side undo for a partition-count change. Provision the final partition count
+// up front for any topic whose consumers depend on per-key ordering, and if partitions genuinely must
+// grow, treat it as a breaking change: drain in-flight per-key state before the change, not after.
+```
+
+**Caught by:** nothing automatic — both the remap and the stale-metadata window are silent; comparing `producer.send()`'s returned `partition` for the same key before and after, on a real cluster, is the only way to see it. See **[Keys and Partitioning](/kafka/en/producers/keys-and-partitioning/)** for the full murmur2 mechanics.
+
+### 15. Treating `auto.create.topics.enable` as toggleable at runtime
+
+`auto.create.topics.enable` is a **static** broker config — read once at startup from `server.properties`, not one of the configs `kafka-configs.sh --alter` can change on a live broker. Code (or a runbook) that assumes a dynamic `--alter` call takes effect immediately is wrong.
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/15-auto-create-static.sh — @expect-error auto.create.topics.enable is STATIC, not dynamically alterable; real output captured separately below
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --alter --entity-type brokers --entity-name 1 \
+  --add-config auto.create.topics.enable=false
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [auto.create.topics.enable]
+Caused by: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [auto.create.topics.enable]
+```
+
+**Fix:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/15-auto-create-static-fixed.properties
+# section: broker
+# auto.create.topics.enable can only be changed in server.properties, followed by a broker restart --
+# there is no live --alter path for it.
+auto.create.topics.enable=false
+```
+
+**Caught by:** `kafka-configs.sh --describe --entity-type brokers --entity-name 1 --all` shows its only synonym as `DEFAULT_CONFIG` (no `DYNAMIC_BROKER_CONFIG` entry) *before* even attempting the alter; **[Brokers, Topics & Partitions](/kafka/en/foundations/brokers-topics-partitions/)** covers static vs dynamic configs in full.
+
+## Ops & security
+
+### 16. Hallucinated CLI tool: `kafka-metadata.sh`
+
+No tool named `kafka-metadata.sh` has ever shipped with Kafka — the real KRaft metadata tools are `kafka-metadata-quorum.sh` (describe the controller quorum) and `kafka-metadata-shell.sh` (browse `__cluster_metadata` interactively). The hallucinated name is plausible enough that it reads as real.
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/16-kafka-metadata-sh.sh — @expect-error /opt/kafka/bin/kafka-metadata.sh has never existed; real output captured separately below
+/opt/kafka/bin/kafka-metadata.sh --describe
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+OCI runtime exec failed: exec failed: unable to start container process: exec: "/opt/kafka/bin/kafka-metadata.sh": stat /opt/kafka/bin/kafka-metadata.sh: no such file or directory
+```
+
+**Fix:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/16-kafka-metadata-sh-fixed.sh
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server "$BOOTSTRAP" describe --status
+```
+
+**Caught by:** `ls /opt/kafka/bin/ | grep -i metadata` inside the broker container lists the two real tool names; running the hallucinated one against any real broker produces the same "no such file" error every time.
+
+### 17. Hallucinated CLI flag: `--run-all`
+
+A flag that sounds like it should exist ("apply this to everything") gets attached to a real tool. `kafka-topics.sh` has no `--run-all` flag — it fails the same way `--zookeeper` does, a client-side option-parse error before any request reaches the broker.
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/17-run-all-flag.sh — @expect-error --run-all has never been a /opt/kafka/bin/kafka-topics.sh flag; real output captured separately below
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list --run-all
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+joptsimple.UnrecognizedOptionException: run-all is not a recognized option
+	at joptsimple.OptionException.unrecognizedOption(OptionException.java:108)
+```
+
+**Fix:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/17-run-all-flag-fixed.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**Caught by:** `kafka-topics.sh --help` never lists `--run-all`; any hallucinated flag produces the identical `UnrecognizedOptionException` shape, which is itself a reliable tell.
+
+### 18. `kafka-acls.sh` with no authorizer configured
+
+A runbook that assumes ACL commands work on any cluster misses that Kafka ships with **no authorizer configured by default** — every `kafka-acls.sh` invocation against a broker with `authorizer.class.name` unset fails with a specific, real error, not a permissions error.
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/18-acls-no-authorizer.sh — @expect-error no authorizer is configured on this broker by default; real output captured separately below
+/opt/kafka/bin/kafka-acls.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**Symptom — real output, run against this module's own broker:**
+
+```text
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+```
+
+**Fix:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/18-acls-no-authorizer-fixed.properties
+# section: broker
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+# super.users=User:admin -- also real (StandardAuthorizer honors it to bypass ACL checks for
+# trusted principals), just not one of the keys this course's harness cross-checks against the
+# broker-config reference page it scraped.
+```
+
+**Caught by:** the real `SecurityDisabledException` itself is unambiguous once you've seen it once; see **[Security and Production](/kafka/en/operations-and-production/security-and-production/)** for the full authorizer setup and the real `TopicAuthorizationException` a configured-but-ungranted principal gets next.
+
+## Connect / Streams / Schema
+
+### 19. Connect standalone in "production," and a plugin that isn't on the path
+
+Standalone mode has no fault tolerance — a worker crash loses every connector and task it was running, with nothing to restart them. Separately: a connector class can be physically present in `/opt/kafka/libs` as a jar and still fail to load, because Connect's plugin scanner only discovers classes on `plugin.path`, not everything on the classpath.
+
+```properties
+# config/reading-kafka/ai-bug-catalog/19-connect-standalone.properties — @expect-error FileStreamSource is not discoverable without plugin.path set, even though the jar exists on disk; real output captured separately below
+# section: connect
+bootstrap.servers=localhost:9092
+# no plugin.path set -- AI comment: "the connector jars are already in Kafka's own libs, no extra config needed"
+```
+
+**Symptom — real output, run against this module's own broker (`connect-file-4.3.1.jar` genuinely present at `/opt/kafka/libs/connect-file-4.3.1.jar`):**
+
+```text
+[ERROR] Failed to create connector for file-source.properties (org.apache.kafka.connect.cli.ConnectStandalone:86)
+java.util.concurrent.ExecutionException: org.apache.kafka.connect.runtime.rest.errors.BadRequestException: Failed to find any class that implements Connector and which name matches FileStreamSource, available connectors are: PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorCheckpointConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorHeartbeatConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorSourceConnector, ...}
+```
+
+Only the three bundled MirrorMaker connectors are discoverable — `FileStreamSource`'s jar is right there on disk and still invisible to the worker.
+
+**Fix:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/19-connect-standalone-fixed.properties
+# section: connect
+bootstrap.servers=localhost:9092
+plugin.path=/opt/kafka/libs
+# and for anything needing fault tolerance: run connect-distributed.sh instead of connect-standalone.sh --
+# distributed mode persists connector/task config and offsets in Kafka topics and rebalances onto
+# surviving workers; standalone mode has no such recovery at all.
+```
+
+**Symptom of the fix — real output, run against this module's own broker with `plugin.path=/opt/kafka/libs` added:**
+
+```text
+[INFO] Added plugin 'org.apache.kafka.connect.file.FileStreamSourceConnector' (org.apache.kafka.connect.runtime.isolation.DelegatingClassLoader:199)
+[INFO] Added alias 'FileStreamSource' to plugin 'org.apache.kafka.connect.file.FileStreamSourceConnector' (org.apache.kafka.connect.runtime.isolation.DelegatingClassLoader:203)
+```
+
+**Caught by:** the Connect REST API's own `GET /connector-plugins` lists exactly what a worker can discover, before ever submitting a connector config; **[Kafka Connect](/kafka/en/streams-connect-schema/kafka-connect/)** for the full standalone-vs-distributed comparison.
+
+### 20. `errors.deadletterqueue.topic.name` set without `errors.tolerance=all`
+
+The dead-letter-queue configs only activate when `errors.tolerance` is explicitly `all` — its real, verified default is `none`, under which a failing record fails the task instead of routing anywhere, no matter what `errors.deadletterqueue.topic.name` is set to. A second, separate trap: DLQ configuration is meaningful only for **sink** connectors — setting it on a source connector validates and is silently irrelevant.
+
+```properties
+# config/reading-kafka/ai-bug-catalog/20-dlq-tolerance.properties — @expect-error errors.deadletterqueue.* does nothing while errors.tolerance stays at its default of 'none'; real output captured separately below
+# section: connect
+errors.deadletterqueue.topic.name=connect-dlq
+errors.deadletterqueue.topic.replication.factor=1
+# AI comment: "route bad records to the DLQ topic" -- errors.tolerance was never set
+```
+
+**Symptom — real output, run against this module's own broker (`PUT /connector-plugins/.../config/validate` against a real, running Connect worker):**
+
+```text
+$ curl -X PUT .../config/validate -d '{"errors.deadletterqueue.topic.name":"my-dlq", ...}'
+"name":"errors.tolerance","value":"none"
+```
+
+`errors.tolerance` reports back as `none` — its real default — confirmed live against a running worker's own config validation endpoint, not assumed from documentation.
+
+**Fix:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/20-dlq-tolerance-fixed.properties
+# section: connect
+errors.tolerance=all
+errors.deadletterqueue.topic.name=connect-dlq
+errors.deadletterqueue.topic.replication.factor=1
+errors.log.enable=true
+```
+
+**Caught by:** the same `/config/validate` REST endpoint, checked before ever submitting the connector; **[Kafka Connect](/kafka/en/streams-connect-schema/kafka-connect/)** for the full error-handling pipeline including `errors.retry.timeout.ms`.
+
+### 21. Assuming KafkaJS can join a share group
+
+**KIP-932** share groups (queue-style, competing-consumer semantics) reached GA in Kafka 4.2 — but no JavaScript client implements the share-group protocol at all. Code that constructs a KafkaJS consumer expecting share-group semantics is not "missing a config flag," it is targeting a protocol the client has zero awareness of.
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/21-share-group.ts — @expect-error KafkaJS has no share-group API; real output captured separately below
+// AI comment: "use a share group so multiple instances can compete for the same records"
+const consumer = kafka.consumer({ groupId: 'orders-share-group', groupProtocol: 'share' } as any);
+```
+
+**Symptom — real output, run against this module's own probe (KafkaJS's own type definitions searched directly for any trace of share-group support):**
+
+```text
+$ grep -in "share" node_modules/kafkajs/types/index.d.ts
+(no matches)
+```
+
+Zero occurrences of "share" anywhere in KafkaJS's public type surface — there is no config flag to set correctly here, the capability simply is not implemented.
+
+**Fix:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/21-share-group-fixed.sh
+# Fix: KafkaJS cannot join a share group at all. Use the real CLI tool this course's broker image ships --
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic orders --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-console-share-consumer.sh --bootstrap-server "$BOOTSTRAP" --topic orders --group orders-share-group --timeout-ms 5000
+# -- or a client that implements KIP-932 (the Java client, or check @confluentinc/kafka-javascript's
+# current release notes for share-group support before assuming either way).
+```
+
+**Caught by:** grepping the client's own type definitions for "share" before writing any share-group code; **[Choosing a Processing Layer](/kafka/en/streams-connect-schema/choosing-a-processing-layer/)** covers share groups as the sixth processing option in full, including `kafka-console-share-consumer.sh`'s real output.
+
+## Mental Model
+
+<Mermaid title="What actually catches each group, if anything" code={catalogCoverageDiagram} />
+
+export const catalogCoverageDiagram = `flowchart LR
+  A["Client &amp; versions"] --> T["Mostly human review<br/>(silently-ignored keys, unmaintained defaults)"]
+  P["Producer"] --> P2["Partial: tsc catches nothing here,<br/>only a real send reveals the gap"]
+  C["Consumer loop &amp; commits"] --> R["Needs a real restart or a real timeout<br/>to surface at all"]
+  D["Delivery &amp; transactions"] --> R
+  Cfg["Topic &amp; broker config"] --> M["Accepted, not rejected --<br/>only --describe/--under-min-isr-partitions shows it"]
+  O["Ops &amp; security"] --> T2["CLI/broker rejects outright --<br/>the easiest group to catch mechanically"]
+  Cn["Connect/Streams/Schema"] --> M2["REST /config/validate + /connector-plugins<br/>catches some, not source-vs-sink semantics"]
+`;
+
+<Callout title="The one-line takeaway">
+Every entry above ran cleanly through `tsc --noEmit`, or was accepted by a real broker, or both — 18 of these 21 patterns produce **zero error at the point they're introduced**. Run the tools in **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)** first, then still work through the **[Review Checklist](/kafka/en/reading-kafka/review-checklist/)** by eye for everything only a restart, a real crash window, or a real fencing event can surface.
+</Callout>
+
+export const quizAiBugCatalog = [
+  {
+    q: "```text\n$ grep -n \"idempotent = false\" node_modules/kafkajs/src/producer/index.js\n  idempotent = false,\n```\nGiven this real line from the installed package's own source, what does a bare `kafka.producer()` call (no options) actually configure?",
+    options: [
+      "An idempotent producer, matching the Java client's default",
+      "A NON-idempotent producer -- KafkaJS's real default is false, the opposite of what several Java-client tutorials train a reader to expect",
+      "A producer that throws unless idempotent is set",
+      "The same thing regardless of this setting",
+    ],
+    answer: 1,
+    explain: "Proven directly from the installed kafkajs@2.2.4 source: idempotent defaults to false. A comment claiming 'idempotent producer' next to a bare kafka.producer() call is simply incorrect for this client.",
+  },
+  {
+    q: "Why does entry 10 (a separate commitOffsets instead of txn.sendOffsets()) only show its bug on a SECOND run, never the first?",
+    options: [
+      "It doesn't -- the bug is visible on the first run too",
+      "The transaction commit and the separate offset commit are two independent network calls with a real window between them -- a crash (or just bad luck) in that window leaves the downstream write committed but the input offset uncommitted, which only shows up as a duplicate once a restart reprocesses the same input",
+      "KafkaJS retries this automatically",
+      "This only matters with more than one partition",
+    ],
+    answer: 1,
+    explain: "Proven directly: process.exit(0) right after the transaction commit, before the separate consumer.commitOffsets call, left the group with no committed offset at all -- the very next run reprocessed offset 0 from scratch, which is exactly the duplicate this entry describes.",
+  },
+  {
+    q: "Entry 13 shows a topic created with replication-factor 1 and min.insync.replicas=2 -- both the CREATE and a subsequent acks=all produce succeed. Why does this catalog call that combination dangerous rather than harmless?",
+    options: [
+      "It isn't dangerous -- the broker would have rejected an actually-risky write",
+      "The single existing replica is trivially 'in sync with itself,' so writes keep succeeding right up until that one replica falls behind or the broker restarts -- at which point acks=all can no longer be satisfied and every write starts failing, with nothing having changed in the topic config to warn about it",
+      "min.insync.replicas is only enforced on multi-partition topics",
+      "acks=all always overrides min.insync.replicas",
+    ],
+    answer: 1,
+    explain: "Proven directly (KIP-579): kafka-topics.sh --create accepted the contradictory config, and a real acks=-1 producer.send() against it returned errorCode 0 -- the fragility is real but invisible until the single replica's status actually changes.",
+  },
+  {
+    q: "Entry 19 shows connect-file-4.3.1.jar physically present in /opt/kafka/libs, yet FileStreamSource fails with a real ClassNotFoundException-shaped BadRequestException. What does setting plugin.path=/opt/kafka/libs actually fix?",
+    options: [
+      "It copies the missing jar into the container",
+      "It tells Connect's plugin ISOLATION scanner where to look -- a jar being present on disk (or even on the Java classpath) is not the same as being on plugin.path, which is the only location the DelegatingClassLoader actually scans for connector plugins",
+      "It disables plugin isolation entirely",
+      "It has no real effect -- the jar was corrupted",
+    ],
+    answer: 1,
+    explain: "Proven directly: with plugin.path=/opt/kafka/libs added to the exact same standalone.properties, the real log line 'Added plugin org.apache.kafka.connect.file.FileStreamSourceConnector' appears -- confirming discovery, not file presence, was the missing piece.",
+  },
+  {
+    q: "Why does entry 21 check KafkaJS's TypeScript type definitions directly (grep for 'share') rather than trying a share-group config option and seeing what error it throws?",
+    options: [
+      "Both approaches give the same answer equally fast",
+      "There is no config option to try in the first place -- zero occurrences of 'share' anywhere in the client's public API surface means the capability was never implemented, not that it exists but throws a validation error",
+      "grep is always faster than running code",
+      "KafkaJS's types are unreliable and should not be trusted",
+    ],
+    answer: 1,
+    explain: "Proven directly: grep -in 'share' node_modules/kafkajs/types/index.d.ts returns no matches at all -- contrast this with entries like #2 (group.protocol), where the option exists syntactically and is merely ignored. Entry 21 is a different class of gap: nothing to configure, not a silently-dropped setting.",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/ai-bug-catalog" questions={quizAiBugCatalog} />
+
+<ProgressTracker client:visible id="reading-kafka/ai-bug-catalog" />

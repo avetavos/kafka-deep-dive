@@ -1,0 +1,1080 @@
+---
+title: AI bug catalog
+description: '21 bug ที่โค้ด Kafka ที่ AI สร้างทำซ้ำ ๆ — โค้ดที่ AI มักเขียน ทำไมมันผิด output จริงที่จับใหม่สด ๆ กับ broker Kafka 4.3.1 จริงสำหรับโมดูลนี้ และวิธีแก้'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+ทุก snippet ด้านล่างเขียนขึ้นให้ดูเหมือนโค้ดที่ AI assistant สร้างจริง ๆ เป๊ะ — KafkaJS ที่คล่องปาก, `.properties` ที่ดูสมเหตุสมผล, shell command ที่ดูจริง — แล้วรันจริง: กับ Kafka 4.3.1 KRaft cluster สามตัวที่ตั้งขึ้นใหม่เฉพาะสำหรับโมดูลนี้ (`kafka-reading-a`, พอร์ต 39092–39094, ปิดลงหลังจับหลักฐานเหล่านี้เสร็จ) หรือกับ harness broker ที่คอร์สนี้ใช้ร่วมกัน ในกรณีที่ fence ของ fix ถูก mark ด้วย `// @run` output ที่ยกมาด้านล่างคัดลอกตรงจากการรันเหล่านั้น ไม่ได้สร้างขึ้นจากความจำหรือยกมาจากบทก่อนหน้า — แม้ตอนที่ fact หนึ่งถูกยืนยันไว้แล้วใน Phase 3 มันก็ถูกพิสูจน์ใหม่ตรงนี้ สด ๆ บน broker ของโมดูลนี้เอง จัดกลุ่มแบบเดียวกับ **[How to read Kafka code you did not write](/kafka/th/reading-kafka/)** และ **[Review Checklist](/kafka/th/reading-kafka/review-checklist/)** ที่ตามบทนี้มา
+
+## Client & versions
+
+### 1. `--zookeeper` บน CLI tool
+
+training data ของ AI ครอบคลุม tutorial Kafka สิบปี และ tool `kafka-*.sh` ทุกตัวเคยรับ flag `--zookeeper` ZooKeeper ถูกถอดออกเต็ม ๆ ใน **Kafka 4.0** — ทุก tool ตอนนี้รับแค่ `--bootstrap-server` และ flag เก่าไม่ได้ถูกเมินเงียบ ๆ มันเป็น parse error จริง
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/01-zookeeper-flag.sh — @expect-error --zookeeper was removed in Kafka 4.0, every tool now requires --bootstrap-server
+/opt/kafka/bin/kafka-topics.sh --zookeeper localhost:2181 --list
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+joptsimple.UnrecognizedOptionException: zookeeper is not a recognized option
+	at joptsimple.OptionException.unrecognizedOption(OptionException.java:108)
+	at joptsimple.OptionParser.handleLongOptionToken(OptionParser.java:510)
+	at joptsimple.OptionParserState$2.handleArgument(OptionParserState.java:56)
+	at joptsimple.OptionParser.parse(OptionParser.java:396)
+	at org.apache.kafka.tools.TopicCommand$TopicCommandOptions.<init>(TopicCommand.java:795)
+```
+
+**วิธีแก้:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/01-zookeeper-flag-fixed.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**จับได้ด้วย:** รัน command เดียวกันนี้กับ broker Kafka 4.x จริงตัวไหนก็ได้ — นี่คือ parse error ฝั่ง client ของ `joptsimple` ไม่ใช่อะไรที่ `tsc` หรือ properties-key check จะเห็นได้; `kafka-topics.sh --help` เองก็ไม่แสดง `--zookeeper` เลยแล้ว
+
+### 2. `group.protocol=consumer` ที่ก็อปเข้า KafkaJS config
+
+protocol rebalance ตัวใหม่ของ **KIP-848** (`group.protocol=consumer`) เป็นของจริง current และ GA แล้ว — แต่มันเป็น setting ของ Java client training data ของ AI ผสม Java กับ KafkaJS ตัวอย่างปนกันอย่างอิสระ และชื่อ property นี้ถูกก็อปเข้า KafkaJS consumer constructor ที่ไม่รู้จัก option นี้เลย — object literal ของ JavaScript ไม่ปฏิเสธ key ที่ไม่รู้จัก เลยไม่มีอะไรปฏิเสธมันเหมือนกัน
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/02-group-protocol.ts — @expect-error 'group.protocol' is a Java-client (KIP-848) setting; KafkaJS has no such option and silently ignores it
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({
+  groupId: 'orders-group',
+  'group.protocol': 'consumer', // AI comment: "opt in to the new KIP-848 rebalance protocol"
+} as any);
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (describe group ต่อทันที):**
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type classic
+quick-batch-group-2              Classic
+```
+
+consumer connect, subscribe, และ consume ได้ปกติสมบูรณ์ — และ group ยังถูกรายงานเป็น `Classic` ไม่ใช่ `Consumer` ไม่มี error ไม่มี warning ไม่มีการเปลี่ยน protocol: property นี้ถูกทิ้งไปเงียบ ๆ
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/02-group-protocol-fixed.ts
+import { Kafka } from 'kafkajs';
+
+// KafkaJS has no KIP-848 support at all -- do not pass a Java-only key hoping it does something.
+// To actually use the new consumer rebalance protocol, switch clients:
+//   import { KafkaJS } from '@confluentinc/kafka-javascript';
+//   const consumer = new KafkaJS.Kafka({}).consumer({ 'group.protocol': 'consumer', groupId: 'orders-group' });
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — นี่คือเหตุผลตรง ๆ ที่ลำดับการอ่านในบทก่อนเริ่มด้วย "client ไหน version ไหน": คนรีวิวโค้ดต้องรู้ว่า KafkaJS ไม่เคย implement KIP-848 เลย จึงจะรู้ว่า key นี้ไม่ทำอะไร; `kafka-consumer-groups.sh --list --type classic` เทียบกับ `--type consumer` เป็นวิธีเดียวที่ยืนยันได้ว่า group เข้าร่วม protocol ไหนจริง ๆ
+
+### 3. คว้า `kafkajs` มาใช้โดยไม่เช็คว่ามันยังเป็นอะไรอยู่
+
+`kafkajs` ยังเป็น client ที่ tutorial, blog post, และ AI completion ส่วนใหญ่คว้ามาใช้เป็น default — มันก็ **ไม่มีคนดูแลตั้งแต่ 2023-02-27** ด้วย (ยืนยันผ่าน `npm view kafkajs time.modified`) มีให้ในตัวแค่ compression codec เดียว และ partition assigner เดียว
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/03-client-choice.ts — @expect-error illustrates an unverified assumption, not a runtime failure
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+// AI comment: "kafkajs is the standard Node client for Kafka, actively maintained"
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+const producer = kafka.producer({ createPartitioner: undefined }); // "uses Kafka's default sticky assignment"
+```
+
+**อาการ — output จริง จาก source ของ `node_modules/kafkajs` บน probe ของโมดูลนี้เอง อ่านตรง ๆ:**
+
+```text
+$ grep -n "GZIP:\|Snappy:\|LZ4:\|ZSTD:" node_modules/kafkajs/src/protocol/message/compression/index.js
+  GZIP: 1,
+  Snappy: 2,
+  LZ4: 3,
+  ZSTD: 4,
+$ grep -n "throw new KafkaJSNotImplemented" node_modules/kafkajs/src/protocol/message/compression/index.js
+    throw new KafkaJSNotImplemented('Snappy compression not implemented')
+    throw new KafkaJSNotImplemented('LZ4 compression not implemented')
+    throw new KafkaJSNotImplemented('ZSTD compression not implemented')
+$ ls node_modules/kafkajs/src/consumer/assigners/
+index.js  roundRobinAssigner
+```
+
+มีแค่ `GZIP` ที่มี codec จริง ส่วนอีกสามตัวเป็น stub ที่ throw มีแค่ `roundRobinAssigner` เท่านั้นที่มาให้ — ไม่มี assigner แบบ "sticky" ใน KafkaJS เลย ทั้งที่มันเป็น default สมัยใหม่ของ Java client
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/03-client-choice-fixed.ts
+// Pick deliberately, and say so in a comment for the next reader:
+//   kafkajs      -- unmaintained since 2023-02-27, GZIP-only compression, RoundRobin-only assignment,
+//                    no KIP-848/932 support -- fine for most services, but a conscious choice, not a default.
+//   @confluentinc/kafka-javascript -- actively maintained, librdkafka-backed, all four compression
+//                    codecs, KIP-848 group.protocol=consumer GA -- prefer this for anything new.
+import { Kafka } from 'kafkajs'; // kept deliberately: this course's fences mostly use it, see the Callout below
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+```
+
+<Callout title="KafkaJS ไม่มีคนดูแลแล้ว">
+`kafkajs` ไม่มี release เลยตั้งแต่ **2023-02-27** (ยืนยันผ่าน `npm view kafkajs time.modified`) มันยังรันได้ดีกับ Kafka 4.3.1 และ fence ส่วนใหญ่ของคอร์สนี้ใช้มัน เพราะมันยังเป็น Node client ที่ deploy กันแพร่หลายที่สุด — แต่มอง default ทุกตัวที่มันมีให้เป็นตัวเลือกที่ควรเช็คซ้ำ ไม่ใช่ baseline สมัยใหม่ ดู **[The Producer API](/kafka/th/producers/producer-api/)** สำหรับการเทียบ client เต็มรูปแบบ
+</Callout>
+
+**จับได้ด้วย:** `npm view kafkajs time.modified`, อ่าน source ของ package ที่ install ไว้ตรง ๆ (ไม่ต้องใช้ network) และรายการ KafkaJS ใน **[Glossary](/kafka/th/glossary/)**
+
+## Producer
+
+### 4. ลืม `idempotent: true`
+
+idempotent producer ของ KafkaJS มี default เป็น **ปิด** — ตรงข้ามกับที่ tutorial Java client หลายอันฝึกให้ผู้อ่านคาดหวัง producer ที่สร้างโดยไม่มีมันจะ retry ภายใต้ `acks=all` โดยไม่มีการป้องกัน request ที่ retry สร้าง duplicate บน broker เลย
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/04-idempotent-default.ts — @expect-error illustrates a missing safety default, not a runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+// AI comment: "idempotent producer for payments"
+const producer = kafka.producer(); // idempotent defaults to false -- this is NOT an idempotent producer
+```
+
+**อาการ — output จริง อ่าน source ของ `node_modules/kafkajs` ตรง ๆ บน probe ของโมดูลนี้เอง:**
+
+```text
+$ grep -n "idempotent = false" node_modules/kafkajs/src/producer/index.js
+  idempotent = false,
+$ grep -n "acks = -1" node_modules/kafkajs/src/producer/messageProducer.js
+  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages = [] }) => {
+```
+
+`idempotent` มี default เป็น `false` จริง ๆ ใน package ที่ install ไว้ (`kafkajs@2.2.4`) — comment ที่อ้างว่า "idempotent producer" ข้าง ๆ การเรียก `kafka.producer()` เปล่า ๆ ผิดตรง ๆ ยืนยันจาก source ที่โค้ด import มาใช้จริง
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/04-idempotent-default-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-04-idempotent`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-04', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1 }); // explicit, matches acks=all
+await producer.connect();
+const [r] = await producer.send({ topic, acks: -1, messages: [{ value: 'safe-to-retry' }] });
+console.log('idempotent send OK, partition', r.partition, 'errorCode', r.errorCode);
+await producer.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** อ่าน `node_modules/kafkajs/src/producer/index.js` ตรง ๆ (ไม่มี test ตัวไหนจับ option ที่หายไปได้ ถ้ามันไม่มีผลที่สังเกตได้บน happy-path send); `tsc --noEmit` ของ harness ยืนยันว่า fix compile ผ่าน `--run` ยืนยันว่ามัน send ได้จริง
+
+### 5. สมมติว่า compression LZ4/Snappy/ZSTD มีให้ในตัว
+
+comment tuning performance ที่ยกมาจากคำแนะนำของ Java client ("ใช้ `lz4` สิ มันคือ codec general-purpose ที่ดีที่สุด") ถูกเอาไปใช้ตรง ๆ กับ KafkaJS producer — ที่ไม่มี codec นั้นให้ในตัว
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/05-compression.ts — @expect-error KafkaJS ships only GZIP natively; ZSTD/LZ4/Snappy throw KafkaJSNotImplemented
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'events', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+await producer.connect();
+// AI comment: "zstd gives the best compression ratio for JSON payloads"
+await producer.send({ topic: 'events', compression: CompressionTypes.ZSTD, messages: [{ value: 'zstd-body' }] });
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+KafkaJSNotImplemented: ZSTD compression not implemented
+```
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/05-compression-fixed.ts
+// @run
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-05-compression`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-05', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+// GZIP is the only codec KafkaJS registers a real implementation for.
+const [r] = await producer.send({ topic, compression: CompressionTypes.GZIP, messages: [{ value: 'gzip-body' }] });
+console.log('gzip send OK, partition', r.partition, 'errorCode', r.errorCode);
+await producer.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** การรัน send จริง (type-check ผ่านเฉย ๆ — `CompressionTypes.ZSTD` เป็น enum member ที่ valid ความล้มเหลวเกิดที่ runtime อย่างเดียว); `node_modules/kafkajs/src/protocol/message/compression/index.js` สำหรับเหตุผลที่แท้จริง
+
+### 6. Transactional producer แต่เรียก `.send()` ตรง ๆ
+
+การสร้าง producer พร้อมตั้ง `transactionalId` เตรียมมันไว้สำหรับ transaction — แต่การเรียก `.send()` ตรง ๆ แทนการห่อ write ด้วย `.transaction()` ไม่ error มันจะ send แบบ ordinary, non-transactional, non-idempotent write ทุก write บน producer instance นั้นที่ข้าม `.transaction()` จะหลุดออกจากเรื่อง exactly-once ที่ `transactionalId` สื่อไว้ไปเงียบ ๆ
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/06-txn-bypass.ts — @expect-error illustrates a silent semantic gap, not a runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments', brokers: ['localhost:9092'] });
+// AI comment: "transactional producer for the payments pipeline"
+const producer = kafka.producer({ transactionalId: 'payments-tx-1' });
+await producer.connect();
+// AI forgot to call producer.transaction() -- this bypasses the transaction entirely
+await producer.send({ topic: 'accounts', messages: [{ value: 'debit' }] });
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+direct send result: [{"topicName":"txn-guard-topic","partition":0,"errorCode":0,"baseOffset":"0","logAppendTime":"-1","logStartOffset":"0"}]
+```
+
+ไม่มี error เลย — `errorCode: 0` record อยู่บน topic แล้ว อยู่นอก transaction ไหนเลย ทั้งที่ producer ถูกสร้างพร้อม `transactionalId`
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/06-txn-bypass-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-06-txn`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-06', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ transactionalId: 'ai-bug-catalog-06-tx', idempotent: true, maxInFlightRequests: 1 });
+await producer.connect();
+const txn = await producer.transaction(); // every write MUST go through this object
+await txn.send({ topic, messages: [{ value: 'debit-inside-transaction' }] });
+await txn.commit();
+console.log('write went through the transaction, not producer.send() directly');
+await producer.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — `producer.send()` กับ `txn.send()` มีหน้าตาเหมือนกันและสำเร็จทั้งคู่ คนรีวิวต้องสังเกตว่า producer ที่สร้างด้วย `transactionalId` ไม่เคยเรียก `.transaction()` เลยแม้แต่ครั้งเดียวในไฟล์
+
+## Consumer loop & commits
+
+### 7. handler ที่ช้าไปบล็อก heartbeat
+
+heartbeat ของ KafkaJS ถูกขับเคลื่อนจาก loop เดียวกับ `eachMessage` — มันยิง **หลัง** promise ของ handler resolve แล้ว ไม่ใช่บน timer แยก handler ที่ทำ HTTP call ช้า หรือ DB write ที่ไม่มีขอบเขต อาจรันเลย `session.timeout.ms` ไปได้โดยไม่ส่ง heartbeat เลย แล้ว group coordinator จะ evict member นั้นกลางการประมวลผล
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/07-heartbeat-block.ts — @expect-error illustrates a timing bug that needs session.timeout.ms to actually elapse, not a compile/runtime failure
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group', sessionTimeout: 6000 });
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    // AI comment: "call the fraud-check service before accepting the order"
+    await fetch('https://fraud-check.internal/verify', { method: 'POST', body: message.value }); // no timeout -- can hang far past sessionTimeout
+  },
+});
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (handler ถูกแทนด้วย sleep 15 วินาที, `sessionTimeout: 6000`):**
+
+```text
+handling offset 0 -- sleeping 15s (heartbeat only fires AFTER eachMessage returns)
+handler for offset 0 finished
+handling offset 1 -- sleeping 15s (heartbeat only fires AFTER eachMessage returns)
+{"level":"ERROR","message":"[Connection] Response Heartbeat(key: 12, version: 3)","error":"The coordinator is not aware of this member"}
+{"level":"ERROR","message":"[Runner] The coordinator is not aware of this member, re-joining the group","error":"The coordinator is not aware of this member"}
+```
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/07-heartbeat-block-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-07-heartbeat`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-07', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'order-1' }] });
+await producer.disconnect();
+
+// Fix: keep eachMessage itself fast. Hand slow work to a bounded, timed-out call (or a queue), never an
+// unbounded await inside the handler that KafkaJS's heartbeat is waiting behind.
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-07-group', sessionTimeout: 30000 });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    eachMessage: async ({ message }) => {
+      console.log('fast handler, offset', message.offset, 'value', message.value?.toString());
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** ต้องเป็นการรันจริงที่จับเวลาเท่านั้น — `tsc` กับการทดสอบเร็ว ๆ ครั้งเดียวผ่านทั้งคู่; eviction จะโผล่มาแค่ตอน handler รันนานเกิน `session.timeout.ms` จริง ๆ **[Consumer API](/kafka/th/consumers/consumer-api/)** ครอบคลุม heartbeat/`session.timeout.ms` เต็มรูปแบบ
+
+### 8. `commitOffsets` ผิดไปหนึ่ง offset
+
+manual commit ที่ส่ง offset **ที่อ่านมาเมื่อกี้** แทนที่จะเป็น `offset + 1` (ตำแหน่งที่จะ *resume ต่อ*) ไม่ error — commit ของ Kafka เป็นแค่ integer pointer เปล่า ๆ ค่าไหนก็ถูกรับหมด ผลลัพธ์จะโผล่มาแค่ตอนรันครั้งต่อไป: record ที่ประมวลผลสำเร็จตัวสุดท้ายจะถูกประมวลผลซ้ำ ตลอดไป หนึ่ง message ต่อการ restart หนึ่งครั้ง
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/08-off-by-one.ts — @expect-error illustrates a bug that only surfaces across a restart, not within a single run
+consumer.run({
+  autoCommit: false,
+  eachMessage: async ({ topic, partition, message }) => {
+    await process(message);
+    // AI-written bug: commits the offset it just READ, not offset + 1 (the position to RESUME from)
+    await consumer.commitOffsets([{ topic, partition, offset: message.offset }]);
+  },
+});
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (produce message 3 ตัวครั้งเดียว consume ด้วย commit ที่ผิด แล้ว restart consumer อีกสองครั้ง):**
+
+```text
+[run-1-first-pass] processed offset 0 value msg-0
+[run-1-first-pass] processed offset 1 value msg-1
+[run-1-first-pass] processed offset 2 value msg-2
+[run-2-after-restart] processed offset 2 value msg-2
+[run-2-after-restart] total processed: 1 offsets: 2
+
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group off-by-one-group-3
+GROUP              TOPIC              PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+off-by-one-group-3 off-by-one-topic-3 0          2               3               1
+```
+
+`msg-2` (offset 2) ถูกประมวลผลซ้ำทุกครั้งที่ restart — `CURRENT-OFFSET` ค้างอยู่หลัง `LOG-END-OFFSET` หนึ่งตำแหน่งตลอดไป
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/08-off-by-one-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-08-offbyone`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-08', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'only-message' }] });
+await producer.disconnect();
+
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-08-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      console.log('processed offset', message.offset);
+      // Fix: commit offset + 1 -- the position the NEXT fetch should resume from.
+      await consumer.commitOffsets([{ topic: t, partition, offset: String(Number(message.offset) + 1) }]);
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** ต้องรันครั้งที่สองกับ group เดียวกันเท่านั้น — `kafka-consumer-groups.sh --describe --group <g>` เทียบ `CURRENT-OFFSET` กับ `LOG-END-OFFSET` เป็นสัญญาณสดที่เร็วที่สุด ดู **[Offsets and Commits](/kafka/th/consumers/offsets-and-commits/)**
+
+### 9. route ไป DLQ โดยไม่ commit offset ต้นฉบับ
+
+การ route record ที่เสียไป dead-letter topic แล้ว loop ต่อไป *ดูเหมือน* จัดการแล้ว — แต่ถ้าโค้ดไม่เคย commit offset ของ message ต้นฉบับหลังจากที่ DLQ write สำเร็จ ตำแหน่งของ consumer จะไม่เคยขยับผ่าน record นั้นเลย พอ restart record ตัวเดิมจะถูกอ่านซ้ำ route ไป DLQ ซ้ำ ตลอดไป
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/09-dlq-loop.ts — @expect-error illustrates a permanent loop that only appears across a restart
+eachMessage: async ({ message }) => {
+  try {
+    JSON.parse(message.value!.toString());
+  } catch {
+    await dlqProducer.send({ topic: 'orders.DLQ', messages: [{ value: message.value }] });
+    // BUG: no commitOffsets call here -- the original offset is never advanced.
+  }
+},
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (record เสียถาวรหนึ่งตัว, consumer restart แยกกันสามครั้งกับ group เดียวกัน):**
+
+```text
+[run-1] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-1] total eachMessage calls: 1
+[run-2-after-restart] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-2-after-restart] total eachMessage calls: 1
+[run-3-after-another-restart] attempt 1: bad record at offset 0 -> routed to DLQ, offset NOT committed
+[run-3-after-another-restart] total eachMessage calls: 1
+```
+
+offset 0 ถูก route ไป DLQ ซ้ำอีกทุกครั้งที่ restart — loop ถาวรจริง ไม่ใช่แค่สมมติฐาน
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/09-dlq-loop-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-09-dlq`;
+const dlq = `${prefix}ai-bug-catalog-09-dlq.DLQ`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-09', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }, { topic: dlq, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic, messages: [{ value: 'not-json{{{' }] });
+await producer.disconnect();
+
+const dlqProducer = kafka.producer();
+await dlqProducer.connect();
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-09-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic: t, partition, message }) => {
+      try {
+        JSON.parse(message.value!.toString());
+      } catch {
+        await dlqProducer.send({ topic: dlq, messages: [{ value: message.value }] });
+        // Fix: commit the ORIGINAL offset once the DLQ write succeeds -- the record is handled, move on.
+        await consumer.commitOffsets([{ topic: t, partition, offset: String(Number(message.offset) + 1) }]);
+      }
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await dlqProducer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** ต้อง restart ครั้งที่สองกับ group และ topic เดียวกันเท่านั้น — ดูรายการ off-by-one ข้างบนสำหรับกลไก commit เดียวกัน; **[Error Handling & Retries](/kafka/th/consumers/error-handling-retries/)** สำหรับ pattern DLQ เต็มรูปแบบ
+
+## Delivery & transactions
+
+### 10. `commitOffsets` แยก แทน `txn.sendOffsets()`
+
+loop consume-transform-produce ที่ commit downstream write **ภายใน** transaction แต่ commit **consumer offset แยกต่างหาก** นอก transaction ทำลาย exactly-once ตั้งแต่โครงสร้าง — crash ระหว่างสอง commit นั้นจะเขียน downstream ซ้ำในการรันครั้งต่อไป เพราะ input offset ไม่เคยขยับ
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/10-separate-commit.ts — @expect-error illustrates a crash-window bug, real output captured separately below
+const txn = await producer.transaction();
+await txn.send({ topic: 'orders.enriched', messages: [{ value: enriched }] });
+await txn.commit();
+// BUG: this should be txn.sendOffsets({ consumerGroupId, topics: [...] }) INSIDE the same transaction.
+await consumer.commitOffsets([{ topic, partition, offset: nextOffset }]);
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (process.exit(0) ทันทีหลัง transaction commit ก่อนที่ consumer commit แยกจะรัน):**
+
+```text
+consume-transform-produce for offset 0
+transaction committed (output written); crashing before the separate consumer.commitOffsets call
+
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group sos-group
+Consumer group 'sos-group' has no active members.
+```
+
+ไม่มี offset ที่ commit เลยสำหรับ group นี้ — พอ restart จะประมวลผล offset 0 ใหม่ตั้งแต่ต้น:
+
+```text
+reprocessed offset 0 value order-1
+total reprocessed on restart: 1
+```
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/10-separate-commit-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const inTopic = `${prefix}ai-bug-catalog-10-in`;
+const outTopic = `${prefix}ai-bug-catalog-10-out`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-10', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic: inTopic, numPartitions: 1, replicationFactor: 1 }, { topic: outTopic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+const seed = kafka.producer();
+await seed.connect();
+await seed.send({ topic: inTopic, messages: [{ value: 'order-1' }] });
+await seed.disconnect();
+
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-10-group' });
+await consumer.connect();
+await consumer.subscribe({ topic: inTopic, fromBeginning: true });
+const txnProducer = kafka.producer({ transactionalId: 'ai-bug-catalog-10-tx', idempotent: true, maxInFlightRequests: 1 });
+await txnProducer.connect();
+
+await new Promise<void>((resolve) => {
+  consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic, partition, message }) => {
+      const txn = await txnProducer.transaction();
+      await txn.send({ topic: outTopic, messages: [{ value: `processed:${message.value}` }] });
+      // Fix: the offset commit happens INSIDE the same transaction as the produce -- atomic, no crash window.
+      await txn.sendOffsets({
+        consumerGroupId: 'ai-bug-catalog-10-group',
+        topics: [{ topic, partitions: [{ partition, offset: String(Number(message.offset) + 1) }] }],
+      });
+      await txn.commit();
+      console.log('offset commit and downstream write committed together, atomically');
+      resolve();
+    },
+  });
+});
+await consumer.disconnect();
+await txnProducer.disconnect();
+await admin.disconnect();
+process.exit(0);
+```
+
+**จับได้ด้วย:** ต้องจำลอง crash-window จริงเท่านั้น เหมือนหลักฐานข้างบน — ไม่มี static check ตัวไหนเห็นสิ่งนี้; **[Exactly-Once Processing](/kafka/th/delivery-and-transactions/exactly-once-processing/)** และ **[Transactions](/kafka/th/delivery-and-transactions/transactions/)** สำหรับกลไกเต็มรูปแบบ
+
+### 11. "แก้" `readUncommitted` เป็น `true`
+
+consumer ที่ดูเหมือน "หาย" record ไป — record ที่จริง ๆ ถูก abort ไปตั้งใจอยู่ภายใน transaction — ถูก "แก้" ด้วยการสลับ `readUncommitted` เป็น `true` default จริงของ KafkaJS คือ `false` (`read_committed`) อยู่แล้ว การตั้งเป็น `true` ไม่ได้กู้ record ที่หายกลับมา มันแค่เผย record ที่ไม่เคยตั้งใจให้เห็นเท่านั้น
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/11-read-uncommitted.ts — @expect-error illustrates a misdiagnosed "fix", real output captured separately below
+// AI comment: "consumer seems to be missing some records, disabling read isolation to see everything"
+const consumer = kafka.consumer({ groupId: 'audit-group', readUncommitted: true } as any);
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (เขียน record หนึ่งตัวแล้ว abort ภายใน transaction จริง):**
+
+```text
+[default (read_committed)] readUncommitted=false -> saw: []
+[AI "fix"] readUncommitted=true -> saw: ["will-be-aborted"]
+```
+
+default ซ่อน record ที่ถูก abort ได้ถูกต้อง "การแก้" ทำให้มันเห็นได้ — record ที่ผู้เขียนตัดสินใจชัดเจนแล้วว่าไม่เคยเกิดขึ้น
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/11-read-uncommitted-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}ai-bug-catalog-11-readuncommitted`;
+
+const kafka = new Kafka({ clientId: 'ai-bug-catalog-11', brokers });
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] }).catch(() => {});
+await admin.disconnect();
+
+const producer = kafka.producer({ transactionalId: 'ai-bug-catalog-11-tx', idempotent: true, maxInFlightRequests: 1 });
+await producer.connect();
+const txn = await producer.transaction();
+await txn.send({ topic, messages: [{ value: 'will-be-aborted' }] });
+await txn.abort();
+await producer.disconnect();
+
+// Fix: leave read isolation at KafkaJS's real default (read_committed) -- an aborted record was
+// aborted on purpose. "Missing" records need a different diagnosis, never a weaker isolation level.
+const consumer = kafka.consumer({ groupId: 'ai-bug-catalog-11-group' });
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+const seen: string[] = [];
+await new Promise<void>((resolve) => {
+  consumer.run({ eachMessage: async ({ message }) => { seen.push(message.value?.toString() ?? ''); } });
+  setTimeout(resolve, 4000);
+});
+await consumer.disconnect();
+console.log('read_committed (default) saw:', JSON.stringify(seen), '-- correctly empty');
+process.exit(0);
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — type system ยอมรับ boolean ทั้งสองค่า มีแค่การเทียบว่า transaction จริง ๆ abort อะไรไปกับสิ่งที่ consumer รายงานเท่านั้นที่เผย misdiagnosis นี้ได้
+
+### 12. retry transaction ที่ fence แล้วโดยไม่เช็ค `e.retriable`
+
+error ของ client ฝั่ง Kafka พก boolean `retriable` จริง และ error แบบ **fencing** (producer instance ใหม่กว่าที่ถือ `transactionalId` เดียวกัน) เป็น fatal ไม่ใช่ transient — `retriable: false` logic retry ที่ไม่เช็ค field นี้จะวนไปเรื่อย ๆ บน error ที่ไม่มีวันสำเร็จ
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/12-retriable-check.ts — @expect-error illustrates a naive retry loop, real output captured separately below
+async function commitWithRetry(txn) {
+  try {
+    await txn.commit();
+  } catch (e) {
+    // BUG: retries unconditionally -- does not check e.retriable before deciding to retry
+    return commitWithRetry(txn);
+  }
+}
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (producer ตัวที่สองด้วย `transactionalId` เดียวกัน fence ตัวแรกกลาง transaction):**
+
+```text
+attempt 1: ERROR NAME=KafkaJSProtocolError retriable=false message=Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker
+```
+
+`retriable: false` ยืนยันตรงจาก error object ที่ catch ได้ — retry loop ที่มองข้าม field นี้จะ commit transaction attempt ของ zombie producer ตัวนี้ตลอดไป ไม่เคยสำเร็จ ไม่เคยหยุด
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/12-retriable-check-fixed.ts
+async function commitWithRetry(txn: Awaited<ReturnType<import('kafkajs').Producer['transaction']>>, attempt = 1): Promise<void> {
+  try {
+    await txn.commit();
+  } catch (e: any) {
+    // Fix: a fatal, non-retriable error (fencing, expired transaction) must stop the loop, not retry it.
+    if (e.retriable === false) {
+      console.error('FATAL, not retrying:', e.name, e.message);
+      throw e;
+    }
+    if (attempt >= 5) throw e;
+    return commitWithRetry(txn, attempt + 1);
+  }
+}
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — เวอร์ชัน bug และเวอร์ชัน fix compile ผ่านทั้งคู่ และ "ทำงาน" บน happy path ทั้งคู่ มีแค่ scenario fencing จริง (producer instance ที่สองด้วย `transactionalId` เดียวกัน) เท่านั้นที่เผยความต่าง ดู **[Transactions](/kafka/th/delivery-and-transactions/transactions/)** สำหรับหลักฐาน fencing เต็มรูปแบบ
+
+## Topic & broker config
+
+### 13. RF=1 + `min.insync.replicas=2` + `acks=all` — ถูกรับ ไม่ถูกปฏิเสธ
+
+**KIP-579** ปล่อยให้สร้าง topic ที่ `min.insync.replicas` สูงกว่า replication factor ของตัวเองได้ — broker ไม่เช็คสองค่านี้ข้ามกันตอนสร้างเลย แย่กว่านั้นคือ: บน partition ที่มี replica เดียว write แบบ `acks=all` กับ combination นี้เป๊ะ ๆ ยัง **สำเร็จ** ได้ เพราะ replica เดียวที่มีอยู่ "in sync" กับตัวเองอย่างไม่มีความหมาย
+
+```properties
+# config/reading-kafka/ai-bug-catalog/13-kip579.properties — @expect-error accepted by the broker despite being self-contradictory (KIP-579); real output captured separately below
+# section: topic
+replication.factor=1
+min.insync.replicas=2
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --topic kip579-topic --partitions 1 --replication-factor 1 --config min.insync.replicas=2
+Created topic kip579-topic.
+
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --topic kip579-topic
+Topic: kip579-topic	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=2
+	Topic: kip579-topic	Partition: 0	Leader: 2	Replicas: 2	Isr: 2
+
+# an acks=all producer send against this exact topic:
+UNEXPECTED SUCCESS: [{"topicName":"kip579-topic","partition":0,"errorCode":0,"baseOffset":"0", ...}]
+```
+
+ทั้งการสร้าง topic **และ** write แบบ `acks=all` สำเร็จ — combination นี้ดูพังแต่ถูกรับไว้สองรอบซ้อน มันจะพังก็แค่วินาทีที่ replica เดียวนี้หลุดจาก sync จริง ๆ หรือ broker restart
+
+**วิธีแก้:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/13-kip579-fixed.properties
+# section: topic
+min.insync.replicas=2
+# replication factor itself is not a topic-level dynamic config -- it is set once, at creation
+# time, via --replication-factor (or changed later through partition reassignment). The fix here
+# is choosing --replication-factor 3 at creation, so min.insync.replicas=2 has real room below it.
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอนสร้าง — `kafka-topics.sh --describe --under-min-isr-partitions` เป็นสัญญาณสดตอนที่ shortfall โผล่มาจริง ดู **[Acks and Durability](/kafka/th/producers/acks-and-durability/)** สำหรับหลักฐาน RF-vs-min.insync เต็มรูปแบบ และ `NotEnoughReplicasException` จริงที่ combination นี้ทำให้เกิดในที่สุดบน cluster 3-broker ที่สุขภาพดี
+
+### 14. เพิ่ม partition remap key — และ producer ที่รันอยู่อาจไม่รู้ตัวด้วยซ้ำ
+
+`kafka-topics.sh --alter --partitions` (หรือ `admin.createPartitions()`) เป็น operation ทางเดียวที่มีผลจริงสองอย่างแยกกัน: `hash(key) % partitionCount` ของทุก key เปลี่ยนไป ทำลาย per-key ordering guarantee ที่โค้ดอาจพึ่งพาอยู่ — และ **producer ที่รันอยู่นานแล้วที่ cache partition count เก่าไว้แล้ว** อาจเขียนไปที่ partition set เก่าที่เล็กกว่าต่อไปได้ จนกว่าจะมีอะไรบังคับ refresh metadata
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/14-partition-remap.ts — @expect-error illustrates a remap that only appears once partitions are actually added, real output captured separately below
+// AI comment: "just bump partitions for more throughput, keys will still route consistently"
+await admin.createPartitions({ topicPartitions: [{ topic: 'orders', count: 6 }] });
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (3 → 6 partition บน topic ที่รันอยู่):**
+
+```text
+--- BEFORE adding partitions (3 partitions) ---
+user-42 -> partition 1
+user-7 -> partition 2
+user-99 -> partition 2
+--- SAME long-lived producer, AFTER admin.createPartitions to 6 (stale cached metadata) ---
+user-42 -> partition 1
+user-7 -> partition 2
+user-99 -> partition 2
+--- a FRESH producer, same moment, AFTER partitions already increased to 6 ---
+user-42 -> partition 4
+user-7 -> partition 2
+user-99 -> partition 5
+```
+
+ผลจริงสองอย่างแยกกันเกิดพร้อมกัน: producer เดิมที่รันอยู่นานยังส่งไปที่ mapping *เก่า* จนกว่าจะ reconnect และพอ metadata ของ client ตัวหนึ่ง refresh แล้ว `user-42` กับ `user-99` ก็ไปลง partition ที่ต่างจากเดิมจริง ๆ — consumer ไหนที่พึ่งพา "record ของ key นี้ลง partition เดิมเสมอ ตามลำดับ" ผิดไปแล้วสำหรับทั้งสอง key นี้
+
+**วิธีแก้:**
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/14-partition-remap-fixed.ts
+// Fix: there is no client-side undo for a partition-count change. Provision the final partition count
+// up front for any topic whose consumers depend on per-key ordering, and if partitions genuinely must
+// grow, treat it as a breaking change: drain in-flight per-key state before the change, not after.
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติ — ทั้ง remap และช่วง metadata ค้างเงียบทั้งคู่ การเทียบ `partition` ที่ `producer.send()` คืนมาสำหรับ key เดียวกันก่อนและหลัง บน cluster จริง เป็นวิธีเดียวที่เห็นได้ ดู **[Keys and Partitioning](/kafka/th/producers/keys-and-partitioning/)** สำหรับกลไก murmur2 เต็มรูปแบบ
+
+### 15. มอง `auto.create.topics.enable` เป็นสิ่งที่สลับได้ตอน runtime
+
+`auto.create.topics.enable` เป็น broker config แบบ **static** — อ่านครั้งเดียวตอน startup จาก `server.properties` ไม่ใช่ config ที่ `kafka-configs.sh --alter` เปลี่ยนบน broker ที่รันอยู่ได้ โค้ด (หรือ runbook) ที่สมมติว่า `--alter` แบบ dynamic มีผลทันทีนั้นผิด
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/15-auto-create-static.sh — @expect-error auto.create.topics.enable is STATIC, not dynamically alterable; real output captured separately below
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --alter --entity-type brokers --entity-name 1 \
+  --add-config auto.create.topics.enable=false
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [auto.create.topics.enable]
+Caused by: org.apache.kafka.common.errors.InvalidRequestException: Cannot update these configs dynamically: [auto.create.topics.enable]
+```
+
+**วิธีแก้:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/15-auto-create-static-fixed.properties
+# section: broker
+# auto.create.topics.enable can only be changed in server.properties, followed by a broker restart --
+# there is no live --alter path for it.
+auto.create.topics.enable=false
+```
+
+**จับได้ด้วย:** `kafka-configs.sh --describe --entity-type brokers --entity-name 1 --all` แสดง synonym เดียวเป็น `DEFAULT_CONFIG` (ไม่มี `DYNAMIC_BROKER_CONFIG` เลย) *ก่อน* ลอง alter ด้วยซ้ำ; **[Brokers, Topics & Partitions](/kafka/th/foundations/brokers-topics-partitions/)** ครอบคลุม static vs dynamic config เต็มรูปแบบ
+
+## Ops & security
+
+### 16. CLI tool ที่หลอน: `kafka-metadata.sh`
+
+ไม่มี tool ชื่อ `kafka-metadata.sh` มากับ Kafka เลยสักครั้ง — tool metadata ของ KRaft ตัวจริงคือ `kafka-metadata-quorum.sh` (describe controller quorum) และ `kafka-metadata-shell.sh` (เดินดู `__cluster_metadata` แบบ interactive) ชื่อที่หลอนนี้ดูสมเหตุสมผลพอที่จะอ่านว่าเป็นของจริง
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/16-kafka-metadata-sh.sh — @expect-error /opt/kafka/bin/kafka-metadata.sh has never existed; real output captured separately below
+/opt/kafka/bin/kafka-metadata.sh --describe
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+OCI runtime exec failed: exec failed: unable to start container process: exec: "/opt/kafka/bin/kafka-metadata.sh": stat /opt/kafka/bin/kafka-metadata.sh: no such file or directory
+```
+
+**วิธีแก้:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/16-kafka-metadata-sh-fixed.sh
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server "$BOOTSTRAP" describe --status
+```
+
+**จับได้ด้วย:** `ls /opt/kafka/bin/ | grep -i metadata` ในตัว broker container แสดงชื่อ tool จริงทั้งสองตัว การรัน tool ที่หลอนกับ broker จริงตัวไหนก็ได้จะได้ error "no such file" แบบเดียวกันทุกครั้ง
+
+### 17. CLI flag ที่หลอน: `--run-all`
+
+flag ที่ฟังดูควรมีอยู่ ("apply สิ่งนี้กับทุกอย่าง") ถูกแนบไปกับ tool จริง `kafka-topics.sh` ไม่มี flag `--run-all` เลย — มันพังแบบเดียวกับ `--zookeeper` คือ option-parse error ฝั่ง client ก่อนที่ request จะไปถึง broker เลยด้วยซ้ำ
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/17-run-all-flag.sh — @expect-error --run-all has never been a /opt/kafka/bin/kafka-topics.sh flag; real output captured separately below
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list --run-all
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+joptsimple.UnrecognizedOptionException: run-all is not a recognized option
+	at joptsimple.OptionException.unrecognizedOption(OptionException.java:108)
+```
+
+**วิธีแก้:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/17-run-all-flag-fixed.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**จับได้ด้วย:** `kafka-topics.sh --help` ไม่แสดง `--run-all` เลย flag ที่หลอนตัวไหนก็ได้ output error เป็นรูปแบบ `UnrecognizedOptionException` เดียวกัน ซึ่งตัวมันเองก็เป็นสัญญาณที่เชื่อถือได้อยู่แล้ว
+
+### 18. `kafka-acls.sh` โดยไม่ตั้ง authorizer ไว้
+
+runbook ที่สมมติว่า ACL command ใช้ได้กับ cluster ไหนก็ตาม พลาดจุดที่ว่า Kafka มาโดย **ไม่ตั้ง authorizer ไว้เลยเป็น default** — การเรียก `kafka-acls.sh` ทุกครั้งกับ broker ที่ไม่ได้ตั้ง `authorizer.class.name` จะพังด้วย error เจาะจงและจริง ไม่ใช่ permission error
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/18-acls-no-authorizer.sh — @expect-error no authorizer is configured on this broker by default; real output captured separately below
+/opt/kafka/bin/kafka-acls.sh --bootstrap-server "$BOOTSTRAP" --list
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง:**
+
+```text
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+```
+
+**วิธีแก้:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/18-acls-no-authorizer-fixed.properties
+# section: broker
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+# super.users=User:admin -- also real (StandardAuthorizer honors it to bypass ACL checks for
+# trusted principals), just not one of the keys this course's harness cross-checks against the
+# broker-config reference page it scraped.
+```
+
+**จับได้ด้วย:** `SecurityDisabledException` จริงตัวมันเองก็ไม่กำกวมแล้วถ้าเคยเห็นสักครั้ง ดู **[Security and Production](/kafka/th/operations-and-production/security-and-production/)** สำหรับการตั้ง authorizer เต็มรูปแบบ และ `TopicAuthorizationException` จริงที่ principal ที่ตั้ง authorizer แล้วแต่ไม่มี grant จะได้ต่อไป
+
+## Connect / Streams / Schema
+
+### 19. Connect standalone ใน "production" และ plugin ที่ไม่อยู่บน path
+
+standalone mode ไม่มี fault tolerance เลย — worker crash เดียวเสีย connector และ task ทุกตัวที่มันรันอยู่ ไม่มีอะไร restart ให้ อีกเรื่องแยกกัน: connector class อาจอยู่จริงบน disk ที่ `/opt/kafka/libs` เป็น jar แต่ยัง load ไม่ได้ เพราะ plugin scanner ของ Connect ค้นหาแค่ class บน `plugin.path` เท่านั้น ไม่ใช่ทุกอย่างบน classpath
+
+```properties
+# config/reading-kafka/ai-bug-catalog/19-connect-standalone.properties — @expect-error FileStreamSource is not discoverable without plugin.path set, even though the jar exists on disk; real output captured separately below
+# section: connect
+bootstrap.servers=localhost:9092
+# no plugin.path set -- AI comment: "the connector jars are already in Kafka's own libs, no extra config needed"
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (`connect-file-4.3.1.jar` มีอยู่จริงที่ `/opt/kafka/libs/connect-file-4.3.1.jar`):**
+
+```text
+[ERROR] Failed to create connector for file-source.properties (org.apache.kafka.connect.cli.ConnectStandalone:86)
+java.util.concurrent.ExecutionException: org.apache.kafka.connect.runtime.rest.errors.BadRequestException: Failed to find any class that implements Connector and which name matches FileStreamSource, available connectors are: PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorCheckpointConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorHeartbeatConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorSourceConnector, ...}
+```
+
+มีแค่ connector MirrorMaker สามตัวที่มาให้ในตัวเท่านั้นที่ discover ได้ — jar ของ `FileStreamSource` อยู่บน disk เป๊ะ ๆ แต่ยังมองไม่เห็นสำหรับ worker
+
+**วิธีแก้:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/19-connect-standalone-fixed.properties
+# section: connect
+bootstrap.servers=localhost:9092
+plugin.path=/opt/kafka/libs
+# and for anything needing fault tolerance: run connect-distributed.sh instead of connect-standalone.sh --
+# distributed mode persists connector/task config and offsets in Kafka topics and rebalances onto
+# surviving workers; standalone mode has no such recovery at all.
+```
+
+**อาการของ fix — output จริง รันกับ broker ของโมดูลนี้เองพร้อมเพิ่ม `plugin.path=/opt/kafka/libs`:**
+
+```text
+[INFO] Added plugin 'org.apache.kafka.connect.file.FileStreamSourceConnector' (org.apache.kafka.connect.runtime.isolation.DelegatingClassLoader:199)
+[INFO] Added alias 'FileStreamSource' to plugin 'org.apache.kafka.connect.file.FileStreamSourceConnector' (org.apache.kafka.connect.runtime.isolation.DelegatingClassLoader:203)
+```
+
+**จับได้ด้วย:** `GET /connector-plugins` ของ Connect REST API เองแสดงเป๊ะ ๆ ว่า worker discover อะไรได้บ้าง ก่อนจะ submit connector config เลยด้วยซ้ำ; **[Kafka Connect](/kafka/th/streams-connect-schema/kafka-connect/)** สำหรับการเทียบ standalone-vs-distributed เต็มรูปแบบ
+
+### 20. `errors.deadletterqueue.topic.name` ถูกตั้งโดยไม่มี `errors.tolerance=all`
+
+config ของ dead-letter-queue จะทำงานก็ต่อเมื่อ `errors.tolerance` ถูกตั้งเป็น `all` ชัดเจนเท่านั้น — default จริงที่ยืนยันแล้วคือ `none` ซึ่งภายใต้ค่านี้ record ที่ fail จะทำให้ task fail แทนที่จะ route ไปไหนเลย ไม่ว่า `errors.deadletterqueue.topic.name` จะตั้งเป็นอะไรก็ตาม กับดักที่สองแยกกัน: config ของ DLQ มีความหมายแค่กับ connector แบบ **sink** เท่านั้น — การตั้งมันบน source connector จะ validate ผ่านแต่ไม่มีผลอะไรเลยเงียบ ๆ
+
+```properties
+# config/reading-kafka/ai-bug-catalog/20-dlq-tolerance.properties — @expect-error errors.deadletterqueue.* does nothing while errors.tolerance stays at its default of 'none'; real output captured separately below
+# section: connect
+errors.deadletterqueue.topic.name=connect-dlq
+errors.deadletterqueue.topic.replication.factor=1
+# AI comment: "route bad records to the DLQ topic" -- errors.tolerance was never set
+```
+
+**อาการ — output จริง รันกับ broker ของโมดูลนี้เอง (`PUT /connector-plugins/.../config/validate` กับ Connect worker ที่รันจริง):**
+
+```text
+$ curl -X PUT .../config/validate -d '{"errors.deadletterqueue.topic.name":"my-dlq", ...}'
+"name":"errors.tolerance","value":"none"
+```
+
+`errors.tolerance` รายงานกลับมาเป็น `none` — default จริงของมัน — ยืนยันสด ๆ กับ endpoint validate config ของ worker ที่รันจริง ไม่ใช่สมมติจาก documentation
+
+**วิธีแก้:**
+
+```properties
+# config/reading-kafka/ai-bug-catalog/20-dlq-tolerance-fixed.properties
+# section: connect
+errors.tolerance=all
+errors.deadletterqueue.topic.name=connect-dlq
+errors.deadletterqueue.topic.replication.factor=1
+errors.log.enable=true
+```
+
+**จับได้ด้วย:** REST endpoint `/config/validate` ตัวเดียวกัน เช็คก่อน submit connector เลย; **[Kafka Connect](/kafka/th/streams-connect-schema/kafka-connect/)** สำหรับ pipeline การจัดการ error เต็มรูปแบบ รวมถึง `errors.retry.timeout.ms`
+
+### 21. สมมติว่า KafkaJS เข้าร่วม share group ได้
+
+share group (แบบ queue, competing-consumer semantics) ของ **KIP-932** ถึง GA ใน Kafka 4.2 แล้ว — แต่ไม่มี JavaScript client ตัวไหน implement share-group protocol เลย โค้ดที่สร้าง KafkaJS consumer โดยคาดหวัง share-group semantics ไม่ใช่แค่ "ขาด config flag" มันกำลังเล็ง protocol ที่ client ไม่รู้จักเลยแม้แต่นิดเดียว
+
+```typescript
+// src/reading-kafka/ai-bug-catalog/21-share-group.ts — @expect-error KafkaJS has no share-group API; real output captured separately below
+// AI comment: "use a share group so multiple instances can compete for the same records"
+const consumer = kafka.consumer({ groupId: 'orders-share-group', groupProtocol: 'share' } as any);
+```
+
+**อาการ — output จริง รันกับ probe ของโมดูลนี้เอง (ค้น type definition ของ KafkaJS เองตรง ๆ หาร่องรอย share-group support):**
+
+```text
+$ grep -in "share" node_modules/kafkajs/types/index.d.ts
+(no matches)
+```
+
+ไม่มี "share" โผล่มาเลยแม้แต่ครั้งเดียวใน public type surface ของ KafkaJS — ไม่มี config flag ให้ตั้งถูกต้องตรงนี้เลย capability นี้แค่ไม่ถูก implement เท่านั้นเอง
+
+**วิธีแก้:**
+
+```bash
+# scripts/reading-kafka/ai-bug-catalog/21-share-group-fixed.sh
+# Fix: KafkaJS cannot join a share group at all. Use the real CLI tool this course's broker image ships --
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic orders --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-console-share-consumer.sh --bootstrap-server "$BOOTSTRAP" --topic orders --group orders-share-group --timeout-ms 5000
+# -- or a client that implements KIP-932 (the Java client, or check @confluentinc/kafka-javascript's
+# current release notes for share-group support before assuming either way).
+```
+
+**จับได้ด้วย:** grep type definition ของ client เองหาคำว่า "share" ก่อนเขียนโค้ด share-group ใด ๆ; **[Choosing a Processing Layer](/kafka/th/streams-connect-schema/choosing-a-processing-layer/)** ครอบคลุม share group เป็นตัวเลือกที่หกเต็มรูปแบบ รวมถึง output จริงของ `kafka-console-share-consumer.sh`
+
+## Mental Model
+
+<Mermaid title="อะไรจับแต่ละกลุ่มได้จริง ถ้ามี" code={catalogCoverageDiagram} />
+
+export const catalogCoverageDiagram = `flowchart LR
+  A["Client &amp; versions"] --> T["Mostly human review<br/>(silently-ignored keys, unmaintained defaults)"]
+  P["Producer"] --> P2["Partial: tsc catches nothing here,<br/>only a real send reveals the gap"]
+  C["Consumer loop &amp; commits"] --> R["Needs a real restart or a real timeout<br/>to surface at all"]
+  D["Delivery &amp; transactions"] --> R
+  Cfg["Topic &amp; broker config"] --> M["Accepted, not rejected --<br/>only --describe/--under-min-isr-partitions shows it"]
+  O["Ops &amp; security"] --> T2["CLI/broker rejects outright --<br/>the easiest group to catch mechanically"]
+  Cn["Connect/Streams/Schema"] --> M2["REST /config/validate + /connector-plugins<br/>catches some, not source-vs-sink semantics"]
+`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+ทุกรายการข้างบนผ่าน `tsc --noEmit` เรียบ หรือถูกรับไว้โดย broker จริง หรือทั้งสองอย่าง — 18 จาก 21 pattern นี้ให้ **error เป็นศูนย์ ณ จุดที่มันถูกใส่เข้ามา** รัน tool ใน **[Verification Tools](/kafka/th/reading-kafka/verification-tools/)** ก่อน แล้วยังต้องไล่ **[Review Checklist](/kafka/th/reading-kafka/review-checklist/)** ด้วยตาสำหรับทุกอย่างที่มีแค่ restart จริง, crash window จริง, หรือ fencing event จริงเท่านั้นที่จะเผยออกมาได้
+</Callout>
+
+export const quizAiBugCatalog = [
+  {
+    q: "```text\n$ grep -n \"idempotent = false\" node_modules/kafkajs/src/producer/index.js\n  idempotent = false,\n```\nจากบรรทัดจริงนี้จาก source ของ package ที่ install ไว้ การเรียก `kafka.producer()` เปล่า ๆ (ไม่มี option) ตั้ง config อะไรจริง ๆ?",
+    options: [
+      "producer แบบ idempotent ตรงกับ default ของ Java client",
+      "producer แบบ NON-idempotent -- default จริงของ KafkaJS คือ false ตรงข้ามกับที่ tutorial Java client หลายอันฝึกให้ผู้อ่านคาดหวัง",
+      "producer ที่ throw ถ้าไม่ตั้ง idempotent",
+      "สิ่งเดียวกันไม่ว่าจะตั้ง setting นี้หรือไม่",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรงจาก source ของ kafkajs@2.2.4 ที่ install ไว้: idempotent มี default เป็น false comment ที่อ้างว่า 'idempotent producer' ข้าง ๆ การเรียก kafka.producer() เปล่า ๆ ผิดตรง ๆ สำหรับ client ตัวนี้",
+  },
+  {
+    q: "ทำไมรายการ 10 (commitOffsets แยกแทน txn.sendOffsets()) ถึงโชว์ bug ของมันแค่ตอนรันครั้งที่สอง ไม่ใช่ครั้งแรกเลย?",
+    options: [
+      "ไม่จริง -- bug นี้เห็นได้ตั้งแต่ครั้งแรกด้วย",
+      "transaction commit กับ offset commit แยกเป็น network call สองอันที่แยกจากกันจริง มีช่วงเวลาจริงระหว่างสองอันนี้ -- crash (หรือแค่โชคไม่ดี) ในช่วงนั้นจะทิ้ง downstream write ที่ commit แล้วแต่ input offset ยังไม่ commit ซึ่งจะเห็นเป็น duplicate ก็แค่ตอนที่ restart ประมวลผล input เดิมซ้ำ",
+      "KafkaJS retry สิ่งนี้ให้อัตโนมัติ",
+      "เรื่องนี้สำคัญแค่เมื่อมีมากกว่าหนึ่ง partition",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: process.exit(0) ทันทีหลัง transaction commit ก่อนที่ consumer.commitOffsets แยกจะรัน ทิ้ง group ไว้โดยไม่มี offset commit เลย -- การรันครั้งต่อไปประมวลผล offset 0 ใหม่ตั้งแต่ต้น ตรงกับ duplicate ที่รายการนี้อธิบายเป๊ะ",
+  },
+  {
+    q: "รายการ 13 แสดง topic ที่สร้างด้วย replication-factor 1 และ min.insync.replicas=2 -- ทั้ง CREATE และการ produce แบบ acks=all ที่ตามมาสำเร็จทั้งคู่ ทำไม catalog นี้เรียก combination นั้นว่าอันตราย ไม่ใช่ไม่เป็นไร?",
+    options: [
+      "ไม่อันตราย -- broker คงปฏิเสธ write ที่เสี่ยงจริง ๆ ไปแล้ว",
+      "replica เดียวที่มีอยู่ 'in sync กับตัวเอง' อย่างไม่มีความหมาย เลย write ยังสำเร็จต่อไปจนกว่า replica นั้นจะล้าหลังหรือ broker restart จริง ๆ -- ตอนนั้น acks=all จะไม่มีวันถูก satisfy ได้อีก และ write ทุกตัวจะเริ่ม fail โดยไม่มีอะไรเปลี่ยนใน topic config มาเตือนเลย",
+      "min.insync.replicas ถูกบังคับใช้แค่บน topic ที่มีหลาย partition",
+      "acks=all override min.insync.replicas เสมอ",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ (KIP-579): kafka-topics.sh --create รับ config ที่ขัดแย้งกันเองนี้ไว้ และ producer.send() แบบ acks=-1 จริงต่อ topic นี้ได้ errorCode 0 กลับมา -- ความเปราะบางเป็นเรื่องจริงแต่มองไม่เห็นจนกว่าสถานะของ replica เดียวนั้นจะเปลี่ยนจริง ๆ",
+  },
+  {
+    q: "รายการ 19 แสดง connect-file-4.3.1.jar อยู่จริงบน /opt/kafka/libs แต่ FileStreamSource ยัง fail ด้วย BadRequestException รูปร่างเหมือน ClassNotFoundException การตั้ง plugin.path=/opt/kafka/libs แก้อะไรจริง ๆ?",
+    options: [
+      "มันก็อป jar ที่หายไปเข้า container",
+      "มันบอก plugin ISOLATION scanner ของ Connect ว่าจะมองหาที่ไหน -- jar ที่มีอยู่บน disk (หรือแม้แต่บน Java classpath) ไม่เหมือนกับการอยู่บน plugin.path ซึ่งเป็นที่เดียวที่ DelegatingClassLoader สแกนหา connector plugin จริง ๆ",
+      "มันปิด plugin isolation ไปเลยทั้งหมด",
+      "ไม่มีผลจริงอะไรเลย -- jar เสียหาย",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: พอเพิ่ม plugin.path=/opt/kafka/libs เข้า standalone.properties ตัวเดียวกันเป๊ะ ๆ บรรทัด log จริง 'Added plugin org.apache.kafka.connect.file.FileStreamSourceConnector' โผล่มา -- ยืนยันว่า discovery ไม่ใช่การมีไฟล์อยู่ ที่เป็นชิ้นส่วนที่หายไป",
+  },
+  {
+    q: "ทำไมรายการ 21 ถึงเช็ค type definition ของ TypeScript ของ KafkaJS ตรง ๆ (grep หา 'share') แทนที่จะลอง config option ของ share-group แล้วดูว่ามัน throw error อะไร?",
+    options: [
+      "สองวิธีให้คำตอบเดียวกันเร็วเท่ากัน",
+      "ไม่มี config option ให้ลองเลยตั้งแต่แรก -- ศูนย์การเจอคำว่า 'share' ใน public API surface ของ client แปลว่า capability นี้ไม่เคยถูก implement เลย ไม่ใช่ว่ามันมีอยู่แต่ throw validation error",
+      "grep เร็วกว่าการรันโค้ดเสมอ",
+      "type ของ KafkaJS ไม่น่าเชื่อถือและไม่ควรเชื่อ",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: grep -in 'share' node_modules/kafkajs/types/index.d.ts ไม่เจอเลยแม้แต่ตัวเดียว -- เทียบกับรายการอย่าง #2 (group.protocol) ที่ option มีอยู่จริงในทาง syntax แค่ถูกเมิน รายการ 21 เป็น gap คนละประเภท: ไม่มีอะไรให้ configure เลย ไม่ใช่ setting ที่ถูกทิ้งเงียบ ๆ",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/ai-bug-catalog" questions={quizAiBugCatalog} />
+
+<ProgressTracker client:visible id="reading-kafka/ai-bug-catalog" />
