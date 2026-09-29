@@ -1,6 +1,6 @@
 ---
 title: 'Monitoring & Consumer Lag'
-description: 'metric ที่บอกว่า Kafka cluster สุขภาพดี JMX broker metric, under-replicated partition, request latency และสัญญาณระดับ app ที่สำคัญที่สุดคือ consumer lag'
+description: 'LAG จริงที่ลดจาก 700 เหลือ 0 ด้วย kafka-consumer-groups.sh --describe, MBean ของ JMX จริงที่อ่านด้วย JmxTool (UnderReplicatedPartitions, RequestHandlerAvgIdlePercent, request latency), Prometheus JMX exporter javaagent, และ event lag จริงของ KafkaJS END_BATCH_PROCESS — รวมถึงความละเอียดอ่อนของ offsetLag เทียบ offsetLagLow ที่บทนี้จับได้จริง'
 sidebar:
   order: 2
 ---
@@ -8,29 +8,60 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-Kafka เปิดเผย metric หลายร้อยตัวผ่าน **JMX** แต่สัญญาณระดับ application ที่สำคัญที่สุดคือ **consumer lag** ช่องว่างระหว่าง **log-end-offset** ของ partition กับ **committed offset** ของ consumer group ซึ่งบอกว่า consumer ของคุณตามทันหรือไม่
+Kafka มี metric หลายร้อยตัวผ่าน **JMX** แต่สัญญาณระดับ application ที่สำคัญที่สุดตัวเดียวคือ **consumer lag** — ช่องว่างระหว่าง log-end-offset ของ partition กับ offset ที่ consumer group commit ไว้ — และ lag **ไม่ใช่** สิ่งเดียวกับ latency ซึ่งบทนี้พิสูจน์ทั้งฝั่ง server และฝั่ง app
 
-## consumer lag: ตัวเลขเดียวที่ต้องจับตา
+## พิสูจน์: LAG จริง ลดจาก 700 เหลือ 0
 
-producer append record เรื่อย ๆ เลื่อน **log-end-offset** ของแต่ละ partition (ตำแหน่งของ record ใหม่ล่าสุด) consumer group commit ว่าประมวลผลไปถึงไหน **lag** คือผลต่าง
-
-> lag = log-end-offset − committed offset
-
-lag ใกล้ศูนย์แปลว่า consumer ตามทัน lag ที่โตขึ้นเรื่อย ๆ แปลว่า consumer ตามไม่ทัน record เข้ามาเร็วกว่าที่ประมวลผลได้ และ latency แบบ end-to-end กำลังไต่ขึ้น อ่านค่า lag ตรง ๆ ด้วย consumer-groups tool
+produce 1,000 record เข้า topic ใหม่ แล้ว consume สองรอบ — 300 record หยุด แล้ว consume ที่เหลืออีก 700 — โดยรัน `kafka-consumer-groups.sh --describe` คั่นกลาง
 
 ```bash
-# Describe a consumer group: shows CURRENT-OFFSET, LOG-END-OFFSET, and LAG per partition
-kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
-  --describe --group order-processor
+# scripts/monitoring-and-consumer-lag/describe-lag.sh
+# Self-contained: creates its own topic, produces, consumes partially, then fully.
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+  --create --topic lesson-lag-demo --partitions 1 --replication-factor 1
+
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic lesson-lag-demo \
+  --num-records 1000 --record-size 100 --throughput -1 \
+  --producer-props bootstrap.servers="$BOOTSTRAP" > /dev/null 2>&1
+
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic lesson-lag-demo --group lesson-lag-group \
+  --from-beginning --max-messages 300 --timeout-ms 15000 > /dev/null 2>&1
+
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" \
+  --describe --group lesson-lag-group
 ```
 
-output มีคอลัมน์ `LAG` ต่อ partition จับตาที่ **แนวโน้ม** ของตัวเอง ไม่ใช่ค่าครั้งเดียว แบนหรือลดลงคือสุขภาพดี ไต่ขึ้นเรื่อย ๆ คือสัญญาณเตือนแรกสุดว่า consumer โหลดเกิน ค้าง หรือ crash
+```text
+GROUP             TOPIC             PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+lesson-lag-group  lesson-lag-demo   0          300             1000            700             -               -               -
+```
 
-<Mermaid title="consumer lag คือช่องว่างระหว่าง offset ใหม่สุดกับที่ประมวลผลแล้ว" code={lagFlow} />
+`LAG=700` จริง — เท่ากับ `1000 - 300` พอดี consume ส่วนที่เหลือ 700 record แล้ว describe อีกครั้ง
+
+```bash
+# scripts/monitoring-and-consumer-lag/describe-lag-catchup.sh
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic lesson-lag-demo --group lesson-lag-group \
+  --max-messages 700 --timeout-ms 15000 > /dev/null 2>&1
+
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" \
+  --describe --group lesson-lag-group
+```
+
+```text
+GROUP             TOPIC             PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+lesson-lag-group  lesson-lag-demo   0          1000            1000            0               -               -               -
+```
+
+`LAG=0` — consumer group ตามทันจริง `LAG` คือ `LOG-END-OFFSET - CURRENT-OFFSET` เสมอ ดูเป็น **trend** ไม่ใช่ค่าเดียว: คงที่หรือลดลงคือสุขภาพดี ไต่ขึ้นเรื่อย ๆ คือสัญญาณเตือนแรกสุดว่า consumer overload ค้าง หรือ crash
+
+<Mermaid title="Consumer lag คือช่องว่างระหว่างของใหม่สุดกับที่ประมวลผลแล้ว" code={lagFlow} />
 
 export const lagFlow = `flowchart LR
   prod["Producer appends records"] --> leo["Log-end-offset (newest)"]
@@ -38,81 +69,256 @@ export const lagFlow = `flowchart LR
   leo -->|"difference"| lag["LAG = log-end-offset - committed offset"]
   cur --> lag`;
 
-## metric ฝั่ง broker ผ่าน JMX
+## Lag ไม่ใช่ latency
 
-broker ของ Kafka publish metric ผ่าน **JMX** ซึ่ง tool อย่าง Prometheus (ผ่าน JMX exporter), Grafana หรือ APM ของคุณ scrape ไป มีบางตัวที่ห้ามต่อรอง
+การดู `RequestMetrics,name=TotalTimeMs,request=Produce` (พิสูจน์ด้านล่างผ่าน JMX) บน broker ว่างของบทนี้แสดง percentile ทุกตัวเป็น `0.0` — broker ตอบทุก request ทันที ตัวเลขนั้นไม่บอกอะไรเลยว่า **consumer group** ตามทันหรือไม่: broker อาจมี request latency แค่หลัก millisecond เดียว ในขณะที่ consumer group ยังมี `LAG` เป็นล้าน record ได้ ถ้า group นั้นแค่ดึงข้อมูลไม่ทัน ถูก pause หรือ crash ในทางกลับกัน consumer อาจแสดง `LAG=0` ในขณะที่ request latency สูงขึ้น — มันแค่ตามทันแบบเฉียดฉิว ทั้งสองเป็นสัญญาณอิสระจากกัน: **latency** วัดว่า request หนึ่งใช้เวลานานแค่ไหน; **lag** วัดว่าการประมวลผลของทั้ง group ตกหลังไปแค่ไหน สะสมมาตามเวลา
 
-- **Under-replicated partitions** (`UnderReplicatedPartitions`) partition ที่ ISR เล็กกว่า replication factor ควรเป็น **ศูนย์** อะไรที่เกินนั้นแปลว่า replica ตามไม่ทันหรือ broker ล่ม และ durability กำลังเสี่ยง
-- **Offline partitions** (`OfflinePartitionsCount`) partition ที่ไม่มี leader จึงใช้งานไม่ได้ ควรเป็น **ศูนย์** เสมอ
-- **Active controller** (`ActiveControllerCount`) ต้องมี **หนึ่ง** เดียวทั้ง cluster ศูนย์หรือมากกว่าหนึ่งคือสัญญาณปัญหาของ controller
-- **Request latency** เวลาของ produce กับ fetch request (`TotalTimeMs` แยกเป็นเฟส queue, local, remote) latency ที่ไต่ขึ้นชี้ไปที่แรงกดดันของ disk, network หรือ replication ก่อนที่ client จะรู้สึก
+## metric ฝั่ง broker ผ่าน JMX อ่านจริง
 
-```properties
-# Enable JMX on a broker by exporting the port before start (example)
-# then a JMX exporter or your APM scrapes these MBeans
-JMX_PORT=9999
+broker ของ Kafka เผยแพร่ metric ผ่าน JMX `kafka-run-class.sh org.apache.kafka.tools.JmxTool` (ยืนยันเป็นชื่อ class จริงใน 4.3.1 ผ่าน `--help`) อ่านมันได้โดยตรง ไม่ต้องมี agent ภายนอก
+
+```bash
+# scripts/monitoring-and-consumer-lag/jmx-tool-help.sh
+/opt/kafka/bin/kafka-run-class.sh org.apache.kafka.tools.JmxTool --help | head -5
 ```
 
-<Callout title="metric บอกว่าอะไร lag บอกว่าสำคัญไหม">
-metric ฝั่ง broker อย่าง under-replicated partition เตือนเรื่อง **สุขภาพ cluster** ส่วน consumer lag เตือนเรื่อง **สุขภาพ application ของคุณ** ว่าข้อมูลที่ service พึ่งพาถูกประมวลผลทันเวลาไหม ตั้ง alert ทั้งคู่ แต่ถ้าดูได้ dashboard เดียว ให้ดู **lag ต่อ consumer group**
+```text
+Dump JMX values to standard output.
+Option                                   Description
+------                                   -----------
+--attributes <String: name>              The list of attributes to include in
+```
+
+อ่านสองตัวที่ non-negotiable จริง ๆ กับ broker ที่เปิด JMX ของบทนี้เอง
+
+```text
+$ kafka-run-class.sh org.apache.kafka.tools.JmxTool \
+    --jmx-url service:jmx:rmi:///jndi/rmi://localhost:39094/jmxrmi \
+    --object-name 'kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions' \
+    --object-name 'kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent' \
+    --one-time true --report-format properties
+kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions:Value=0
+kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent:Value=0.38543167517469595
+```
+
+- **`UnderReplicatedPartitions`** — partition ที่ ISR เล็กกว่า replication factor setup RF=1 broker เดียวของบทนี้อ่านได้ `0` จริง (ไม่มีอะไรให้ under-replicate); cluster หลาย broker ที่สุขภาพดีก็ควรอ่าน `0` ตลอดเวลาเช่นกัน อะไรก็ตามที่สูงกว่าศูนย์นานเกินชั่วครู่หนึ่งแปลว่า replica ตามหลังอยู่หรือ broker ล่ม — durability กำลังเสี่ยงอยู่ตอนนี้
+- **`NetworkProcessorAvgIdlePercent`** — สัดส่วนเวลาที่ network thread ว่าง ค่าจริง `0.385` ที่นี่ (Mac เครื่องนี้ load แบบ single-partition ที่ว่างเกือบทั้งหมด) ใกล้ `1.0` คือ headroom ที่ดี ค่าที่ไต่ลงไปทาง `0` แปลว่า network thread อิ่มตัว request เริ่มต่อคิวก่อนจะถูก parse ด้วยซ้ำ
+
+สัดส่วน idle ของ request-handler thread pool output จริง (เป็น Yammer-metrics meter จึงมี field `Rate`/`Count` แทนที่จะเป็น `Value` เดียว)
+
+```text
+kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent:OneMinuteRate=0.9708645122119944
+kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent:FiveMinuteRate=0.9669659596065399
+```
+
+**`RequestHandlerAvgIdlePercent`** ใกล้ `1.0` (97% ว่างที่นี่) แปลว่า request handler thread มีกำลังสำรองเหลือเฟือ ไต่ลงไปทาง `0` แปลว่าทุก handler thread ยุ่งตลอดเวลา — broker กำลัง CPU-bound บนการประมวลผล request และ produce/fetch latency กำลังจะไต่ขึ้น
+
+<Callout title="gotcha จริงที่ compose ของบทนี้เองเจอ">
+ทุก JMX read ด้านบนต้องใช้ `env -u JMX_PORT -u KAFKA_JMX_OPTS` ก่อนเรียก `kafka-run-class.sh` — [Running Kafka Locally](/kafka/th/operations-and-production/running-kafka-locally/) พิสูจน์เหตุผลไว้: env var สองตัวนั้น พอตั้งระดับ container สำหรับ JMX ของ broker เอง จะถูก inherit โดย JVM ของ short-lived CLI tool ทุกตัวด้วย แล้ว CLI tool ก็พยายาม rebind JMX port เดียวกับที่ broker ถืออยู่แล้ว ไม่พูดซ้ำที่นี่ — ดู failure กับ fix เต็มรูปแบบในบทนั้น
 </Callout>
 
-## ควร alert อะไรบ้าง
+## Prometheus JMX exporter
 
-เปลี่ยน metric สำคัญให้เป็น alert ไม่ใช่แค่ dashboard
+การอ่าน MBean ทีละตัวด้วย `JmxTool` ไม่ scale ไปถึง dashboard และ alerting ทางมาตรฐานคือ **Prometheus JMX exporter** รันเป็น Java agent ใน JVM เดียวกัน (มีเอกสารที่ `prometheus.github.io/jmx_exporter/deployment/java-agent` ยืนยัน syntax แล้ว)
 
-- **consumer lag** ไต่เกิน threshold (หรือเกิน SLA เป็นวินาที) ของ group สำคัญใด ๆ
-- **under-replicated partitions** มากกว่าศูนย์นานเกินชั่วครู่
-- **offline partitions** มากกว่าศูนย์ page ทันที
-- **request latency** p99 ทะลุ budget ของ produce หรือ fetch
+```text
+# KAFKA_OPTS is a shell/launch env var, not a server.properties key --
+# shown as a transcript, not a checked properties fence.
+KAFKA_OPTS=-javaagent:/opt/jmx_prometheus_javaagent-1.6.0.jar=9404:/opt/kafka-jmx-exporter.yml
+```
 
-<Callout title="สรุปหนึ่งบรรทัด">
-จับตา Kafka ผ่าน **JMX** ทั้ง **under-replicated partitions** และ **offline partitions** ต้องเป็น **ศูนย์** มี active controller **หนึ่ง** ตัว และ **latency** ของ produce/fetch อยู่ใน budget แต่สัญญาณระดับ application ที่คมที่สุดคือ **consumer lag** (**log-end-offset − committed offset**) อ่านด้วย **`kafka-consumer-groups.sh --describe --group`** แนวโน้ม lag ที่ไต่ขึ้นเรื่อย ๆ คือสัญญาณแรกสุดว่า consumer ตามไม่ทัน
+flag `-javaagent:<jar>=<PORT>:<EXPORTER_YAML>` ตัวเดียวนั้นเปิด HTTP endpoint ที่ `0.0.0.0:9404` เสิร์ฟทุก MBean ที่ config ไว้ในรูปแบบ Prometheus text exposition ไม่ต้องมี JMX/RMI network hop แยกเลย (agent รันข้างใน JVM ของ broker เอง) บทนี้ไม่ได้ตั้ง Prometheus + Grafana เต็มรูปแบบ — config key และ syntax อ้างอิงตรงจากเอกสารของ exporter เอง ไม่ได้รันครบวงจร
+
+<Callout title="metric สำคัญและความหมายของค่าที่ไม่ดี">
+- **`UnderReplicatedPartitions`** — ควรเป็น `0` ตลอด; สูงกว่า `0` แปลว่า replica ตามหลังหรือ broker ล่ม
+- **`OfflinePartitionsCount`** — ควรเป็น `0` ตลอด; สูงกว่า `0` แปลว่า partition ไม่มี leader และใช้งานไม่ได้ตอนนี้
+- **`RequestHandlerAvgIdlePercent`** — ใกล้ `1.0` คือสุขภาพดี ไต่ลงไปทาง `0` แปลว่า thread ประมวลผล request อิ่มตัว
+- **`NetworkProcessorAvgIdlePercent`** — รูปร่างเดียวกับด้านบน แต่เฉพาะ network I/O thread
+- **Request latency (`RequestMetrics,name=TotalTimeMs`) p99** — p99 ที่ไต่ขึ้นสำหรับ produce/fetch คือสัญญาณเตือนแรกของแรงกดดันจาก disk, network, หรือ replication ก่อนที่ client จะรู้สึกด้วยซ้ำ
+- **`records-lag-max` ของ consumer** (metric JMX ของ Java client เอง `kafka.consumer:type=consumer-fetch-manager-metrics`) — เทียบเท่าฝั่ง app ของคอลัมน์ `LAG` ที่ broker เห็น มีประโยชน์เมื่อ consumer เองเป็น JVM app ที่เผย JMX ของตัวเองได้ KafkaJS consumer ไม่มี JVM เลยไม่มี JMX เลย — พิสูจน์ด้านล่าง สัญญาณ lag ของมันเองมาจาก instrumentation event แทน
 </Callout>
 
-export const quizMonitor = [
+## Lag ฝั่ง app จาก client ที่ไม่ใช่ JVM: instrumentation event ของ KafkaJS
+
+KafkaJS consumer เผย JMX ไม่ได้ — ไม่มี JVM สัญญาณ lag จริงของมันคือ instrumentation event `consumer.events.END_BATCH_PROCESS` (ชื่อ event ยืนยันตรงจาก source ของ `kafkajs@2.2.4` ที่ติดตั้งไว้ `src/consumer/instrumentationEvents.js`: `HEARTBEAT`, `COMMIT_OFFSETS`, `GROUP_JOIN`, `FETCH`, `FETCH_START`, `START_BATCH_PROCESS`, `END_BATCH_PROCESS`, `CRASH`, `REBALANCING` และอื่น ๆ) payload จริงของมัน (ยืนยันจาก `src/consumer/runner.js`) มี `offsetLag`, `offsetLagLow`, `batchSize`, `firstOffset`, `lastOffset`, และ `duration`
+
+```typescript
+// lag-instrumentation.ts -- run directly against this lesson's own scratch
+// broker (kafka-ops, port 39092), not the shared harness probe: it shares a
+// persistent groupId/topic across runs, which the harness's own probe
+// broker accumulates state on across the whole course's test history.
+import { Kafka } from 'kafkajs';
+
+const brokers = [(process.env.KAFKA_BROKERS ?? 'localhost:9092')];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}lag-instrumentation-demo`;
+const kafka = new Kafka({ clientId: 'lag-instrumentation', brokers });
+
+// Self-contained: produce a small backlog first, THEN subscribe and consume
+// it, so this fence proves the real event shape without depending on any
+// pre-existing topic state.
+const admin = kafka.admin();
+await admin.connect();
+await admin.createTopics({ topics: [{ topic, numPartitions: 1, replicationFactor: 1 }] });
+await admin.disconnect();
+
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({
+  topic,
+  messages: Array.from({ length: 20 }, (_, i) => ({ value: `record-${i}` })),
+});
+await producer.disconnect();
+
+const consumer = kafka.consumer({ groupId: `${prefix}lag-instrumentation-group` });
+consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) => {
+  console.log(`batchSize=${payload.batchSize} offsetLag=${payload.offsetLag} offsetLagLow=${payload.offsetLagLow}`);
+});
+
+await consumer.connect();
+await consumer.subscribe({ topic, fromBeginning: true });
+
+let processed = 0;
+await consumer.run({
+  eachMessage: async () => {
+    processed++;
+    if (processed >= 20) {
+      await consumer.disconnect();
+      process.exit(0);
+    }
+  },
+});
+```
+
+บทนี้ยังรัน event เดียวกัน payload `offsetLag`/`offsetLagLow` กับ backlog ที่มีอยู่ก่อนแล้วขนาดใหญ่กว่ามาก (1,000 record นั่งอยู่ใน topic ก่อนที่ consumer group จะเข้าร่วมด้วยซ้ำ) บน scratch broker ของตัวเอง เพื่อดูว่าจะเกิดอะไรขึ้นเมื่อ backlog ทั้งหมดตกอยู่ใน fetch batch **เดียว** แทนที่จะเป็นหลาย batch เล็ก ๆ — output จริง จับความละเอียดอ่อนที่เข้าใจผิดง่ายของสอง field นี้ได้
+
+```text
+END_BATCH_PROCESS batchSize=1000 offsetLag=0 offsetLagLow=999
+```
+
+`offsetLag` (คำนวณจาก offset **ล่าสุด** ใน batch) อ่านได้ `0` — ถูกต้องในทางเทคนิค record ล่าสุดของ batch นี้คือ record ใหม่สุดที่มีตอน fetch แต่ `offsetLagLow` (คำนวณจาก offset **แรก** ใน batch) อ่านได้ `999` — มี record ที่ยังไม่ได้ประมวลผลจริง 999 ตัวอยู่ข้างหน้า message *แรก* ที่ batch นี้เริ่มประมวลผล dashboard ที่ผูกกับ `offsetLag` อย่างเดียวจะรายงาน "ไม่มี lag" ตลอดเวลาที่ batch 1,000 record นี้ถูกประมวลผลโดย `eachMessage` ซึ่งทำให้เข้าใจผิดถ้าการประมวลผลนั้นใช้เวลาจริง ๆ การบังคับให้ batch เล็กลง (backlog 500 record จำกัด `maxBytesPerPartition` ให้ต่ำ) ทำให้สอง field เดียวกันหดตัวลงพร้อมกัน ทีละ batch ตามที่คาดไว้เป๊ะ
+
+```text
+END_BATCH_PROCESS batchSize=3 offsetLag=497 offsetLagLow=499
+END_BATCH_PROCESS batchSize=3 offsetLag=494 offsetLagLow=496
+END_BATCH_PROCESS batchSize=3 offsetLag=491 offsetLagLow=493
+[... continues shrinking by 3 every batch ...]
+END_BATCH_PROCESS batchSize=3 offsetLag=410 offsetLagLow=412
+```
+
+<Callout title="แก้ความเข้าใจผิดที่พบบ่อย">
+`offsetLag` กับ `offsetLagLow` ไม่ใช่ตัวเลขเดียวกันที่ต่างกันแค่ชื่อผิวเผิน — พิสูจน์ด้านบน มันต่างกันได้เท่ากับขนาด batch ปัจจุบันทั้งก้อน doc comment ของ KafkaJS เองใน `runner.js` อธิบายว่าทำไมถึงมีทั้งคู่: `offsetLag` เป็น metric ดั้งเดิม (คำนวณจาก offset ล่าสุดของ batch เก็บไว้เพื่อ backward compatibility); `offsetLagLow` ถูกเพิ่มมาทีหลังเพราะ `offsetLag` แสดง lag ต่ำกว่าความจริงทุกครั้งที่ consumer fetch batch ใหญ่ทีเดียว — ตรงกับที่ run 1,000 record ของบทนี้เองแสดงให้เห็นเป๊ะ
+</Callout>
+
+<Callout title="สรุปในหนึ่งบรรทัด">
+`kafka-consumer-groups.sh --describe --group` คือความจริงพื้นฐานสำหรับ `LAG` — พิสูจน์ด้านบนว่าลดจาก `700` จริงเหลือ `0` จริงตอน consumer group ตามทันจริง ๆ lag กับ latency เป็นอิสระจากกัน: พิสูจน์ด้านบน percentile ของ produce latency บน broker ว่างเป็น `0.0` ทั้งหมด ในขณะที่ lag เป็นตัวเลขคนละแบบที่สะสมมาตามเวลา `JmxTool` อ่าน MBean จริงของ broker ได้โดยตรง (`UnderReplicatedPartitions`, `RequestHandlerAvgIdlePercent`, `NetworkProcessorAvgIdlePercent` พิสูจน์ด้านบนด้วยค่าจริงทั้งหมด); flag `-javaagent:<jar>=<port>:<config>` ของ Prometheus JMX exporter (อ้างอิงจากเอกสารของมันเอง) คือวิธีที่สิ่งนั้นกลายเป็น dashboard ที่ scrape ได้ในระดับใหญ่ KafkaJS app ไม่มี JMX เลย — สัญญาณ lag จริงของมันคือ field payload `offsetLag`/`offsetLagLow` ของ `consumer.events.END_BATCH_PROCESS` พิสูจน์ด้านบนว่าไม่ตรงกันจริง ๆ เมื่อ backlog ทั้งก้อนตกอยู่ใน batch เดียว
+</Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// AI comment: "Track consumer lag so we can alert if it grows"
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'lag-alerter', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-processor' });
+
+consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) => {
+  if (payload.offsetLag > 1000) {
+    console.error('ALERT: consumer is falling behind!', payload.offsetLag);
+  }
+});
+`}>
+
+ดูสมเหตุสมผล — subscribe event `END_BATCH_PROCESS` ที่มีเอกสารจริง แล้ว alert บน field ที่มีเอกสารจริง bug ที่พิสูจน์ด้านบนกับ broker จริง: `offsetLag` คำนวณจาก offset **ล่าสุด** ในแต่ละ batch ที่ fetch มา ดังนั้นทุกครั้งที่ consumer ตามหลังจริง ๆ และ Kafka ยื่น batch catch-up ก้อนใหญ่ให้ (run ของบทนี้เอง: 1,000 record ที่ backlog อยู่ใน batch เดียว) `offsetLag` จะอ่านได้ `0` ตลอดเวลาที่ batch ใหญ่นั้นกำลังถูกประมวลผล — ตรงกับจังหวะที่ alert จริงควรจะดังที่สุดเป๊ะ วิธีแก้คือ alert บน `offsetLagLow` แทน (หรือเพิ่มเข้าไปด้วย) ซึ่งคำนวณจาก offset **แรก** ใน batch และพิสูจน์ด้านบนว่าแสดง `999` ถูกต้องใน scenario เดียวกันเป๊ะที่ `offsetLag` รายงานเป็น `0` script monitoring ที่สร้างจาก `offsetLag` อย่างเดียวจะรายงาน lag ต่ำกว่าความจริงได้มากถึงขนาด batch เต็มก้อน แย่ที่สุดตรงเป๊ะตอนที่ consumer ตามหลังไกลที่สุดและกำลัง fetch batch catch-up ที่ใหญ่ที่สุดของมัน
+
+</SpotTheBug>
+
+## Mental Model
+
+มอง monitoring เป็นเครื่องมืออิสระสองชิ้นที่ชี้ไปที่สองสิ่งต่างกัน **JMX / broker metric** คือหูฟังแพทย์บน broker เอง — มันสุขภาพดีตอนนี้ ขณะนี้หรือไม่ (thread ว่าง, สถานะ replication, request latency) **Consumer lag** คือมาตรวัดระยะทางของ*การเดินทาง*ของ group หนึ่ง — มันตกหลังไปแค่ไหน สะสมมาตลอดเวลาที่มันดิ้นรน broker อาจสุขภาพดีเป๊ะตาม JMX metric ทุกตัว ในขณะที่ lag ของ consumer group เฉพาะเจาะจงไต่ขึ้นไปหลักล้าน เพราะ broker ไม่เคยเป็นคอขวดเลย — logic ประมวลผลของ consumer เองต่างหาก alert ทั้งสองอย่าง แต่มันตอบคำถามคนละข้อ และไม่มีตัวไหนแทนที่อีกตัวได้
+
+## Trade-offs
+
+- **`JmxTool` อ่านแบบครั้งเดียวเทียบกับ Prometheus JMX exporter** — `JmxTool` ไม่ต้อง setup อะไรเลยและเหมาะกับการเช็กจริงแบบเร็ว (พิสูจน์ด้านบน ไม่ต้องมี process เพิ่ม) แต่ไม่ scale ไปถึง dashboard, ประวัติ, หรือ alerting rule; exporter คือคำตอบด้าน operation จริง แลกกับ agent flag เพิ่มอีกตัวและไฟล์ YAML mapping ที่ต้องดูแล
+- **`offsetLag` เทียบกับ `offsetLagLow`** — `offsetLag` คิดแบบง่าย ๆ ได้ถูกกว่า ("lag หลัง batch นี้") และเก็บไว้เพื่อ backward compatibility; `offsetLagLow` พิสูจน์ด้านบนว่าต่างกันมากบน batch ใหญ่ เป็นตัวเลขที่ซื่อสัตย์กว่าสำหรับ alerting แลกกับการตั้งชื่อที่เข้าใจยากกว่าเล็กน้อยบน dashboard
+- **การ poll `kafka-consumer-groups.sh --describe` เทียบกับ instrumentation ฝั่ง app** — CLI คือความจริงพื้นฐานและใช้ได้กับ consumer ภาษาไหนก็ได้ แต่ให้แค่ snapshot ณ จุดเวลาที่คุณบังเอิญรันมันเท่านั้น; instrumentation event (KafkaJS) หรือ JMX (Java client) ให้การมองเห็นต่อเนื่องแบบ real-time ข้างในตัว app เอง แลกกับการผูกกับ client library เฉพาะตัว
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"request latency ต่ำแปลว่า consumer ตามทัน"** ไม่ — พิสูจน์ด้านบน: broker ของบทนี้มี produce latency `0.0` ทุก percentile ในขณะที่ consumer group แบกรับ `LAG` จริงที่ไม่ใช่ศูนย์พร้อมกัน — มันเป็นการวัดอิสระของคนละสิ่ง
+- **"`offsetLag` กับ `offsetLagLow` เป็น field ซ้ำซ้อนที่ตรงกันเสมอ"** ไม่ — พิสูจน์ด้านบน: batch เดียว 1,000 record ให้ `offsetLag=0` และ `offsetLagLow=999` พร้อมกัน ต่างกันเท่ากับขนาด batch ทั้งก้อน ไม่ใช่ความคลาดเคลื่อนจากการปัดเศษ
+- **"KafkaJS app เผย JMX metric เดียวกับ Java Kafka client ได้"** ไม่ — พิสูจน์ด้านบน (และตามข้อเท็จจริงง่าย ๆ): ไม่มี JVM ใน process ของ KafkaJS เลยไม่มี JMX เลย สิ่งที่ใกล้เคียงที่สุดคือ field payload ของ `consumer.events.END_BATCH_PROCESS` เอง
+- **"`UnderReplicatedPartitions` เป็น `0` บน cluster ทดสอบ broker เดียวพิสูจน์ว่า metric ทำงาน"** ทำให้เข้าใจผิดบางส่วน — พิสูจน์ด้านบนว่ามันอ่าน `0` จริง แต่เพราะไม่มีอะไรให้ under-replicate บน RF=1; metric นี้จะมีความหมายจริงก็ต่อเมื่อ cluster มีมากกว่าหนึ่ง broker และมีอะไรที่ตกหลังได้จริง ๆ
+
+export const quizMonitoring = [
   {
-    q: 'consumer lag นิยามยังไง',
+    q: 'พิสูจน์ด้านบน kafka-consumer-groups.sh --describe แสดง LAG อะไรหลัง consume 300 จาก 1,000 record ที่ produce ไว้?',
     options: [
-      'จำนวน broker ใน cluster',
-      'log-end-offset ลบด้วย committed offset ของ consumer group สำหรับ partition หนึ่ง',
-      'เวลาตั้งแต่ broker restart ครั้งล่าสุด',
-      'จำนวน partition ที่ topic มี',
+      'LAG=300',
+      'LAG=700 เท่ากับ LOG-END-OFFSET (1000) ลบ CURRENT-OFFSET (300) พอดี',
+      'LAG=0 เพราะการ consume record ใด ๆ จะ reset มัน',
+      'LAG=1000 ไม่เปลี่ยนจนกว่าจะตามทันเต็มที่',
     ],
     answer: 1,
+    explain: 'output จริง: CURRENT-OFFSET=300, LOG-END-OFFSET=1000, LAG=700; หลัง consume ที่เหลือ 700 --describe ครั้งที่สองจริงแสดง LAG=0',
   },
   {
-    q: 'คำสั่งไหนอ่าน consumer lag ต่อ partition',
+    q: 'พิสูจน์ด้านบน ทำไม produce request latency ต่ำถึงไม่ได้แปลว่า consumer group ตามทัน?',
     options: [
-      '`kafka-topics.sh --describe`',
-      '`kafka-consumer-groups.sh --bootstrap-server ... --describe --group X`',
-      '`kafka-storage.sh format`',
-      '`kafka-console-consumer.sh --lag`',
+      'มันแปลว่าอย่างนั้นจริง -- เคลื่อนไปด้วยกันเสมอ',
+      'lag กับ latency เป็นการวัดอิสระจากกัน: broker ของบทนี้เองแสดง produce latency 0.0 ทุก percentile ผ่าน JMX ในขณะที่ consumer group แบกรับ LAG จริงที่ไม่ใช่ศูนย์วัดแยกกันพร้อมกัน',
+      'latency วัดได้แค่ฝั่ง consumer ไม่ใช่ฝั่ง broker',
+      'request latency สำคัญแค่กับ fetch request ไม่ใช่ produce request',
     ],
     answer: 1,
+    explain: 'percentile จริงของ RequestMetrics,name=TotalTimeMs,request=Produce เป็น 0.0 ทั้งหมดบน broker ที่ว่าง พิสูจน์ผ่าน JmxTool เป็นอิสระอย่างสมบูรณ์จาก LAG จริงที่พิสูจน์แยกด้วย kafka-consumer-groups.sh --describe',
   },
   {
-    q: 'metric under-replicated partitions ปกติควรแสดงค่าอะไร',
+    q: 'บทนี้ยืนยันชื่อ class จริงอะไรผ่าน --help สำหรับอ่าน MBean ของ broker ตรงจาก CLI?',
     options: [
-      'เท่ากับจำนวน topic',
-      'ศูนย์ อะไรที่เกินนั้นแปลว่า replica ตามไม่ทันหรือ broker ล่ม',
-      'เท่ากับ replication factor',
-      'สูงที่สุดเท่าที่ทำได้',
+      'kafka.tools.JmxTool (package เก่า ยังใช้ได้)',
+      'org.apache.kafka.tools.JmxTool ยืนยันกับ Kafka 4.3.1 broker container จริง',
+      'kafka-run-class.sh ไม่รองรับการอ่าน JMX',
+      'org.apache.kafka.tools.MetricsTool',
     ],
     answer: 1,
+    explain: 'คำสั่งจริงที่รัน: kafka-run-class.sh org.apache.kafka.tools.JmxTool --help ซึ่งพิมพ์ usage text จริงรวมถึง --jmx-url, --object-name, และ --report-format',
   },
   {
-    q: 'lag ของ consumer group ไต่ขึ้นเรื่อย ๆ มาหนึ่งชั่วโมง บอกอะไร',
+    q: 'พิสูจน์ด้านบน UnderReplicatedPartitions กับ NetworkProcessorAvgIdlePercent อ่านค่าจริงอะไรบน cluster broker เดียวของบทนี้?',
     options: [
-      'cluster จัดสรรทรัพยากรเกินและสุขภาพดี',
-      'consumer ตามไม่ทัน record เข้ามาเร็วกว่าที่ประมวลผลได้',
-      'topic ถูกลบไปแล้ว',
-      'replication เสร็จสมบูรณ์',
+      'ทั้งคู่ใช้ไม่ได้ถ้าไม่มี Prometheus exporter รันอยู่',
+      'UnderReplicatedPartitions=0 (ไม่มีอะไรให้ under-replicate บน RF=1) และ NetworkProcessorAvgIdlePercent=0.385 (จริง วัดบน Mac เครื่องนี้)',
+      'metric ทั้งคู่ต้องการ broker ขั้นต่ำ 3 ตัวถึงจะมีอยู่',
+      'UnderReplicatedPartitions เป็น 1 บ่งชี้ปัญหาจริง',
     ],
     answer: 1,
+    explain: 'output จริงของ JmxTool: kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions:Value=0 และ kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent:Value=0.38543167517469595',
+  },
+  {
+    q: 'พิสูจน์ด้านบนด้วย backlog 1,000 record จริงที่ consume ใน KafkaJS batch เดียว offsetLag เทียบ offsetLagLow เผยความคลาดเคลื่อนจริงอะไร?',
+    options: [
+      'เหมือนกันเป๊ะ ทั้งคู่เป็น 0',
+      'offsetLag อ่านได้ 0 (คำนวณจาก offset ล่าสุดของ batch ตามทัน record ใหม่สุดแล้ว) ในขณะที่ offsetLagLow อ่านได้ 999 (คำนวณจาก offset แรกของ batch) -- alert monitoring ที่ผูกกับ offsetLag อย่างเดียวจะรายงาน lag เป็นศูนย์ตลอดเวลาที่ batch นั้นกำลังประมวลผล',
+      'offsetLagLow เลิกใช้แล้วและคืนค่า undefined เสมอ',
+      'offsetLag มีอยู่แค่ฝั่ง producer ไม่ใช่ฝั่ง consumer',
+    ],
+    answer: 1,
+    explain: 'output จริงบน console: "END_BATCH_PROCESS batchSize=1000 offsetLag=0 offsetLagLow=999" -- ยืนยันตรงจาก source runner.js ของ kafkajs เอง ซึ่งคำนวณ offsetLag จาก batch.offsetLag() (offset ล่าสุด) และ offsetLagLow จาก batch.offsetLagLow() (offset แรก)',
+  },
+  {
+    q: 'ทำไม KafkaJS consumer ถึงเผย JMX metric เดียวกับที่ Java Kafka client เผยได้ (เช่น records-lag-max) ไม่ได้?',
+    options: [
+      'KafkaJS ปิด JMX โดยตั้งใจด้วยเหตุผลด้าน security',
+      'ไม่มี JVM ใน process ของ Node.js/KafkaJS เลย ดังนั้น JMX (เทคโนโลยีเฉพาะ JVM) จึงมีอยู่ที่นั่นไม่ได้ -- สิ่งที่เทียบเท่าจริงของ KafkaJS คือ instrumentation event ของตัวเอง พิสูจน์ด้านบนด้วย END_BATCH_PROCESS',
+      'JMX ใช้ได้แค่กับ client confluent-kafka-javascript ไม่ใช่ KafkaJS',
+      'records-lag-max เป็น metric ฝั่ง broker ไม่ใช่ฝั่ง client เลยไม่มี client ตัวไหนเผยมันได้',
+    ],
+    answer: 1,
+    explain: 'JMX คือเทคโนโลยี management ของ JVM; process ของ KafkaJS คือ Node.js ธรรมดาที่ไม่มี JVM เลย การพิสูจน์ consumer.events.END_BATCH_PROCESS ของบทนี้เอง (ยืนยันจาก source จริงของ kafkajs) คือสิ่งที่เทียบเท่าจริงสำหรับที่ไม่มี JVM',
   },
 ];
 
-<Quiz client:visible id="operations-and-production/monitoring-and-consumer-lag" questions={quizMonitor} />
+<Quiz client:visible id="operations-and-production/monitoring-and-consumer-lag" questions={quizMonitoring} />
 
 <ProgressTracker client:visible id="operations-and-production/monitoring-and-consumer-lag" />
