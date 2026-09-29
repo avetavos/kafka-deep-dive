@@ -1,0 +1,214 @@
+---
+// Ported from typescript-deep-dive/src/components/TSPlayground.astro
+// (in-browser TypeScript compile-check, same UMD-TS-from-jsdelivr approach —
+// see ts-runner.ts there for the base mechanism, unchanged here).
+//
+// KafkaJS type resolution — which of the two documented approaches worked:
+// Tried (a) first: fetch kafkajs's real `types/index.d.ts` from a CDN
+// (jsdelivr / esm.sh `?dts`) and register it as `node_modules/kafkajs/index.d.ts`
+// in the in-browser CompilerHost. Rejected: the real 2.2.4 d.ts starts with
+// `/// <reference types="node" />` + `import * as tls from 'tls'` +
+// `import * as net from 'net'` — resolving that pulls in most of @types/node
+// (net, tls, dns, crypto, stream, buffer, events, url, ...) across dozens of
+// files reachable only by walking further `/// <reference>` chains one CDN
+// fetch at a time. That is exactly the kind of fragile, slow, many-round-trip
+// dependency graph this component's existing lib-fetching code was built to
+// avoid for TS's own lib.*.d.ts closure (see fetchLibClosure in ts-runner.ts)
+// — replicating it for @types/node is not "offline-safe" and multiplies the
+// component's failure surface for no benefit to the two lessons that use it.
+//
+// Using (b) instead: a trimmed ambient `declare module 'kafkajs' { ... }`
+// at public/kafkajs-types.d.ts, generated (not hand-invented) from the real
+// `tools/probe/node_modules/kafkajs/types/index.d.ts` (2.2.4) — every member
+// kept is copied verbatim; only tls/net/Cluster/Logger-typed fields (ssl,
+// sasl, socketFactory, logCreator, partitionAssigners) are dropped (see that
+// file's header for the exact list). Because it's an ambient module
+// declaration, TypeScript resolves `import { Kafka } from 'kafkajs'` by name
+// match against the program's ambient modules — no node_modules path
+// resolution needed, so ts-runner.ts's existing in-memory CompilerHost only
+// needed one addition: an optional extra root file list (see `ExtraLib` /
+// `checkTypes(..., extraLibs)`).
+//
+// @confluentinc/kafka-javascript's KafkaJS-compat surface: left out. Its
+// types re-export from the same `kafkajs`-shaped surface plus librdkafka
+// native config (also net/tls-typed) — cheap only if bundled from a real
+// `.d.ts` the same way, and neither lesson embedding this component uses
+// that client, so it wasn't worth trimming a second package for no caller.
+//
+// Node globals (`process.env`, `setTimeout`) resolve the same way they do in
+// the TypeScript course: `strict`/`target: ES2024` with `skipLibCheck: true`
+// and the default lib closure fetched from jsdelivr — `setTimeout` comes from
+// lib.dom.d.ts (already fetched for every check), and `process` is not
+// declared here (no @types/node, per the tls/net reasoning above); no lesson
+// snippet embedded in this course references `process.env` inside a
+// TSPlayground block for that reason.
+import { Code } from 'astro-expressive-code/components';
+
+interface Props {
+  code: string;
+  id?: string;
+  title?: string;
+}
+
+const { code, id, title } = Astro.props;
+---
+
+<div class="tsp not-content" data-code={code} id={id}>
+  {title && <p class="tsp__title">{title}</p>}
+  <Code code={code} lang="ts" />
+  <div class="tsp__bar">
+    <button class="tsp__check" data-check type="button">Check types</button>
+    <button class="tsp__run" data-run type="button">Run ▸</button>
+    <a class="tsp__open" data-open href="#" target="_blank" rel="noopener">Open in TS Playground</a>
+    <span class="tsp__badge" data-badge></span>
+  </div>
+  <p class="tsp__hint" data-hint hidden></p>
+  <pre class="tsp__err" data-err hidden><code></code></pre>
+  <pre class="tsp__out" data-out hidden><code></code></pre>
+</div>
+
+<script>
+  import {
+    loadTypeScript,
+    checkTypes,
+    fetchLibFromCdn,
+    fetchExtraLibText,
+    hasTopLevelImport,
+    transpileForRun,
+    runInSandbox,
+    buildPlaygroundUrl,
+    CHECK_BADGE,
+    TS_CDN_VERSION,
+  } from './ts-runner';
+
+  const KAFKAJS_TYPES_URL = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/kafkajs-types.d.ts`;
+
+  const TH = document.documentElement.lang?.startsWith('th');
+  const T = TH
+    ? {
+        check: 'ตรวจ type',
+        run: 'รัน ▸',
+        open: 'เปิดใน TS Playground',
+        loading: 'กำลังโหลด TypeScript…',
+        running: 'กำลังรัน…',
+        noOutput: 'ไม่มี output',
+        noErrors: 'ไม่มี error',
+        importsNotRunnable: 'รันคำสั่ง import ไม่ได้ใน sandbox นี้ — ลองกด "เปิดใน TS Playground" แทน',
+        timedOut: 'รันไม่เสร็จภายในเวลาที่กำหนด (5 วินาที)',
+        failedCheck: 'ตรวจ type ไม่สำเร็จ — ลองใหม่อีกครั้ง',
+        badge: CHECK_BADGE.th,
+      }
+    : {
+        check: 'Check types',
+        run: 'Run ▸',
+        open: 'Open in TS Playground',
+        loading: 'Loading TypeScript…',
+        running: 'Running…',
+        noOutput: '(no output)',
+        noErrors: 'No errors ✓',
+        importsNotRunnable: "Imports aren't runnable in this sandbox — try \"Open in TS Playground\" instead.",
+        timedOut: 'Timed out after 5s.',
+        failedCheck: 'Type check failed — please try again.',
+        badge: CHECK_BADGE.en,
+      };
+
+  document.querySelectorAll<HTMLElement>('.tsp').forEach((tsp) => {
+    if (tsp.dataset.wired) return;
+    tsp.dataset.wired = '1';
+
+    const code = tsp.dataset.code || '';
+    const checkBtn = tsp.querySelector<HTMLButtonElement>('[data-check]');
+    const runBtn = tsp.querySelector<HTMLButtonElement>('[data-run]');
+    const openLink = tsp.querySelector<HTMLAnchorElement>('[data-open]');
+    const badge = tsp.querySelector<HTMLElement>('[data-badge]');
+    const hint = tsp.querySelector<HTMLElement>('[data-hint]');
+    const errBox = tsp.querySelector<HTMLElement>('[data-err]');
+    const outBox = tsp.querySelector<HTMLElement>('[data-out]');
+
+    if (checkBtn) checkBtn.textContent = T.check;
+    if (runBtn) runBtn.textContent = T.run;
+    if (openLink) {
+      openLink.textContent = T.open;
+      openLink.href = buildPlaygroundUrl(code);
+    }
+    if (badge) {
+      badge.textContent = T.badge;
+      badge.title = `Loaded from jsdelivr, pinned to ${TS_CDN_VERSION}; KafkaJS types from a trimmed local ambient .d.ts`;
+    }
+
+    function showHint(text: string) {
+      if (!hint) return;
+      hint.textContent = text;
+      hint.hidden = false;
+    }
+    function hideHint() {
+      if (hint) hint.hidden = true;
+    }
+    function showError(text: string) {
+      if (!errBox) return;
+      errBox.querySelector('code')!.textContent = text;
+      errBox.hidden = false;
+    }
+    function showOutput(text: string) {
+      if (!outBox) return;
+      outBox.querySelector('code')!.textContent = text;
+      outBox.hidden = false;
+    }
+    function resetPanels() {
+      if (errBox) errBox.hidden = true;
+      if (outBox) outBox.hidden = true;
+    }
+
+    checkBtn?.addEventListener('click', async () => {
+      checkBtn.disabled = true;
+      resetPanels();
+      showHint(T.loading);
+      try {
+        const ts = await loadTypeScript();
+        const kafkajsTypes = await fetchExtraLibText(KAFKAJS_TYPES_URL);
+        const result = await checkTypes(ts, code, fetchLibFromCdn, [
+          { fileName: 'kafkajs-types.d.ts', text: kafkajsTypes },
+        ]);
+        hideHint();
+        if (result.diagnostics.length === 0) {
+          showOutput(T.noErrors);
+        } else {
+          showError(result.diagnostics.join('\n'));
+        }
+      } catch {
+        hideHint();
+        showError(T.failedCheck);
+      } finally {
+        checkBtn.disabled = false;
+      }
+    });
+
+    runBtn?.addEventListener('click', async () => {
+      runBtn.disabled = true;
+      runBtn.textContent = T.running;
+      resetPanels();
+      if (hasTopLevelImport(code)) {
+        showError(T.importsNotRunnable);
+        runBtn.disabled = false;
+        runBtn.textContent = T.run;
+        return;
+      }
+      showHint(T.loading);
+      try {
+        const ts = await loadTypeScript();
+        const js = transpileForRun(ts, code);
+        hideHint();
+        const result = await runInSandbox(js);
+        if (result.errorLines.length) showError(result.errorLines.join('\n'));
+        if (result.timedOut) showError(T.timedOut);
+        showOutput(result.lines.join('\n') || T.noOutput);
+      } catch {
+        hideHint();
+        showError(T.failedCheck);
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = T.run;
+      }
+    });
+  });
+</script>

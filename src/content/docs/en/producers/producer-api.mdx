@@ -10,6 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import TSPlayground from '../../../../components/TSPlayground.astro';
 
 ## The idea in one sentence
 
@@ -149,6 +150,48 @@ export const producerDiagram = `flowchart LR
   buf --> io["KafkaJS batches and sends"]
   io --> broker["Broker appends to partition"]
   broker --> cb["Promise resolves: metadata, or throws"]`;
+
+## Try it: type-check a KafkaJS producer call
+
+`tsc` catches shape mistakes in a `producer.send()` call before the code ever touches a broker. The playground below type-checks in your browser against KafkaJS's real types — try the clean call first, then the broken one to see the actual compiler diagnostic.
+
+<TSPlayground code={producerApiPlaygroundCode} id="producers-producer-api" title="A clean producer.send() call" />
+
+<TSPlayground code={producerApiBrokenPlaygroundCode} id="producers-producer-api-broken" title="Same call, one bug: topic is a number instead of a string" />
+
+export const producerApiPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+
+async function main() {
+  await producer.connect();
+  const [meta] = await producer.send({
+    topic: 'orders',
+    messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }],
+  });
+  console.log(\`sent to \${meta.topicName}-\${meta.partition} @ offset \${meta.baseOffset}\`);
+  await producer.disconnect();
+}
+
+main();`;
+
+export const producerApiBrokenPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+
+async function main() {
+  await producer.connect();
+  // bug: topic must be the topic name (a string), not a number
+  await producer.send({
+    topic: 42,
+    messages: [{ key: 'order-42', value: JSON.stringify({ amount: 19.99 }) }],
+  });
+  await producer.disconnect();
+}
+
+main();`;
 
 ## Two defaults everyone gets wrong, verified from source
 

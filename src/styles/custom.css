@@ -151,3 +151,15 @@ html.read-mode .readmode-toggle {
 
 /* ---- Paper read mode: keep content clear of the sticky header ---- */
 html.read-mode .main-frame { padding-top: var(--sl-nav-height, 3.5rem) !important; }
+
+/* TSPlayground (ported from typescript-deep-dive) */
+.tsp { margin:1rem 0; }
+.tsp__title { font-weight:600; margin:0 0 .25rem; }
+.tsp__bar { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; margin:.35rem 0 .25rem; }
+.tsp__check, .tsp__run { cursor:pointer; font-size:.78rem; border:1px solid var(--sl-color-accent); border-radius:4px; padding:.15rem .6rem; background:var(--sl-color-accent); color:#fff; }
+.tsp__check:disabled, .tsp__run:disabled { opacity:.6; cursor:default; }
+.tsp__open { font-size:.78rem; border:1px solid var(--sl-color-accent); border-radius:4px; padding:.15rem .6rem; background:transparent; color:var(--sl-color-accent); text-decoration:none; }
+.tsp__badge { margin-left:auto; font-size:.72rem; opacity:.7; }
+.tsp__hint { font-size:.8rem; opacity:.7; margin:.25rem 0; }
+.tsp pre { white-space:pre; overflow:auto; }
+.tsp__out { border-left:3px solid #339933; } .tsp__err { border-left:3px solid var(--sl-color-red); color:var(--sl-color-red-high); }
