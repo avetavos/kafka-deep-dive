@@ -1,0 +1,441 @@
+---
+title: 'Worked review 1: an order-service Kafka producer'
+description: 'An AI-generated KafkaJS producer module for an order service — reviewed bug by bug against real duplicate-on-retry, ordering, connection-churn, and compression failures on a live Kafka 4.3.1 broker.'
+sidebar:
+  order: 4
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Write a `createOrder` function for our order service that publishes the order to Kafka with KafkaJS."* What follows is the kind of first draft an AI assistant hands back for exactly that prompt — every option it sets is a real KafkaJS option, every call compiles, and a single happy-path call to `createOrder` genuinely does put a record on the `orders` topic. Read it the way the **[review checklist](/kafka/en/reading-kafka/review-checklist/)** recommends: what does it do to state that outlives one call (connections, topics), then correctness (acks, ordering, idempotence), then failure handling. It has **8 real bugs**; check the **[AI bug catalog](/kafka/en/reading-kafka/ai-bug-catalog/)** for the general pattern behind most of them. Every claim below was proven on a real single-broker Kafka 4.3.1 KRaft container for this module (`docker compose -p kafka-reading-b up -d`, ports 49092-49094 so it never collides with the harness broker or a sibling module's own stack) — real `producer.send()` calls, a real `kafka-dump-log.sh --print-data-log`, and a real `tsc --noEmit`.
+
+## The generated code
+
+```typescript
+// reading-kafka/worked-review-1/order-producer.ts -- as generated, see review below
+import { Kafka, CompressionTypes } from 'kafkajs';
+
+interface OrderEvent {
+  customerId: string;
+  orderId: string;
+  amount: number;
+}
+
+export async function createOrder(order: OrderEvent): Promise<{ status: string }> {
+  const kafka = new Kafka({
+    clientId: 'orders-api',
+    brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'],
+  });
+  const producer = kafka.producer();
+  await producer.connect();
+
+  producer.send({
+    topic: 'orders',
+    acks: 1,
+    compression: CompressionTypes.Snappy,
+    messages: [{ value: JSON.stringify(order) }],
+  });
+
+  await producer.disconnect();
+  return { status: 'accepted' };
+}
+```
+
+```typescript
+// reading-kafka/worked-review-1/transaction-timeout.ts -- @expect-error Object literal may only specify known properties, and 'transactionTimeout' does not exist in type 'ProducerRecord'
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-app', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+
+async function createOrder(order: { orderId: string }) {
+  await producer.connect();
+  await producer.send({
+    topic: 'orders',
+    transactionTimeout: 60000, // AI comment: "give the transaction more time to commit"
+    messages: [{ value: JSON.stringify(order) }],
+  });
+}
+```
+
+## The review walk
+
+### A fresh connection on every call
+
+`new Kafka({...})` and `producer.connect()` both live **inside** `createOrder` — every call opens a brand-new TCP connection, negotiates API versions, and fetches metadata, then tears it all down again with `disconnect()`. Proven directly by timing 20 calls both ways against this module's own broker:
+
+```text
+mode=per-request N=20 total_ms=144 avg_ms_per_call=7.2
+mode=reused N=20 total_ms=36 avg_ms_per_call=1.8
+```
+
+<SpotTheBug code={`const kafka = new Kafka({ ... });
+const producer = kafka.producer();
+await producer.connect();
+// ... send ...
+await producer.disconnect();`}>
+A `Kafka` client and a connected `producer` are meant to be built **once per process** and reused for the life of that process — connecting is a real handshake (TCP + SASL/TLS if configured + an `ApiVersions` request + a metadata fetch), not a free operation. Building and tearing one down inside a per-request handler pays that full cost on every single call: proven above at roughly **4x** the per-call time on this Mac's loopback network alone, before any real network latency, TLS, or SASL is added on top. The fix is a module-level singleton: construct `kafka` and `producer` once, `connect()` once (e.g. at process startup), and only `disconnect()` on shutdown (`SIGTERM`).
+</SpotTheBug>
+
+### The topic is never created — `orders` only exists because auto-create made it exist
+
+Nothing in this module ever calls `admin.createTopics`. The very first `send()` to a topic that doesn't exist yet is silently covered by the broker's own `auto.create.topics.enable` (`true` by default, confirmed directly against this module's own broker: `kafka-configs.sh --entity-type brokers --entity-name 1 --describe --all` reports `auto.create.topics.enable=true`) — with `num.partitions=1`. Proven with a real send to a brand-new topic name and a real describe right after:
+
+```text
+$ kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic wr1-never-created
+Topic: wr1-never-created	TopicId: nA-RxBXFQuOV4mVipfX8eA	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=1
+```
+
+And the reverse failure, proven by restarting this module's own broker with `auto.create.topics.enable=false` and repeating the exact same send:
+
+```text
+{"level":"ERROR","message":"[Connection] Response Metadata(key: 3, version: 6)","error":"This server does not host this topic-partition"}
+send() rejected: This server does not host this topic-partition retriable: false
+```
+
+<SpotTheBug code={`producer.send({
+  topic: 'orders',
+  // no admin.createTopics anywhere in this module
+});`}>
+`auto.create.topics.enable` is a **broker-wide, static** setting (confirmed directly: `kafka-configs.sh --alter --add-config auto.create.topics.enable=false` was rejected outright with `Cannot update these configs dynamically`) — this code has no control over it at all, and every environment it runs in may have it set differently. When it's on, the order service silently ends up with a `1`-partition `orders` topic (`num.partitions=1` is itself just as much this broker's own default as the flag is), locking in exactly the partition count this same code's own key-based routing (see the next bug) depends on getting right. When it's off, in a **less** forgiving environment, the very first request fails outright with `UNKNOWN_TOPIC_OR_PARTITION`. The fix is calling `admin.createTopics` explicitly, with the partition count and replication factor the service actually needs, once at startup — treat topic existence as this service's own concern, not the broker's default behavior.
+</SpotTheBug>
+
+### `acks: 1` "for speed"
+
+`acks: 1` only waits for the **partition leader** to append the record — it says nothing about any follower. On this module's single-broker (RF=1) setup every replica the leader has *is* itself, so `acks: 1` and `acks: -1` (all) behave identically here; the real cost only shows up once replication factor is greater than 1, which the **[Acks and Durability](/kafka/en/producers/acks-and-durability/)** lesson proves directly with a 3-broker cluster: an `acks: 1` write can be acknowledged and then lost outright if that exact leader crashes before a follower ever replicates it, while `acks: -1` with `min.insync.replicas >= 2` cannot.
+
+<SpotTheBug code={`producer.send({
+  topic: 'orders',
+  acks: 1, // "for speed"
+  ...
+});`}>
+"For speed" is a real trade-off, but it's the wrong one to make silently in an order service: `acks: 1` trades a small amount of latency for the acknowledged write surviving a leader crash — proven with a real leader kill in the Acks and Durability lesson linked above. `acks` defaults to `-1` in KafkaJS already; a comment justifying "for speed" here is *weakening* a strong default, not merely leaving it alone. The fix is `acks: -1` (or simply omitting `acks`, since `-1` is already the default) paired with `min.insync.replicas` set to at least 2 once replication factor is above 1.
+</SpotTheBug>
+
+### `compression: CompressionTypes.Snappy` — a codec KafkaJS never implements
+
+Read directly from the installed `kafkajs@2.2.4` source (`node_modules/kafkajs/src/protocol/message/compression/index.js`):
+
+```text
+const Codecs = {
+  [Types.GZIP]: () => require('./gzip'),
+  [Types.Snappy]: () => { throw new KafkaJSNotImplemented('Snappy compression not implemented') },
+  [Types.LZ4]: () => { throw new KafkaJSNotImplemented('LZ4 compression not implemented') },
+  [Types.ZSTD]: () => { throw new KafkaJSNotImplemented('ZSTD compression not implemented') },
+}
+```
+
+Only `GZIP` has a real implementation bundled — `Snappy`, `LZ4`, and `ZSTD` unconditionally throw unless the caller registers an external codec module first (`CompressionCodecs[CompressionTypes.Snappy] = require('kafkajs-snappy')`, which this module never does). Proven with a real send:
+
+```text
+$ node order-producer.ts
+send() rejected: KafkaJSNotImplemented - Snappy compression not implemented
+```
+
+<SpotTheBug code={`compression: CompressionTypes.Snappy,`}>
+This isn't a missing native dependency that silently degrades to no compression — `KafkaJSNotImplemented` is thrown for **every** `send()` call, immediately, on this exact line. `CompressionTypes.Snappy` existing as an importable enum value creates the reasonable-looking impression that KafkaJS can produce Snappy-compressed batches out of the box; it cannot, without also installing and registering a third-party codec package. The fix is `CompressionTypes.GZIP` (the one codec that ships and needs zero extra setup), or installing and registering a real Snappy/LZ4/ZSTD codec package first if a specific codec is actually required.
+</SpotTheBug>
+
+### No message key — this customer's orders land on three different partitions
+
+`messages: [{ value: ... }]` never sets a `key`. Proven by sending 6 messages for the same `customer-77` with and without a key, to two otherwise-identical 3-partition topics:
+
+```text
+=== no key ===
+seq=0 -> partition 2
+seq=1 -> partition 0
+seq=2 -> partition 1
+seq=3 -> partition 2
+seq=4 -> partition 0
+seq=5 -> partition 1
+
+=== with key ===
+seq=0 -> partition 1
+seq=1 -> partition 1
+seq=2 -> partition 1
+seq=3 -> partition 1
+seq=4 -> partition 1
+seq=5 -> partition 1
+```
+
+<SpotTheBug code={`messages: [{ value: JSON.stringify(order) }],`}>
+Kafka only guarantees ordering **within a single partition** — a consumer reading partitions 2, 0, 1, 2, 0, 1 in whatever order it happens to poll them has no way to reconstruct that `seq=0` came before `seq=3` for this customer, even though both landed on partition 2. This is exactly why the **[Keys and Partitioning](/kafka/en/producers/keys-and-partitioning/)** lesson treats the key as the ordering mechanism, not an optional field: every message for the same key hashes to the same partition (proven above: all 6 landed on partition 1), and a single partition is read by exactly one consumer in a group at a time, in write order. The fix is `key: order.customerId` — any field the business actually needs ordered together.
+</SpotTheBug>
+
+### `idempotent` never set — a retried write becomes two writes
+
+Nothing sets `idempotent` on `kafka.producer()`, so it defaults to `false` (confirmed directly: `node_modules/kafkajs/src/producer/index.js` line 37, `idempotent = false,` — the opposite of the Java client, where `enable.idempotence=true` has been the default since Kafka 3.0). A retry duplicate needs a specific, real condition: the broker durably writes the record but the acknowledgement never makes it back before the client's request timeout fires, so the client — with no way to distinguish "lost on the way there" from "lost on the way back" — retries. This was reproduced deterministically (not by racing `docker pause` against a `<5ms` loopback round trip, but with a small TCP proxy in front of this module's own broker that forwards every request immediately and holds only `Produce` responses for a fixed window, so every retry really does reach and get applied by the broker):
+
+```text
+proxy: Produce request correlationId=2 -> will hold its response 5000ms
+proxy: Produce request correlationId=3 -> will hold its response 5000ms
+proxy: Produce request correlationId=4 -> will hold its response 5000ms
+... (9 correlation ids total, one per client-side retry attempt)
+
+$ kafka-dump-log.sh --print-data-log --files .../wr1-dup-nonidem-0/00000000000000000000.log
+baseOffset: 0 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 1 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+baseOffset: 2 ... producerId: -1 sequence: 0 | key: order-42 payload: {"amount":19.99}
+... 9 identical records total, one per retry, producerId: -1 (no idempotence tracking at all)
+```
+
+The exact same treatment with `idempotent: true` on an otherwise-identical producer: the client made the same 9 attempts against the same held-response proxy, but the broker kept **one** record —
+
+```text
+baseOffset: 0 ... producerId: 0 producerEpoch: 0 baseSequence: 0 lastSequence: 0
+| offset: 0 sequence: 0 key: order-42 payload: {"amount":19.99}
+```
+
+<SpotTheBug code={`const producer = kafka.producer();`}>
+Identical client-side retry behavior, opposite broker-side outcome — because only the idempotent producer stamps every attempt with a `producerId` and sequence number the broker can recognize as "already applied," so 9 real, separate `Produce` requests collapse into exactly 1 committed record instead of 9. For an order service, this is the difference between a customer being charged once and being charged 9 times for a transient network hiccup that never even reached the application layer as an error. The fix is `kafka.producer({ idempotent: true })` (which, in KafkaJS, also pins `maxInFlightRequests` to 1 unless explicitly overridden with retries enabled — see the [idempotent producer](/kafka/en/producers/idempotent-producer/) lesson for the PID/sequence mechanism in full).
+</SpotTheBug>
+
+### `producer.send(...)` without `await`, then an immediate `disconnect()`
+
+`producer.send({...})` is called with no `await` and no `.catch` — its returned promise is simply discarded — and the very next line calls `producer.disconnect()`. Proven with a realistic HTTP-handler shape: `createOrder` returns normally, "sends" its 200 OK, and only *after* that does the discarded promise reject:
+
+```text
+createOrder(o-swallowed-1) returned normally -- caller believes this succeeded
+HTTP handler would now send 200 OK: {"status":"accepted","orderId":"o-swallowed-1"}
+...500ms later, the process is still running; the rejection above happened with nothing to catch it
+UNHANDLED REJECTION: KafkaJSNotImplemented - Snappy compression not implemented
+```
+
+<SpotTheBug code={`producer.send({ ... }); // no await, no .catch
+await producer.disconnect();`}>
+The caller of `createOrder` — an HTTP handler, most realistically — has already returned a success response by the time this rejection happens, proven above by the literal order of the printed lines. Worse, `disconnect()` runs immediately afterward, so even a genuinely successful send races its own connection being torn down mid-flight. A Node process with no global `unhandledRejection` handler crashes here (silently, if that crash isn't observed); one that does have a handler that only logs makes this failure mode permanent and invisible — the order is gone, and the caller was already told it succeeded. The fix is `await producer.send(...)` inside a `try`/`catch` that lets `createOrder`'s own caller decide what "the order failed to publish" means for its response — and never disconnecting a producer that a concurrent call might still be using.
+</SpotTheBug>
+
+### `transactionTimeout` set on `send()` instead of on `producer()`
+
+The second generated snippet sets `transactionTimeout: 60000` as a `send()`-call option. `transactionTimeout` is a real KafkaJS option (confirmed directly in `node_modules/kafkajs/types/index.d.ts`, line 105 — it belongs to `ProducerConfig`, the object passed to `kafka.producer({...})`), which makes this a subtler bug than a purely hallucinated key: the AI got the *name* right and the *location* wrong. `ProducerRecord` (the object passed to `send()`) has no such field, so `tsc --noEmit` catches it immediately:
+
+```text
+$ tsc --noEmit --strict transaction-timeout.ts
+transaction-timeout.ts(10,5): error TS2353: Object literal may only specify known properties, and 'transactionTimeout' does not exist in type 'ProducerRecord'.
+```
+
+<SpotTheBug code={`await producer.send({
+  topic: 'orders',
+  transactionTimeout: 60000,
+  ...
+});`}>
+`transactionTimeout` is also only meaningful for a **transactional** producer in the first place (one constructed with a `transactionalId`) — this module's producer isn't transactional at all, so even moved to the right location, the option would do nothing here. This is the kind of bug the type checker genuinely catches, unlike every other bug in this review: a real, immediate, compile-time `tsc` error rather than something that only shows up under a specific runtime condition. The fix is deleting the line entirely, since `createOrder` never opens a transaction.
+</SpotTheBug>
+
+## The corrected code
+
+```typescript
+// src/reading-kafka/worked-review-1/order-producer-fixed.ts
+// @run
+import { Kafka, CompressionTypes, Partitioners } from 'kafkajs';
+
+interface OrderEvent {
+  customerId: string;
+  orderId: string;
+  amount: number;
+}
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const topic = `${prefix}wr1-orders`;
+
+// Module-level singleton -- one Kafka client, one connected producer, built
+// once per process, not once per request.
+const kafka = new Kafka({ clientId: 'orders-api', brokers });
+const producer = kafka.producer({
+  createPartitioner: Partitioners.DefaultPartitioner,
+  idempotent: true, // KafkaJS defaults this to false -- explicit, unlike the Java client
+  maxInFlightRequests: 1, // keeps ordering intact per partition under retry, alongside idempotence
+});
+
+let ready = false;
+async function ensureReady() {
+  if (ready) return;
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({ topics: [{ topic, numPartitions: 3, replicationFactor: 1 }] });
+  await admin.disconnect();
+  await producer.connect();
+  ready = true;
+}
+
+export async function createOrder(order: OrderEvent): Promise<void> {
+  await ensureReady();
+  try {
+    const [r] = await producer.send({
+      topic,
+      acks: -1, // explicit -- wait for every in-sync replica, not just the leader
+      compression: CompressionTypes.GZIP, // the one codec KafkaJS actually implements
+      messages: [{ key: order.customerId, value: JSON.stringify(order) }], // key -> per-customer ordering
+    });
+    console.log(`order ${order.orderId} -> partition ${r.partition}, offset ${r.baseOffset}`);
+  } catch (err) {
+    // no more swallowed rejections -- the caller decides what "order create failed" means
+    throw new Error(`createOrder(${order.orderId}) failed: ${(err as Error).message}`);
+  }
+}
+
+async function main() {
+  await createOrder({ customerId: 'customer-77', orderId: 'o-1', amount: 10 });
+  await createOrder({ customerId: 'customer-77', orderId: 'o-2', amount: 20 });
+  await createOrder({ customerId: 'customer-99', orderId: 'o-3', amount: 30 });
+  console.log('3 orders sent, all acked by every in-sync replica');
+  await producer.disconnect();
+  process.exit(0);
+}
+
+main();
+```
+
+Run for real against this module's own broker (the harness's `--run` repeats this against its own broker at gate time):
+
+```text
+order o-1 -> partition 1, offset 0
+order o-2 -> partition 1, offset 1
+order o-3 -> partition 1, offset 2
+3 orders sent, all acked by every in-sync replica
+```
+
+`o-1` and `o-2` — same `customerId`, hence same key — land on the same partition, in order, at consecutive offsets; a real `kafka-dump-log.sh --print-data-log` on that partition confirms `compresscodec: gzip` and `producerId: 0` (idempotence tracking active) on every record.
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `new Kafka()` + `producer.connect()` inside `createOrder`, every call | Module-level singleton, connected once — real ~4x per-call time drop measured above |
+| 2 | Topic never created; relies on `auto.create.topics.enable` | Explicit `admin.createTopics` at startup with the real partition count |
+| 3 | `acks: 1` "for speed" | `acks: -1` (all in-sync replicas) — matters once RF > 1, proven in Acks and Durability |
+| 4 | `compression: CompressionTypes.Snappy` (not implemented in KafkaJS) | `CompressionTypes.GZIP` — real `KafkaJSNotImplemented` otherwise |
+| 5 | No message key — same customer's orders scattered across partitions | `key: order.customerId` — proven: all 6 landed on the same partition, in order |
+| 6 | `idempotent` never set (defaults `false`) | `idempotent: true` — proven: 9 retried attempts collapsed to 1 committed record, not 9 |
+| 7 | `producer.send(...)` without `await`/`catch`, then immediate `disconnect()` | `await` inside `try`/`catch`; producer stays connected for the process's life |
+| 8 | `transactionTimeout` set on `send()` instead of `producer()` | Deleted — this producer isn't transactional; real `tsc` `TS2353` otherwise |
+
+## What the reviewer writes in the PR
+
+> This is close, but I can't approve it as-is — 8 things, roughly in the order they'd bite in production:
+>
+> 1. **Connection per call.** `new Kafka()`/`connect()` belongs at module scope, not inside `createOrder`. Measured ~4x overhead per call locally; it'll be worse under real network latency.
+> 2. **No `admin.createTopics`.** We're relying on `auto.create.topics.enable`, which is off in staging/prod — this will throw `UNKNOWN_TOPIC_OR_PARTITION` the first time it runs there.
+> 3. **`acks: 1` "for speed."** Not our call to make silently in an order service — please use the default (`-1`) and set `min.insync.replicas` once we're multi-broker.
+> 4. **`CompressionTypes.Snappy`** isn't implemented in KafkaJS — this throws on every single send. Use `GZIP`.
+> 5. **No message key.** Same customer's orders need to land on one partition to stay ordered — `key: order.customerId`.
+> 6. **`idempotent` isn't set.** Defaults to `false` in this client (opposite of the Java client) — please set it explicitly, or a network blip double-charges a customer.
+> 7. **Missing `await`/`catch` on `send()`, plus a `disconnect()` right after.** We return "accepted" before we know the send even worked, and then tear down the connection under it.
+> 8. **`transactionTimeout` on `send()` doesn't compile** — it's a `producer()` option, and this producer isn't transactional anyway. Delete the line.
+>
+> Happy to pair on the fix — none of these need a redesign, just moving a few things to the right place.
+
+## Mental Model
+
+Two of these eight bugs (6, 8) are the kind static analysis can genuinely help with: `tsc` catches bug 8 outright, and bug 6 is a one-line source read away (`idempotent = false` in the installed package). The other six all compile and run without error on a happy path — each one is a real KafkaJS option or a reasonable-looking omission that only shows a problem under a specific condition this review had to construct on purpose: a connection torn down and rebuilt fast enough that the overhead is easy to miss without timing it, a topic that "just works" until the environment's defaults differ, a codec enum value that exists without an implementation behind it, a key left off until two messages for the same entity need to agree on order, a retry racing an acknowledgement, a promise nobody awaited.
+
+## Common Misconceptions
+
+- **"If `producer.send()` doesn't throw synchronously, the message was sent."** Proven above: a `send()` call with no `await` returns *nothing* synchronously — the promise it created rejected 500ms later, after the caller had already moved on and reported success.
+- **"KafkaJS supports the standard Kafka compression codecs out of the box."** Proven above directly from the installed package's own source: only `GZIP` has a real implementation; `Snappy`, `LZ4`, and `ZSTD` are enum values that unconditionally throw `KafkaJSNotImplemented` unless a third-party codec is registered first.
+- **"Reusing one producer across requests is a premature optimization."** Proven above with a real, repeatable timing measurement: rebuilding the client and connection per call costs roughly 4x the per-call time on this Mac's own loopback network, before any real network latency is added.
+
+<Mermaid title="Where each bug sits in one createOrder call" code={wr1Diagram} />
+
+export const wr1Diagram = `flowchart TD
+  A["new Kafka + connect()"] -->|"1: rebuilt every call"| A
+  A --> B["send to topic 'orders'"]
+  B -->|"2: topic never created explicitly"| B
+  B --> C["acks: 1"]
+  C -->|"3: weakens the KafkaJS default"| C
+  B --> D["compression: Snappy"]
+  D -->|"4: KafkaJSNotImplemented"| D
+  B --> E["messages: no key"]
+  E -->|"5: ordering lost across partitions"| E
+  A --> F["producer: idempotent unset"]
+  F -->|"6: retry = duplicate record"| F
+  B --> G["send(...) -- no await"]
+  G -->|"7: rejection swallowed"| G
+  A --> H["disconnect() right after"]
+  H -->|"7: races the in-flight send"| H
+`;
+
+<Callout title="The one-line takeaway">
+Six of these eight bugs never produce an error anywhere in this module's own happy-path run — a connection rebuilt every call, a topic that exists only because the broker's own default let it, a durability setting weakened "for speed," a codec enum with no implementation behind it, a missing key, and a retry with no idempotence guard all look identical to correct code until something forces the specific condition each one depends on. Only the type checker (bug 8) and a direct source read (bug 6) give any warning before that.
+</Callout>
+
+export const quizWorkedReview1 = [
+  {
+    q: "Timing 20 calls to a `createOrder`-shaped function that builds `new Kafka()` + `connect()` per call vs. one that reuses a module-level producer gave `avg_ms_per_call=7.2` vs `avg_ms_per_call=1.8` on the same machine. What does that ~4x difference actually measure?",
+    options: [
+      'Network latency, which is identical in both cases',
+      "The real cost of a fresh TCP connection, API-version negotiation, and a metadata fetch on every call -- work a long-lived producer does exactly once",
+      'A bug specific to this one measurement, not a general KafkaJS behavior',
+      'The cost of JSON.stringify, unrelated to the Kafka client',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: both variants ran the identical send() against the identical broker; the only difference was whether connect() happened once (module scope) or on every call (inside the function) -- the ~4x gap is exactly that handshake overhead, paid once instead of N times.',
+  },
+  {
+    q: "`kafka-configs.sh --entity-type brokers --entity-name 1 --alter --add-config auto.create.topics.enable=false` was rejected with `Cannot update these configs dynamically`. What does this mean for a service that never calls `admin.createTopics` and just relies on the broker's default?",
+    options: [
+      'Nothing -- the setting can always be flipped later without a restart',
+      "The setting is fixed at broker startup; the same code that 'just works' when it's true will throw UNKNOWN_TOPIC_OR_PARTITION in any environment where it's false, with no way to fix it from the client side at runtime",
+      'auto.create.topics.enable only affects consumers, not producers',
+      'This config only matters for internal topics like __consumer_offsets',
+    ],
+    answer: 1,
+    explain: "Proven directly above: the real UNKNOWN_TOPIC_OR_PARTITION-shaped error ('This server does not host this topic-partition', retriable: false) appeared the moment auto-create was disabled and the exact same send() ran again -- explicit admin.createTopics removes the dependency on this static, environment-specific default entirely.",
+  },
+  {
+    q: '`node_modules/kafkajs/src/protocol/message/compression/index.js` shows `[Types.Snappy]: () => { throw new KafkaJSNotImplemented(...) }`. Why does `compression: CompressionTypes.Snappy` still look like reasonable code to write?',
+    options: [
+      'It is reasonable -- KafkaJS ships Snappy support by default',
+      'CompressionTypes.Snappy is a real, importable enum value, which creates the impression of a supported codec even though only GZIP has an actual implementation bundled -- Snappy/LZ4/ZSTD all throw unconditionally unless a third-party codec is registered first',
+      'The error only happens in TypeScript, not at runtime with plain JavaScript',
+      'Snappy works, but only for keyed messages',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: a real send() with compression: CompressionTypes.Snappy rejected with the exact KafkaJSNotImplemented message read from the installed source -- the enum value existing says nothing about whether an implementation backs it.',
+  },
+  {
+    q: 'Sending 6 messages for the same `customer-77` with no `key` landed on partitions `2, 0, 1, 2, 0, 1`; the identical 6 messages with `key: "customer-77"` all landed on partition `1`. Why does the no-key version lose ordering even though every individual `send()` call still succeeds?',
+    options: [
+      'It does not lose ordering -- Kafka orders all messages globally regardless of partition',
+      'Kafka only guarantees order within a single partition; with no key, the default partitioner spreads messages round-robin-ish across all partitions, so a consumer reading multiple partitions has no way to reconstruct this customer\'s true send order',
+      'The messages are still ordered as long as they share the same topic',
+      'This only matters if the topic has replication factor greater than 1',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with two real, otherwise-identical runs: no key scattered the 6 sends across 3 different partitions in a pattern that does not preserve the customer\'s send order once a consumer reads across partitions; the same key pinned all 6 to one partition, in order.',
+  },
+  {
+    q: 'A TCP proxy that forwards every request immediately but holds Produce responses for 5000ms caused 9 separate, real retry attempts to reach a non-idempotent producer\'s broker -- and the broker wrote 9 duplicate records (`producerId: -1` on all 9). The identical test with `idempotent: true` produced how many records, and why?',
+    options: [
+      'Still 9 -- idempotence only affects the client, not what the broker stores',
+      "Exactly 1 -- the idempotent producer stamps every attempt (including retries) with a producerId and sequence number, and the broker recognizes a repeated sequence number as already applied, so it stores it once regardless of how many times the request actually arrives",
+      '0 -- the idempotent producer gives up after the first timeout instead of retrying',
+      'It depends on network latency, not on the idempotent setting',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the idempotent run made the identical 9 attempts against the identical proxy, but kafka-dump-log.sh showed exactly one record, with a real producerId (0) and sequence number (0) -- versus 9 records with producerId: -1 for the non-idempotent run.',
+  },
+  {
+    q: "```text\nerror TS2353: Object literal may only specify known properties, and 'transactionTimeout' does not exist in type 'ProducerRecord'.\n```\n`transactionTimeout` is confirmed to be a real KafkaJS option in `node_modules/kafkajs/types/index.d.ts`. Why does this specific placement still fail to compile?",
+    options: [
+      'transactionTimeout was removed in a recent kafkajs version',
+      "The option is real, but it belongs to ProducerConfig (the object passed to kafka.producer(...)), not ProducerRecord (the object passed to producer.send(...)) -- the AI got the key name right and the location wrong",
+      'This is a false positive; the code actually compiles fine',
+      'transactionTimeout requires a transactionalId to be set on the same object literal',
+    ],
+    answer: 1,
+    explain: "Proven directly above with a real tsc --noEmit run: the exact TS2353 error names ProducerRecord as the type that rejects the property. Moving the same key to kafka.producer({ transactionTimeout: 60000 }) is where it actually belongs -- though it would still do nothing here, since this producer has no transactionalId and isn't transactional at all.",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/worked-review-1" questions={quizWorkedReview1} />
+
+<ProgressTracker client:visible id="reading-kafka/worked-review-1" />
