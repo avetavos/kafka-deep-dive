@@ -1,0 +1,563 @@
+---
+title: 'Worked review 3: streaming pipeline — Connect, Streams, และ Schema Registry'
+description: 'รีวิว pipeline Connect + Kafka Streams + Schema Registry ที่ AI สร้างให้ทีละบั๊ก เทียบกับ hang จริง, DataException จริง, ค่า config ที่ถูกลบออกจริง และการสูญหายของข้อมูลแบบเงียบจริงบน broker Kafka 4.3.1 ตัวจริง'
+sidebar:
+  order: 6
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## โจทย์
+
+prompt คือ: *"ตั้ง streaming pipeline -- Connect ดึง order เข้ามา, Streams join กับ payment, KafkaJS consumer decode output แบบ Avro ด้วย Schema Registry ทำให้ทนทานด้วย: DLQ สำหรับ record เสีย"* สิ่งที่ตามมาคือ draft แรกแบบที่ AI assistant มักส่งมาให้กับ prompt นี้: docker-compose file, connector config ที่มี transform กับ DLQ, Streams topology, และ consumer ที่รู้จัก schema -- แต่ละชิ้นดูเหมือนก็อปมาจาก tutorial จริง มัน**บั๊กจริง 9 ตัว** ทุกข้ออ้างด้านล่างพิสูจน์บน stack ของโมดูลนี้เอง (`docker compose -p kafka-reading-b up -d`, broker บน 49092-49094, `confluentinc/cp-schema-registry:7.7.1` บน 48081, `connect-distributed.sh` รัน**ข้างใน** broker container เองตามข้อจำกัด toolchain ของโมดูลนี้ -- ไม่มี Connect container แยก ไม่มี gradle/maven สำหรับ Streams ใช้ `javac` ธรรมดากับ jar ที่ fetch จาก Maven Central) -- Connect REST response จริง, Schema Registry `409` จริง, hex dump จริง, และ `ConfigException` จริง
+
+## โค้ดที่ AI สร้างให้
+
+```yaml
+# docker-compose.yml -- as generated, see review below
+services:
+  broker:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # AI comment: "single broker, replication factor 1 is the default anyway"
+  connect:
+    image: confluentinc/cp-kafka-connect:7.7.1
+    depends_on: [broker]
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: broker:9092
+      CONNECT_GROUP_ID: pipeline-connect
+      CONNECT_REST_PORT: '8083'
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    depends_on: [broker]
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://broker:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+```
+
+```json
+{
+  "name": "orders-file-source",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSourceConnector",
+    "tasks.max": "3",
+    "file": "/data/orders.txt",
+    "topic": "left-orders",
+    "transforms": "insertOrigin",
+    "transforms.insertOrigin.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.insertOrigin.static.field": "source_system",
+    "transforms.insertOrigin.static.value": "file-connector",
+    "errors.deadletterqueue.topic.name": "orders-dlq",
+    "errors.deadletterqueue.topic.replication.factor": "1"
+  }
+}
+```
+
+```java
+// wr3/WordCountCopartition.java -- as generated, see review below
+package wr3;
+
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.JoinWindows;
+import java.time.Duration;
+import java.util.Properties;
+
+public class WordCountCopartition {
+  public static void main(String[] args) {
+    Properties props = new Properties();
+    props.put(StreamsConfig.APPLICATION_ID_CONFIG, "wr3-copartition-demo");
+    props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+    props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+    // AI comment: "the old stable name for exactly-once"
+    props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once");
+
+    StreamsBuilder builder = new StreamsBuilder();
+    // left-orders: 3 partitions; right-payments: 5 partitions -- never
+    // verified equal before this topology was deployed. AI comment: "Kafka
+    // Streams will refuse to start and throw immediately if they don't match"
+    KStream<String, String> left = builder.stream("left-orders");
+    KStream<String, String> right = builder.stream("right-payments");
+    left.join(right, (l, r) -> l + "|" + r, JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofSeconds(5)));
+
+    KafkaStreams streams = new KafkaStreams(builder.build(), props);
+    streams.start();
+  }
+}
+```
+
+```typescript
+// reading-kafka/worked-review-3/avro-consumer.ts -- as generated, see review below
+import { Kafka } from 'kafkajs';
+import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
+
+const registry = new SchemaRegistry({ host: 'http://localhost:8081' });
+// AI comment: "NONE avoids 409 Conflict errors when the pipeline evolves fast"
+await fetch('http://localhost:8081/config', {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/vnd.schemaregistry.v1+json' },
+  body: JSON.stringify({ compatibility: 'NONE' }),
+});
+
+const kafka = new Kafka({ clientId: 'avro-consumer', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'avro-consumer-group' });
+
+async function start() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'joined-orders', fromBeginning: true });
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      // BUG: treats the raw wire bytes as the Avro payload directly
+      const raw = message.value!;
+      const decoded = raw.toString('utf8');
+      console.log('decoded order:', decoded);
+    },
+  });
+}
+
+start();
+```
+
+## เดินรีวิวทีละบั๊ก
+
+### `docker-compose.yml`: ขาด env var RF=1 ทั้งสามตัว
+
+มีแค่ `KAFKA_NODE_ID`, `KAFKA_PROCESS_ROLES`, listener, และ controller quorum -- ไม่มี `KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR`, `KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR`, หรือ `KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR` ที่ไหนเลย พิสูจน์ตรงๆ บน single-broker container ทิ้งขว้างที่สร้างจาก env var set แบบย่อเป๊ะนี้: broker start และรับ topic create ได้ปกติ --
+
+```text
+$ kafka-configs.sh --bootstrap-server localhost:9092 --entity-type brokers --entity-name 1 --describe --all | grep replication.factor
+offsets.topic.replication.factor=3
+transaction.state.log.replication.factor=3
+```
+
+-- default จริงของ Kafka ทั้งคู่คือ **3** ไม่ใช่ 1 ทันทีที่มี `KAFKA_*` env var ตัวไหนก็ตามถูกตั้ง (ยืนยันจาก comment ใน compose ของ harness broker ของโมดูลนี้เอง: การตั้ง `KAFKA_*` env var แค่ตัวเดียว ทำให้ docker wrapper ของ image เปลี่ยนไปสร้าง config แบบ env-driven เต็มรูปแบบ ซึ่งไม่ fallback ไปที่ default ที่เป็นมิตรกับ single-broker ของไฟล์ static อีกต่อไป) consumer group จริงกับ broker ตัวนี้เป๊ะ:
+
+```text
+{"error":"The group coordinator is not available"}
+{"error":"The group coordinator is not available"}
+... (repeats until the client gives up)
+KafkaJSGroupCoordinatorNotFound: Failed to find group coordinator
+```
+
+<SpotTheBug code={`KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+# no RF env vars at all`}>
+"Replication factor 1 เป็น default อยู่แล้ว" จริงแค่กับ `docker run` **เปล่าๆ** ที่ไม่มี `KAFKA_*` env var เลย ซึ่ง `server.properties` แบบ static ของ image ยังใช้อยู่ -- พิสูจน์ด้านบน ทันทีที่ compose file นี้ตั้ง `KAFKA_*` variable แม้แค่ตัวเดียว (ที่นี่คือ listener) default จริง (`3`) จะเข้ามาแทนที่ตัวที่ไม่ได้ตั้งไว้ และ single-broker cluster ไม่มีทางสนอง replication factor 3 ได้เลย `__consumer_offsets` กับ transaction-state log ไม่มีทางถูกสร้างได้ ทุก consumer group และทุก transactional producer เลย hang ไม่มีที่สิ้นสุด -- ไม่ใช่ error แต่เป็นการ hang ซึ่งเป็นเหตุผลที่พลาดง่ายในการทดสอบแบบเร็วๆ ที่ไม่มีใครบังเอิญใช้ consumer group หรือ transaction ทางแก้คือตั้ง env var RF ทั้งสามตัวเป็น `1` ตรงๆ เหมือนที่ probe compose ของ course นี้เองทำ พร้อมบันทึกเหตุผลไว้ใน comment แทนที่จะสมมติเอาเอง
+</SpotTheBug>
+
+### `docker-compose.yml`: `KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092`
+
+listener เดียวของ broker advertise `localhost:9092` พิสูจน์ตรงๆ: จาก **container แยก** บน Docker network เดียวกันกับ broker (ตำแหน่งเดียวกับที่ service `connect` ใน compose file นี้อยู่พอดี) --
+
+```text
+$ docker run --rm --network kafka-reading-b_readingb busybox sh -c "nc -zv -w3 broker 9092"
+broker (172.20.0.2:9092) open
+
+$ docker run --rm --network kafka-reading-b_readingb busybox sh -c "nc -zv -w3 localhost 9092; echo EXIT=$?"
+EXIT=1
+```
+
+<SpotTheBug code={`KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092`}>
+`ADVERTISED_LISTENERS` ไม่ใช่ "ที่อยู่ที่ broker นี้ฟังอยู่" -- มันคือ "ที่อยู่ที่ broker นี้บอก**ทุก client**ให้ต่อกลับมาหลังจากดึง metadata ครั้งแรก" และ client ของ Kafka ทุกตัว รวมถึง producer/consumer/admin client ภายในของ Connect เอง ต่อกลับมาด้วยที่อยู่ advertise นั้นเสมอ ไม่ว่า bootstrap address ตอนแรกจะเป็นอะไร `localhost` ข้างใน container `connect` resolve ไปที่ container `connect` เอง ไม่ใช่ broker -- พิสูจน์ด้านบนด้วย pattern ความล้มเหลวเดียวกันเป๊ะ (ผลการเชื่อมต่อจริงที่ไม่ใช่ 0) ที่ Connect worker จริงเจอทันทีที่มันพยายาม request ใดๆ หลัง bootstrap connection แรก ทางแก้คือ advertise **ชื่อ service** ของ Docker Compose (`PLAINTEXT://broker:9092` พิสูจน์แล้วว่าเข้าถึงได้ด้านบน) ซึ่งทุก container อื่นบน compose network เดียวกัน resolve ได้ถูกต้องผ่าน embedded DNS ของ Docker
+</SpotTheBug>
+
+### Connector: `errors.deadletterqueue.topic.name` โดยไม่มี `errors.tolerance=all`
+
+connector config ตั้งชื่อ DLQ topic กับ replication factor แต่ไม่เคยตั้ง `errors.tolerance` เลย ซึ่ง default จริงคือ `none` พิสูจน์ตรงๆ กับ `connect-distributed.sh` worker ของโมดูลนี้เอง (รันข้างใน broker container) พร้อม source topic ที่มีบรรทัดหนึ่งที่ไม่ใช่ JSON ที่ถูกต้องสำหรับฝั่ง sink ของ pipeline ที่เทียบเท่ากัน:
+
+```text
+$ curl .../connectors/wr3-dlq-notolerance-sink2/status
+"trace":"org.apache.kafka.connect.errors.ConnectException: Tolerance exceeded in error handler\n...
+Caused by: org.apache.kafka.connect.errors.DataException: Converting byte[] to Kafka Connect data failed due to serialization error...
+
+$ kafka-console-consumer --topic wr3-dlq-notolerance-dlq2 --from-beginning --timeout-ms 3000
+Processed a total of 0 messages
+```
+
+<SpotTheBug code={`"errors.deadletterqueue.topic.name": "orders-dlq",
+"errors.deadletterqueue.topic.replication.factor": "1"
+// no errors.tolerance anywhere`}>
+DLQ config เป็นของจริง valid และถูกยอมรับโดย config validation ของ Connect -- มันแค่ไม่ทำอะไรเลยตราบใดที่ `errors.tolerance` ยังอยู่ที่ default จริงคือ `none` ซึ่ง record ที่ล้มเหลวจะทำให้ **task เองล้มเหลว** แทนที่จะถูกส่งไปไหน พิสูจน์ด้านบน: ความล้มเหลวเดียวกันเป๊ะที่ควรสร้าง DLQ record กลับทำให้ task ตาย (`state: FAILED`) และ DLQ topic ว่างเปล่า ทางแก้คือเพิ่ม `errors.tolerance=all` คู่กับ DLQ config -- ถ้าไม่มี "DLQ" ตรงนี้แปลว่า "task พังแล้วต้องมีคนสังเกตเห็นแล้วมา restart เอง" ซึ่งเป็น failure mode ที่แย่กว่าทั้งการ drop record เสียหรือการ dead-letter จริงๆ
+</SpotTheBug>
+
+### Connector: `InsertField$Value` บนค่าแบบ plain-string
+
+transform `insertOrigin` รัน `InsertField$Value` กับ output ของ `FileStreamSourceConnector` ซึ่งเป็น plain string แบบ schemaless (บรรทัดหนึ่งของ source file) ไม่ใช่ `Struct` พิสูจน์ตรงๆ ด้วย transform เดียวกันเป๊ะที่ post ไปที่ Connect worker ของโมดูลนี้เอง:
+
+```text
+$ curl .../connectors/wr3-orders-file-source/status
+"trace":"org.apache.kafka.connect.errors.ConnectException: Tolerance exceeded in error handler\n...
+Caused by: org.apache.kafka.connect.errors.DataException: Only Struct objects supported for [field insertion], found: java.lang.String
+	at org.apache.kafka.connect.transforms.util.Requirements.requireStruct(Requirements.java:52)
+	at org.apache.kafka.connect.transforms.InsertField.applyWithSchema(InsertField.java:175)
+```
+
+<SpotTheBug code={`"transforms": "insertOrigin",
+"transforms.insertOrigin.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+"transforms.insertOrigin.static.field": "source_system"`}>
+`InsertField` เพิ่ม field ที่ตั้งชื่อไว้ลงใน **record** -- มันไม่มี operation ที่สมเหตุสมผลกับ string เปล่าๆ และมันไม่ no-op หรือ wrap value เงียบๆ ด้วย มัน throw เลย และเมื่อ `errors.tolerance` อยู่ที่ default (ดูบั๊กก่อนหน้า -- task เดียวกันล้มเหลวตรงนี้ด้วยเหตุผลเดียวกัน) ตัวอย่าง `InsertField` ใน tutorial ทุกอันใช้ connector ที่มา source เป็น JSON หรือ Avro ซึ่ง value มาถึงเป็น `Struct` อยู่แล้ว บรรทัดจาก `FileStreamSource` ธรรมดาคือ input shape ที่ผิดเป๊ะสำหรับ SMT ตัวนี้ ไม่ว่า DLQ หรือ tolerance จะตั้งค่ายังไงก็ตาม ทางแก้คือไม่ transform string แบบ schemaless ด้วย SMT ที่แทรก field หรือแปลงมันเป็น structured value ก่อน (`ValueToKey`/`Cast` หรือ converter เอง) ก่อนที่ `InsertField` จะรัน
+</SpotTheBug>
+
+### Streams: `left-orders` (3 partition) join กับ `right-payments` (5 partition)
+
+comment ของ AI เองอ้างว่า Kafka Streams "จะปฏิเสธการ start และ throw ทันที" ถ้าจำนวน partition ของสอง topic ที่ join กันไม่ตรงกัน **[Kafka Streams DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/)** เห็นด้วยในหลักการ -- *"Kafka Streams verifies whether the number of partitions for both sides of a join are the same. If they are not, a `TopologyBuilderException`... is being thrown."* บท **[Kafka Streams](/kafka/th/streams-connect-schema/kafka-streams/)** ของโมดูลข้างเคียงนี้ทดสอบข้ออ้างนี้จริงๆ บน broker version เดียวกันเป๊ะ พร้อมจำนวน partition ที่ไม่ตรงกันจริง (3 vs 5) -- และมัน**ไม่**fail fast:
+
+```text
+A real run on apache/kafka:4.3.1 joining two genuinely mismatched topics
+(3 vs 5 partitions) reached RUNNING with NO exception and silently assigned
+tasks that could never see both sides of the join.
+```
+
+<SpotTheBug code={`KStream<String, String> left = builder.stream("left-orders");
+KStream<String, String> right = builder.stream("right-payments");
+left.join(right, ...);`}>
+นี่คือบั๊กที่อันตรายที่สุดในรีวิวนี้ เพราะ comment ของ AI อ้างอิง documentation ที่ถูกต้องจริงๆ -- fail-fast behavior ถูก document ไว้จริง แค่มันไม่เกิดขึ้นในการรันจริงที่ทำซ้ำได้บน broker version ที่ course นี้ pin ไว้ ตามที่บทข้างเคียงพิสูจน์เอง ทางแก้ตรงนี้ไม่ใช่การแก้โค้ดที่ join เอง แต่เป็นการแก้**กระบวนการ** เพราะ runtime guard ที่ comment ของ AI นี้ (และ docs อย่างเป็นทางการ) สมมติไว้ พิสูจน์แล้วว่าพึ่งพาไม่ได้บน version นี้: ตรวจสอบว่า `left-orders` กับ `right-payments` มีจำนวน partition เท่ากันด้วย `kafka-topics.sh --describe` (หรือ admin-client check ใน CI) **ก่อน** deploy topology นี้ ทุกครั้งที่จำนวน partition ของ topic ใดตัวหนึ่งอาจเปลี่ยน
+</SpotTheBug>
+
+### Streams: `processing.guarantee = "exactly_once"`
+
+comment ของ AI เรียก `"exactly_once"` ว่า "ชื่อเก่าที่เสถียรของ exactly-once" -- บอกเป็นนัยว่ามันแค่ deprecated แต่ยังใช้ได้ พิสูจน์ตรงๆ ด้วยการสร้าง `StreamsConfig` จริงด้วยค่านี้เป๊ะ กับ `kafka-streams-4.3.1.jar` จริง:
+
+```text
+$ java -cp kafka-streams-4.3.1.jar:... ExactlyOnceConfigCheck exactly_once
+StreamsConfig REJECTED processing.guarantee=exactly_once -- org.apache.kafka.common.config.ConfigException: Invalid value exactly_once for configuration processing.guarantee: String must be one of: at_least_once, exactly_once_v2
+```
+
+<SpotTheBug code={`props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once"); // "the old stable name"`}>
+นี่ไม่ใช่ deprecation warning ตอน start-up -- validator ของ `StreamsConfig` เองปฏิเสธค่านี้ตรงๆ ตอน construction time ก่อนที่ record แม้แต่ตัวเดียวจะถูกประมวลผล: `"exactly_once"` (implementation EOS ดั้งเดิมที่ไม่ใช่ `_v2`) ถูก**ลบออก**จาก accepted value set ทั้งหมดใน version `kafka-streams` ที่ course นี้ pin ไว้ ไม่ใช่แค่ไม่แนะนำ ทางแก้คือ `exactly_once_v2` (ค่าที่ error message จริงเองระบุว่าเป็นตัวเลือก exactly-once ตัวเดียวที่เหลืออยู่) ซึ่งใช้กลไก transactional เดียวกับที่พิสูจน์แบบ end-to-end ใน [Exactly-Once Processing](/kafka/th/delivery-and-transactions/exactly-once-processing/) และใน [worked review 2](/kafka/th/reading-kafka/worked-review-2/) แค่ถูกใช้อัตโนมัติโดย Streams library
+</SpotTheBug>
+
+### Schema Registry: compatibility ตั้งเป็น `NONE` "เพื่อเลี่ยง 409"
+
+setup script ตั้ง compatibility ระดับ subject เป็น `NONE` ก่อน register อะไรเลย พิสูจน์ตรงๆ: พอตั้ง `NONE` การเปลี่ยน schema ที่ breaking จริง (ลบ field หนึ่งตัว เปลี่ยน type ของอีก field จาก `double` เป็น `string`) ถูกยอมรับตรงๆ --
+
+```text
+setting compatibility to NONE
+{ status: 200, body: '{"compatibility":"NONE"}' }
+registering v1: { status: 200, body: '{"id":1}' }
+registering v2 (breaking): { status: 200, body: '{"id":2}' }
+```
+
+การเปลี่ยนแบบ breaking เดียวกันเป๊ะกับ subject ที่ปล่อยไว้ที่ default จริง (`BACKWARD`):
+
+```text
+registering v2 (same breaking change, default compat): {
+  status: 409,
+  body: '{"error_code":409,"message":"Schema being registered is incompatible with an earlier schema... TYPE_MISMATCH ... reader type: STRING not compatible with writer type: DOUBLE..."}'
+}
+```
+
+<SpotTheBug code={`await fetch('.../config', { method: 'PUT', body: JSON.stringify({ compatibility: 'NONE' }) });`}>
+`409` จาก Schema Registry ไม่ใช่บั๊กที่ต้องหาทางเลี่ยง -- มันคือ**กลไกทั้งหมด**ที่ให้ producer กับ consumer วิวัฒน์แยกจากกันได้โดยไม่ต้อง deploy พร้อมกัน: มันแปลว่า "consumer ที่รัน schema version ก่อนหน้าจะพังกับ write นี้" ที่ถูกจับได้ก่อนที่ write จะไปถึง topic ด้วยซ้ำ พิสูจน์ด้านบน: `NONE` ไม่ได้แก้สิ่งที่ทำให้เกิด 409 มันแค่ลบ check ที่กำลังรายงาน incompatibility ที่มีโครงสร้างจริง -- การเปลี่ยนแบบ breaking เดียวกันเป๊ะสำเร็จแบบเงียบๆ ภายใต้ `NONE` และถูกปฏิเสธถูกต้องด้วย error ที่แม่นยำและใช้งานได้ภายใต้ default จริง ทางแก้คือปล่อย compatibility ไว้ที่ `BACKWARD` (หรือ mode ที่ลำดับ deployment/rollout จริงขององค์กรต้องการ) แล้วแก้ที่ตัว schema change เอง ไม่ใช่แก้ที่ check
+</SpotTheBug>
+
+### KafkaJS consumer: decode raw byte แทนที่จะใช้ registry
+
+`eachMessage` เรียก `message.value!.toString('utf8')` ตรงๆ -- ไม่มี `registry.decode(...)` ที่ไหนเลย พิสูจน์ด้วย encode/decode round trip จริงและ hex dump จริงของ wire format ที่ `@kafkajs/confluent-schema-registry` สร้างขึ้นจริง:
+
+```text
+hex bytes: 0000000003086f2d34320000000000e05840
+magic byte: 0 (must be 0)
+schema id (4 bytes, big-endian) from wire: 3 == registered id? true
+decoded correctly (via registry.decode): {"orderId":"o-42","amount":99.5}
+
+raw payload as hex (header skipped): 086f2d34320000000000e05840
+raw payload misinterpreted as utf8 text (garbled): "\bo-42\u0000\u0000\u0000\u0000\u0000<0xEF><0xBF><0xBD>X@"
+```
+
+<SpotTheBug code={`const decoded = raw.toString('utf8');`}>
+ทุก record ที่ `encode()` ของ `@kafkajs/confluent-schema-registry` สร้าง **ไม่ใช่** raw Avro byte -- มันคือ wire-format header 5 byte (magic byte 1 ตัว เป็น `0` เสมอ บวก schema id 4 byte แบบ big-endian) ตามด้วย Avro payload ที่ encode จริง พิสูจน์ด้านบนแบบ byte ต่อ byte: การอ่าน byte พวกนั้นเป็น UTF-8 text แทนที่จะป้อนผ่าน `registry.decode()` สร้าง output แบบที่ hex dump นี้แสดงเป๊ะ -- control character, length-prefix byte หลุดมา (string ของ Avro เป็นแบบ length-prefixed ไม่ใช่ null-terminated) และหาง double 8 byte ที่ถูกตีความผิดเป็น garbage text นี่ไม่ throw เลย ซึ่งเป็นสิ่งที่ทำให้มันอันตราย: มัน "ทำงาน" ในแง่ที่สร้าง string *บางอย่าง* ออกมา ถูก log และอาจถูกเก็บไว้ต่อ ผิดแบบเงียบๆ ตลอดเวลา ทางแก้คือ `await registry.decode(message.value)` ซึ่งลอก header ออก หา schema ด้วย id ที่ encode ไว้ในนั้น แล้วคืน object จริงที่มี type ถูกต้อง
+</SpotTheBug>
+
+### ฝั่ง producer (โดยนัย): schema id ที่ cache ไว้เก่าเก็บ
+
+ไม่ได้เห็นตรงๆ ใน snippet ที่ AI สร้างด้านบน แต่ mental model gap เดียวกันโผล่มาฝั่ง produce ของ pipeline จริง: schema วิวัฒน์ (เพิ่ม field `currency` ซึ่งเป็นการเปลี่ยนที่ backward-compatible จริงภายใต้ default จริง) แล้ว producer ที่รันยาวและ cache schema id **เก่า**ไว้ตอน startup ก็ยังใช้ตัวเดิมต่อ พิสูจน์ตรงๆ:
+
+```text
+v1 schema id (cached before currency was added): 5
+v2 schema id (current, has currency): 6
+encoded with STALE v1 id -- currency field silently has nowhere to go in v1's schema
+
+decoded by a reader using the WIRE schema id (v1): {"orderId":"o-stale-1","amount":15}
+currency ("USD") present in decoded output? false
+```
+
+<SpotTheBug code={`const encoded = await registry.encode(v1Id, payload);`}>
+`registry.encode(id, payload)` เชื่อ `id` ของผู้เรียกโดยสมบูรณ์ -- มันไม่ derive หรือตรวจสอบ id จาก shape ของ payload เองเลย และเมื่อ schema เป้าหมาย compatible-แต่ต่าง กัน (ไม่ใช่ไม่เข้ากันแบบสุดขั้ว) จะไม่มี error ถูก throw เลย: field `currency` บน payload ไม่มีที่ไปใน schema v1 ที่ wire format อ้างว่าใช้ ดังนั้นมันถูกทิ้งเงียบๆ และทุก reader ปลายทาง -- ที่ decode ถูกต้องตามตำรา ด้วย `registry.decode()` -- ไม่เคยเห็นมันเลย (id ที่ไม่ตรงกันแบบสุดขั้ว ทดสอบแยกต่างหาก จะ throw `ConfluentSchemaRegistryValidationError` จริงตอน `encode()` เอง -- กรณีอันตรายคือ id ที่เก่าเก็บแต่ยังดูมีโครงสร้างที่เป็นไปได้ ไม่ใช่ id ที่ผิดเต็มๆ) ทางแก้คือ re-register (หรือ re-fetch id ล่าสุดของ) schema ทุกครั้งที่ deploy แทนที่จะ cache id ไว้ไม่มีกำหนด หรือต่อ cache invalidation เข้ากับ signal การเปลี่ยน subject-version ของ Schema Registry เองถ้า client library มีให้
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```yaml
+# docker-compose.yml (relevant excerpt)
+services:
+  broker:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: '1'
+  connect:
+    image: confluentinc/cp-kafka-connect:7.7.1
+    depends_on: [broker]
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: broker:9092
+      CONNECT_GROUP_ID: pipeline-connect
+      CONNECT_REST_PORT: '8083'
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    depends_on: [broker]
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://broker:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+```
+
+```json
+{
+  "name": "orders-file-source",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSourceConnector",
+    "tasks.max": "1",
+    "file": "/data/orders.txt",
+    "topic": "left-orders",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "orders-dlq",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+    "errors.log.enable": "true"
+  }
+}
+```
+
+```java
+// src/main/java/wr3/WordCountCopartitionFixed.java
+package wr3;
+
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.JoinWindows;
+import java.time.Duration;
+import java.util.Properties;
+
+public class WordCountCopartitionFixed {
+  public static void main(String[] args) {
+    Properties props = new Properties();
+    props.put(StreamsConfig.APPLICATION_ID_CONFIG, "wr3-copartition-fixed");
+    props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+    props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+    props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+    props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
+
+    // Partition-count equality is verified explicitly, in code, before this
+    // topology is ever built -- proven above that the runtime guard the
+    // docs describe does not reliably fire on this broker version.
+    // AdminClient.describeTopics(List.of("left-orders", "right-payments"))
+    // .partitionCountsMatch() (real check omitted here for brevity -- see
+    // the co-partitioning section of the Kafka Streams lesson for the full
+    // AdminClient snippet) must return true before start() is ever called.
+
+    StreamsBuilder builder = new StreamsBuilder();
+    KStream<String, String> left = builder.stream("left-orders");
+    KStream<String, String> right = builder.stream("right-payments");
+    left.join(right, (l, r) -> l + "|" + r, JoinWindows.ofTimeDifferenceWithNoGrace(Duration.ofSeconds(5)));
+
+    KafkaStreams streams = new KafkaStreams(builder.build(), props);
+    streams.start();
+  }
+}
+```
+
+compile จริงกับ `kafka-streams-4.3.1.jar` ตัวเดียวกับด้านบน -- `javac` clean ไม่มี error; `exactly_once_v2` เป็นค่าเดียวที่ `StreamsConfig` ยอมรับสำหรับ constant นี้นอกจาก `at_least_once` ยืนยันตรงๆ กับ jar เดียวกันด้วยโปรแกรมตรวจสอบเดียวกับที่ใช้พิสูจน์บั๊ก:
+
+```text
+$ java -cp kafka-streams-4.3.1.jar:... ExactlyOnceConfigCheck exactly_once_v2
+StreamsConfig accepted processing.guarantee=exactly_once_v2
+resolved value: exactly_once_v2
+```
+
+```typescript
+// reading-kafka/worked-review-3/avro-consumer-fixed.ts -- Fragment, not collected: depends on
+// @kafkajs/confluent-schema-registry, which is outside the probe's devDependencies (schema-registry.mdx
+// uses the identical convention for the same package, per npm view: latest published is 4.1.0)
+import { Kafka } from 'kafkajs';
+import { SchemaRegistry } from '@kafkajs/confluent-schema-registry';
+
+const registry = new SchemaRegistry({ host: process.env.SCHEMA_REGISTRY_URL ?? 'http://localhost:8081' });
+const kafka = new Kafka({ clientId: 'avro-consumer', brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'avro-consumer-group' });
+
+async function start() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'joined-orders', fromBeginning: true });
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      // registry.decode strips the 5-byte wire header (magic byte + schema
+      // id) and looks up the real schema before deserializing -- never the
+      // raw bytes directly.
+      const decoded = await registry.decode(message.value!);
+      console.log('decoded order:', JSON.stringify(decoded));
+    },
+  });
+}
+
+start();
+```
+
+`compatibility` ของทุก subject ใน pipeline นี้ยังอยู่ที่ default จริง (`BACKWARD`) -- ไม่ถูกตั้งเป็น `NONE` ที่ไหนใน setup ที่แก้แล้ว -- และ producer re-register (หรือ re-fetch) schema id ทุกครั้งที่ deploy แทนที่จะ cache ไว้ไม่มีกำหนด ปิดช่องว่างเรื่อง stale id ที่พิสูจน์ไว้ด้านบน consumer ที่แก้แล้วนี้ต้องมี Schema Registry จริงถึงจะรันได้ (stack ของโมดูลนี้เองบนพอร์ต 48081 ไม่ใช่ harness broker ธรรมดา -- harness ไม่มีทั้ง Connect และ Schema Registry ตามข้อจำกัด toolchain ของโมดูลนี้) และต้องพึ่ง `@kafkajs/confluent-schema-registry` ซึ่งอยู่นอก devDependencies ของ probe harness (convention เดียวกับที่ [Schema Registry](/kafka/th/streams-connect-schema/schema-registry/) ใช้กับ package ตัวเดียวกันอยู่แล้ว) -- fence นี้จึงเป็น fragment ไม่ถูก collect หรือ `--run`; การเรียก `registry.decode` ตรงๆ ที่มันใช้ถูกพิสูจน์แบบ end-to-end, byte ต่อ byte, กับ registry จริงของโมดูลนี้เองด้านบนแล้ว
+
+## สิ่งที่เปลี่ยนและเหตุผล
+
+| # | บั๊ก | ทางแก้ |
+|---|---|---|
+| 1 | compose ขาด env var RF=1 ทั้ง 3 ตัว | ตั้งทั้ง 3 ตรงๆ -- พิสูจน์แล้ว: default จริงคือ `3` ทันทีที่มี `KAFKA_*` var ตัวไหนถูกตั้ง ทำให้ coordinator hang ถาวรจริง |
+| 2 | `KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092` | Advertise ชื่อ service ของ compose (`broker:9092`) -- พิสูจน์แล้ว: container ข้างเคียงเข้าถึง `broker:9092` ได้แต่ `localhost:9092` ไม่ได้ |
+| 3 | DLQ config ไม่มี `errors.tolerance=all` | เพิ่ม `errors.tolerance=all` -- พิสูจน์แล้ว: ถ้าไม่มี task ตายและ DLQ ว่างเปล่า |
+| 4 | `InsertField$Value` บน schemaless string | ลบ transform ทิ้ง (หรือ structure value ก่อน) -- พิสูจน์แล้ว: `DataException` จริง |
+| 5 | Streams join บน topic ที่ไม่ co-partitioned | ตรวจ partition count ในโค้ดก่อน `start()` -- พิสูจน์แล้ว (อ้างจาก [Kafka Streams](/kafka/th/streams-connect-schema/kafka-streams/)): fail-fast ที่ document ไว้ไม่เกิดขึ้นบน broker version นี้ |
+| 6 | `processing.guarantee = "exactly_once"` | `exactly_once_v2` -- พิสูจน์แล้ว: ค่าเก่าถูกลบออกจริง ไม่ใช่แค่ deprecated, `ConfigException` จริง |
+| 7 | Schema Registry compatibility `NONE` "เพื่อเลี่ยง 409" | ปล่อยไว้ที่ `BACKWARD` -- พิสูจน์แล้ว: การเปลี่ยนแบบ breaking เดียวกันถูกยอมรับเงียบๆ ภายใต้ `NONE` ถูกปฏิเสธถูกต้องภายใต้ default |
+| 8 | Consumer decode raw byte ข้าม `registry.decode` | `registry.decode(message.value)` -- พิสูจน์แล้ว: hex dump จริงแสดง header 5 byte และผลลัพธ์ที่ garbled จากการข้ามมัน |
+| 9 | Producer cache schema id เก่าเก็บ | re-fetch schema id ทุกครั้งที่ deploy -- พิสูจน์แล้ว: field `currency` หายไปเงียบๆ ไม่มี error เลย |
+
+## สิ่งที่ reviewer เขียนใน PR
+
+> pipeline นี้มีช่องโหว่เชิงโครงสร้างจริงในสามระบบต่างกัน -- Connect, Streams, และ Schema Registry แต่ละอันมีอย่างน้อยหนึ่งช่อง บวกกับ compose file ที่จะ hang ทั้งระบบทันทีที่ใครใช้ consumer group:
+>
+> 1. **compose ขาด env var replication-factor ทั้ง 3 ตัว** ไม่ใช่ช่องว่างผิวเผิน -- single broker สนอง default จริงที่ 3 ไม่ได้เลย ทุก consumer group และ transaction hang ตลอดกาล แบบเงียบๆ
+> 2. **`ADVERTISED_LISTENERS` ใช้ `localhost`** ใช้ได้ตอน broker คุยกับตัวเอง พังทันทีกับทุก container อื่นที่ต่อกลับมาด้วย address ที่ advertise ใช้ชื่อ service แทน
+> 3. **DLQ config ไม่มี `errors.tolerance=all`** setting DLQ เป็น dead code ถ้าไม่มีมัน -- task แค่ตายแทน
+> 4. **`InsertField$Value` บน plain string** SMT ผิดสำหรับ shape output ของ connector นี้ `DataException` จริงทุก record
+> 5. **Streams join โดยไม่ตรวจ partition count** fail-fast ของ docs ไม่เกิดในการทดสอบจริงบน broker version นี้ -- ต้องมี check ตรงๆ ก่อน `start()`
+> 6. **`processing.guarantee=exactly_once`** ค่านี้หายไปแล้ว ไม่ใช่แค่ deprecated -- `exactly_once_v2` คือตัวเลือก EOS เดียวที่เหลือ
+> 7. **Schema Registry compatibility `NONE`** นี่ไม่ได้แก้ปัญหา 409 มันลบ check ที่กำลังจับ breaking change จริงต่างหาก
+> 8. **Consumer ข้าม `registry.decode`** output garbled แบบเงียบๆ ไม่ใช่ error -- บั๊กที่น่ากลัวที่สุดในรีวิวนี้ทั้งหมด
+> 9. **schema id ที่ cache ไว้ไม่เคย refresh** failure mode เดียวกับ #8 แต่ฝั่งเขียน -- ทั้ง field หายไปโดยไม่มี error ที่ไหนเลย
+>
+> ไม่มีอะไรในนี้แปลกใหม่ -- ทุกทางแก้คือ "ใช้ option ที่มีอยู่แล้วสำหรับเรื่องนี้" ไม่ใช่ infrastructure ใหม่
+
+## Mental Model
+
+pipeline นี้แตะสามระบบที่แต่ละระบบมีสัญญาโดยนัยหนึ่งข้อที่โค้ดที่สร้างมาทำผิด: Connect สัญญาว่า task จะประมวลผล record หรือส่งไปที่ที่กู้คืนได้ -- ถูกทำลายด้วย DLQ config ที่ไม่มี `errors.tolerance` Kafka Streams สัญญาว่าจะ fail-fast ที่ document ไว้ หรือรับประกันที่ document ไว้ -- ถูกทำลายสองครั้ง ครั้งแรกจากการเชื่อ fail-fast ที่ broker version นี้ไม่ได้ให้แบบเชื่อถือได้ ครั้งที่สองจากการใช้ค่า config ที่ถูกลบออกเงียบๆ ไม่ใช่แค่เปลี่ยนชื่อ Schema Registry สัญญาว่าทุก write ที่ reader จะเห็น decode ได้ด้วย schema ของ reader เอง -- ถูกทำลายด้วยการปิดกลไกที่บังคับสัญญานั้น และแยกต่างหากด้วยสองวิธีที่แค่ไม่ใช้ wire format ที่ client library ของ Schema Registry เองสร้างขึ้น ไม่มีข้อไหนเป็นสมมติฐาน: ทุกข้อสร้างผลลัพธ์จริงที่ทำซ้ำได้แบบ byte ต่อ byte หรือ log line ต่อ log line บน stack ที่มีชีวิตของโมดูลนี้เอง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้าไม่ตั้ง replication factor มันจะ default เป็น 1 บน single broker"** พิสูจน์ด้านบน: default จริงคือ `3` สำหรับ offsets กับ transaction-state topic ทันทีที่มี `KAFKA_*` env var ตัวไหนถูกตั้งเลย -- พฤติกรรม "default เป็น 1" เกิดแค่กับ `docker run` เปล่าๆ ที่ไม่มี env var เลย ซึ่ง config file แบบ static ของ image ไม่เคยถูก override
+- **"`tasks.max` บอก connector ว่าให้รันกี่ task"** การตรวจสอบเร็วๆ แยกต่างหากบน worker ของโมดูลนี้เอง: `tasks.max: 3` ที่ post ไปที่ `FileStreamSourceConnector` สร้าง task ที่รันจริงแค่ **1** -- `tasks.max` เป็นเพดานที่ implementation `taskConfigs()` ของ connector เองมีอิสระที่จะไม่ไปถึงเลยก็ได้ ไฟล์เดียวแยกข้าม parallel task ไม่ได้จริงๆ ดังนั้น connector นี้คืน task เดียวเสมอไม่ว่าจะตั้งค่าอะไร
+- **"schema id ที่ผิดจะ throw ทันทีเสมอ"** พิสูจน์ด้านบน: id ที่ไม่ตรงกันแบบสุดขั้ว throw จริงตอน `encode()` แต่ id ที่เก่าเก็บและยังมีโครงสร้างที่เข้ากันได้ ไม่ throw -- มันทิ้ง field ที่ไม่เข้ากันไปเงียบๆ โดยไม่มี error ที่ไหนใน pipeline เลย
+
+<Mermaid title="บั๊กแต่ละตัวทำลายสัญญาที่ pipeline นี้พึ่งพาตรงไหน" code={wr3Diagram} />
+
+export const wr3Diagram = `flowchart TD
+  A["compose: no RF=1 vars"] -->|"1: real default 3 -- permanent hang"| A
+  B["ADVERTISED_LISTENERS: localhost"] -->|"2: unreachable from Connect"| B
+  C["connector: DLQ config, no errors.tolerance"] -->|"3: task dies, DLQ empty"| C
+  D["connector: InsertField on a string"] -->|"4: DataException"| D
+  E["Streams: join, mismatched partitions"] -->|"5: silent, wrong assignment"| E
+  F["Streams: processing.guarantee=exactly_once"] -->|"6: ConfigException -- removed"| F
+  G["Schema Registry: compatibility NONE"] -->|"7: breaking change accepted silently"| G
+  H["consumer: raw bytes, no registry.decode"] -->|"8: garbled, no error"| H
+  I["producer: stale cached schema id"] -->|"9: field silently dropped"| I
+`;
+
+<Callout title="ข้อคิดสั้นๆ">
+ทุกระบบใน pipeline นี้ -- Connect, Streams, Schema Registry -- มีกลไกความปลอดภัยจริง และทุกบั๊กในรีวิวนี้เป็นอย่างใดอย่างหนึ่ง: ข้ามกลไกนั้นโดยตั้งใจ (DLQ tolerance, compatibility NONE), เชื่อกลไกที่ broker version นี้ไม่ได้ให้แบบเชื่อถือได้ (co-partitioning fail-fast), หรือข้ามครึ่งฝั่ง client ของกลไกนั้นไปทั้งหมด (raw-byte decoding, schema id เก่าเก็บ) ไม่มีข้อไหนใน 9 บั๊กเป็นสมมติฐาน: ทั้ง 9 ข้อสร้างผลลัพธ์จริงที่ทำซ้ำได้ -- hang, `DataException`, `ConfigException`, `409`, หรือข้อมูลที่ garbled/หายไปแบบเงียบๆ -- บน stack ที่มีชีวิตของโมดูลนี้เอง
+</Callout>
+
+export const quizWorkedReview3 = [
+  {
+    q: "compose file ของ single-broker ตั้ง KAFKA_LISTENERS กับ KAFKA_* env var อื่นๆ แต่ไม่เคยตั้ง env var replication-factor ทั้งสามตัว `kafka-configs.sh --describe --all` บน broker ที่รันอยู่แสดง `offsets.topic.replication.factor=3` ทำไมมันไม่ใช่ 1?",
+    options: [
+      'It is a bug in this specific Kafka version only',
+      "The apache/kafka image only falls back to single-broker-friendly RF=1 defaults for a bare docker run with ZERO KAFKA_* env vars; the moment ANY KAFKA_* env var is set, the image switches to fully env-driven config, and unset values fall back to Kafka's real defaults (3), not the image's single-node-friendly ones",
+      'RF=3 is required for any topic with more than one partition',
+      'This only happens when KRaft mode is used instead of ZooKeeper',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรงๆ ด้านบน: describe output จริงแสดง 3 และ consumer group จริงกับ broker ตัวนี้เป๊ะ hang ด้วย "The group coordinator is not available" จนถึง KafkaJSGroupCoordinatorNotFound -- single broker สนอง RF=3 ไม่ได้เลย',
+  },
+  {
+    q: 'จาก container แยกบน Docker network เดียวกันกับ broker ที่ advertise `PLAINTEXT://localhost:9092`, `nc -zv broker 9092` สำเร็จ แต่ `nc -zv localhost 9092` ล้มเหลว ทำไมเรื่องนี้ถึงสำคัญกับ Connect worker ที่รันใน container ของตัวเองบน network เดียวกันนั้น?',
+    options: [
+      "It doesn't matter -- Connect only needs the bootstrap address, not the advertised one",
+      "Every client, including Connect's internal producer/consumer/admin clients, reconnects using the ADVERTISED address after the first metadata fetch -- 'localhost' inside the Connect container resolves to the Connect container itself, not the broker, so every request past the first one fails",
+      'This only affects consumers, not the Connect REST API',
+      'The fix is running Connect inside the same container as the broker in every case',
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรงๆ ด้านบนด้วยการทดสอบ connection จริงจาก sidecar container ที่ตำแหน่ง network เดียวกันเป๊ะกับที่ Connect จะอยู่: 'broker:9092' เข้าถึงได้ 'localhost:9092' เข้าถึงไม่ได้ -- ยืนยันว่า ADVERTISED_LISTENERS คุมสิ่งที่ container อื่นๆ ทุกตัวต่อกลับไปหา ไม่ใช่แค่ bind address ของ broker เอง",
+  },
+  {
+    q: "connector ตั้ง `errors.deadletterqueue.topic.name` กับ `errors.deadletterqueue.topic.replication.factor` แต่ไม่เคยตั้ง `errors.tolerance` record เสียมาถึง connector นี้ เกิดอะไรขึ้นจริงๆ?",
+    options: [
+      'The bad record is automatically routed to the DLQ topic, since DLQ config is present',
+      "errors.tolerance really defaults to 'none', under which a failing record fails the TASK instead of routing anywhere -- proven directly: the task's status shows FAILED with 'Tolerance exceeded in error handler', and the DLQ topic has zero messages",
+      'Connect throws a config-validation error at connector creation time',
+      'The record is silently dropped with no task failure',
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรงๆ ด้านบน: REST API status จริงแสดง task FAILED พร้อม DataException ห่อด้วย 'Tolerance exceeded in error handler' และการอ่าน DLQ topic จริงด้วย console-consumer คืน 'Processed a total of 0 messages' -- DLQ config valid และถูกยอมรับ แต่ไม่ทำงานถ้าไม่มี errors.tolerance=all",
+  },
+  {
+    q: '[Kafka Streams DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/) บอกว่า stream-stream join ที่จำนวน partition ไม่ตรงกัน throw ทันที การรันจริงบน Kafka 4.3.1 ที่ course นี้ pin ไว้ join topic 3 partition กับ 5 partition เข้าถึง RUNNING โดยไม่มี exception การตอบสนองที่ถูกต้องต่อความขัดแย้งนี้คืออะไร?',
+    options: [
+      'Trust the docs -- the real run must have had a different bug',
+      "Add an explicit partition-count check (e.g. via AdminClient) before starting the topology in code, since the documented runtime guard is proven, on this exact broker version, not to reliably fire -- a process fix, not a code change to the join itself",
+      'Downgrade to an older Kafka version where the guard is known to work',
+      'Ignore it -- co-partitioning does not actually matter for correctness',
+    ],
+    answer: 1,
+    explain: "อ้างและแสดงซ้ำจากบท Kafka Streams ของโมดูลข้างเคียงนี้ ซึ่งพิสูจน์เรื่องนี้ตรงๆ: การรันจริงที่ทำซ้ำได้บน apache/kafka:4.3.1 เข้าถึง RUNNING พร้อม partition ที่ไม่ตรงกันโดยไม่มี exception การพึ่งพา runtime guard ที่พิสูจน์แล้วว่าไม่น่าเชื่อถือบน version ที่ pin ไว้ แปลว่าทางแก้จริงต้องเกิดก่อน deploy ไม่ใช่พึ่งให้ Streams จับตอน start",
+  },
+  {
+    q: "`props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, \"exactly_once\")` throw `ConfigException: Invalid value exactly_once for configuration processing.guarantee: String must be one of: at_least_once, exactly_once_v2` ตอน StreamsConfig ถูกสร้าง เรื่องนี้พิสูจน์อะไรเกี่ยวกับ `exactly_once` (ไม่มี `_v2`) ใน Kafka Streams version ที่ course นี้ pin ไว้?",
+    options: [
+      "It's merely deprecated -- it still works but logs a warning",
+      "It has been fully REMOVED from the set of accepted values, not just discouraged -- StreamsConfig rejects it outright at construction time, before any topology runs, confirmed directly against the real installed kafka-streams-4.3.1.jar",
+      'It only fails when combined with a stream-stream join',
+      'The error is a false positive from an outdated jar',
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรงๆ ด้านบนด้วยการรัน java จริงกับ kafka-streams-4.3.1.jar: ConfigException เป๊ะๆ ที่ระบุค่าที่ยอมรับแค่สองตัว (at_least_once, exactly_once_v2) -- exactly_once_v2 ถูกยอมรับเหมือนกัน ยืนยันว่านี่คือการลบออกจริงในปัจจุบัน ไม่ใช่แค่ warning",
+  },
+  {
+    q: 'Schema Registry compatibility ตั้งเป็น `NONE` "เพื่อเลี่ยง 409" การเปลี่ยน schema ที่ลบ field หนึ่งตัวและเปลี่ยน type ของอีก field จาก double เป็น string ถูก register ทีหลัง เกิดอะไรขึ้น และอะไรจะเกิดขึ้นภายใต้ default จริง (`BACKWARD`)?',
+    options: [
+      'Both reject it -- NONE only affects new subjects, not existing ones',
+      'NONE accepts it with a 200 (proven: real registration IDs returned for both the safe and the breaking version); the identical breaking change under BACKWARD is proven to return a real 409 with a precise TYPE_MISMATCH error naming the exact incompatible field',
+      'NONE and BACKWARD behave identically for this kind of change',
+      'This only matters for Protobuf schemas, not Avro',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรงๆ ด้านบนด้วยการ register จริงสองครั้ง: การเปลี่ยนแบบ breaking เดียวกัน 200 ภายใต้ NONE และ 409 ภายใต้ BACKWARD พร้อม error body จริงที่ระบุ field และ type mismatch ชัดเจน -- NONE ไม่ได้แก้สิ่งที่ทำให้เกิด 409 มันลบ check ที่กำลังรายงาน incompatibility จริงต่างหาก',
+  },
+];
+
+<Quiz client:visible id="reading-kafka/worked-review-3" questions={quizWorkedReview3} />
+
+<ProgressTracker client:visible id="reading-kafka/worked-review-3" />
