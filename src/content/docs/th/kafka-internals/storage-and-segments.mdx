@@ -1,0 +1,245 @@
+---
+title: 'Storage and Segments'
+description: 'รูปแบบไบต์จริงของ segment .log และ .index แบบ sparse ของมัน decode ด้วยมือจาก hexdump จริงแล้ว cross-check กับ kafka-dump-log.sh, การ compress ของ record batch v2, sparse offset index, log cleaner, และทำไม fsync ไม่ใช่กลไก durability -- พิสูจน์บน Kafka 4.3.1.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## สรุปในหนึ่งบรรทัด
+
+ไบต์ของ `.log` segment ไม่ทึบ -- 21 ไบต์แรกของทุก record batch (`baseOffset`, `batchLength`, `partitionLeaderEpoch`, `magic`, `crc`) decode ด้วยมือได้จาก `hexdump` ดิบ แล้ว cross-check ทีละ field กับ `kafka-dump-log.sh` และไฟล์ `.index` ข้าง ๆ มันตั้งใจให้ sparse ไม่ใช่หนึ่ง entry ต่อ record
+
+## Decode record batch จริงด้วยมือ
+
+produce record หนึ่งตัวแล้ว dump ไบต์แรกของ segment ที่มันไปอยู่:
+
+```text
+$ hexdump -C /tmp/kafka-logs/internals-pipeline-lesson-0/00000000000000000000.log | head -3
+00000000  00 00 00 00 00 00 00 00  00 00 00 46 00 00 00 00  |...........F....|
+00000010  02 d1 99 b8 4d 00 00 00  00 00 00 00 00 01 a0 eb  |....M...........|
+00000020  09 1e 95 00 00 01 a0 eb  09 1e 95 00 00 00 00 00  |................|
+```
+
+header ตายตัวของ record batch v2 decode ทีละไบต์จากสามแถวนั้น cross-check กับ `kafka-dump-log.sh --print-data-log` บนไฟล์เดียวกันเป๊ะ:
+
+| ไบต์ | Field | Hex | Decode แล้ว | `kafka-dump-log.sh` บอกว่า |
+|---|---|---|---|---|
+| 0-7 | `baseOffset` (int64) | `00 00 00 00 00 00 00 00` | `0` | `baseOffset: 0` |
+| 8-11 | `batchLength` (int32) | `00 00 00 46` | `70` | (`size: 82` = prefix offset+length 12 ไบต์ + 70) |
+| 12-15 | `partitionLeaderEpoch` (int32) | `00 00 00 00` | `0` | `partitionLeaderEpoch: 0` |
+| 16 | `magic` (int8) | `02` | `2` | `magic: 2` |
+| 17-20 | `crc` (uint32, CRC-32C) | `d1 99 b8 4d` | `3516512333` | `crc: 3516512333` |
+
+ทุก field ตรงกันเป๊ะ `12 + 70 = 82` ไม่ใช่ความบังเอิญ -- `batchLength` นับทุกอย่าง**หลัง**prefix `baseOffset`+`batchLength` 12 ไบต์ ดังนั้น `size: 82` ของเครื่องมือเองคือ prefix นั้นบวก `batchLength` ที่ decode แล้วเป๊ะ นี่คือความหมายที่เป็นรูปธรรมของ "record batch format v2": header ตายตัว 61 ไบต์ (ห้า field ในตารางนี้บวก `attributes`, `lastOffsetDelta`, timestamp, producer ID/epoch, base sequence, และจำนวน record -- ไม่ได้แสดงทั้งหมดใน 3 แถวที่ตัดมานี้) ตามด้วย record เอง แต่ละตัวเก็บแค่**เดลต้า**จาก `baseOffset`/base timestamp ของ batch เป็น varint แทนการซ้ำค่าเต็ม -- กลไกจริงที่ [The Log Abstraction](/kafka/th/foundations/the-log-abstraction/) แนะนำไปแล้วจากฝั่ง CLI; บทนี้คือเวอร์ชันระดับไบต์ของไฟล์เดียวกัน
+
+<Callout title="Compression เป็นคุณสมบัติระดับ batch ไม่ใช่ต่อ record">
+`attributes` (ข้างในheader ที่ตัดมานี้ไม่ได้แสดงทีละไบต์) พก compression codec สำหรับ**ทั้ง batch** -- พิสูจน์ด้านล่าง batch เดียวที่ `compresscodec: lz4` มี 200 record compress เป็นหน่วยเดียว ไม่ใช่ 200 ครั้งแยกกัน นี่คือเหตุผลที่ batch ที่มี record ใหญ่หนึ่งตัวกับ record เล็ก 199 ตัวยัง compress เป็น blob เดียว และทำไม decompress ต้องใช้ batch ทั้งตัว ไม่ใช่แค่ record ตัวที่ต้องการ
+</Callout>
+
+## ไฟล์ `.index` เป็น sparse -- พิสูจน์ด้วย 500 record จริง
+
+```bash
+# scripts/storage-and-segments/sparse-index.sh
+TOPIC="${TOPIC_PREFIX}internals-sparse-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1 \
+  --config index.interval.bytes=512
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic "$TOPIC" --num-records 500 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers=$BOOTSTRAP acks=1 > /dev/null
+echo "=== index entries for 500 records ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.index
+```
+
+output จริง -- 500 record produce ด้วย `index.interval.bytes=512` (ต่ำกว่า default 4096 เพื่อให้เห็น entry มากกว่าหนึ่งตัวในการทดสอบขนาดเล็กที่สมเหตุสมผล):
+
+```text
+=== index entries for 500 records ===
+offset: 155 position: 16377
+offset: 233 position: 32754
+offset: 311 position: 49131
+offset: 389 position: 65508
+offset: 467 position: 81885
+offset: 499 position: 98262
+```
+
+หก index entry สำหรับห้าร้อย record -- index ได้ entry ใหม่แค่ทุก `index.interval.bytes` ของข้อมูล *log* ที่เขียน ไม่ใช่ทุก record การหา offset ที่ต้องการ (สมมติ `300`) คือ binary-search ไฟล์เล็ก ๆ sparse นี้หา entry ที่ใกล้สุด**ที่หรือก่อน**เป้าหมาย (`233` ที่นี่) seek ไฟล์ `.log` ไปที่ byte `position` นั้น (`32754`) แล้ว scan ต่อไปทีละ record จากจุดนั้น -- ผสมกันระหว่าง "index พาไปใกล้" กับ "linear scan ทำงานที่เหลือ" นี่เองคือเหตุผลที่ `index.interval.bytes` เป็น trade-off latency/space จริง (index หนาแน่นกว่า = scan น้อยลงต่อการค้นหา, ไบต์ index บนดิสก์มากขึ้น) ไม่ใช่ parameter ฟรี
+
+## Compression เป็นของจริง และเป็นระดับ batch ทั้งตัว
+
+```bash
+# scripts/storage-and-segments/compression-batch.sh
+TOPIC="${TOPIC_PREFIX}internals-lz4-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic "$TOPIC" --num-records 200 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers=$BOOTSTRAP acks=1 compression.type=lz4 batch.size=65536 linger.ms=500 > /dev/null
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.log
+```
+
+output จริง:
+
+```text
+baseOffset: 0 lastOffset: 199 count: 200 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1
+  partitionLeaderEpoch: 0 isTransactional: false isControl: false position: 0 CreateTime: 1790650248460
+  size: 41519 magic: 2 compresscodec: lz4 crc: 3359023082 isvalid: true
+```
+
+`count: 200` บน batch **เดียว** (`baseOffset: 0 lastOffset: 199`) พร้อม field `compresscodec: lz4` เดียวพิสูจน์ว่า compression เกิดขึ้นครั้งเดียว สำหรับ batch 200 record ทั้งตัว ไม่ใช่ 200 ครั้ง 200 record × 200 ไบต์ = 40,000 ไบต์ payload ดิบ; `size` บนดิสก์ (41,519) รวม header ของ record-batch และ overhead ต่อ record บนหัวข้อมูลที่*compress แล้ว* -- ยังอยู่ระดับใกล้เคียงขนาดไม่ compress ที่นี่เพราะ record ทดสอบสังเคราะห์สั้น ๆ หน้าตาคล้ายกันไม่ compress ได้มากนัก แต่กลไก (field codec เดียว, blob compress เดียว ทั้ง batch) คือสิ่งที่บทนี้พิสูจน์ ไม่ใช่ ratio เฉพาะ
+
+## Log cleaner และ `log.cleaner.threads`
+
+```bash
+# scripts/storage-and-segments/cleaner-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep -E "log.cleaner.threads|log.segment.bytes|log.index.interval.bytes"
+```
+
+output จริง:
+
+```text
+log.cleaner.threads=1 sensitive=false synonyms={DEFAULT_CONFIG:log.cleaner.threads=1}
+log.index.interval.bytes=4096 sensitive=false synonyms={DEFAULT_CONFIG:log.index.interval.bytes=4096}
+log.segment.bytes=1073741824 sensitive=false synonyms={DEFAULT_CONFIG:log.segment.bytes=1073741824}
+```
+
+หนึ่ง cleaner thread โดย default ทำงานข้าม partition ที่ compact ทุกตัวบน broker (`log.cleaner.threads` เพิ่มค่านี้สำหรับ broker ที่มี partition compact เยอะและมี CPU เหลือ -- [Retention and Compaction](/kafka/th/topics-and-partitions/retention-and-compaction/) พิสูจน์กลไกจริงของ compaction ด้วย `kafka-dump-log.sh` ก่อน/หลังไปแล้ว บทนี้เพิ่มแค่ knob จำนวน thread) `log.segment.bytes` (1 GiB default) คือ knob*อีกตัว*ที่คุมว่ามี segment กี่ตัวต่อ partition -- พิสูจน์ตลอดคอร์สนี้ด้วยชุด `.log`/`.index`/`.timeindex` segment ใหม่เริ่มเมื่อตัว active ข้ามขนาดนี้ (หรือ `log.segment.ms` ผ่านไป) แต่ละตัวมี index sparse ใหม่ของตัวเองที่เริ่มจาก base offset ของ segment นั้นเอง
+
+## Page cache และ `sendfile`: พิสูจน์ทางอ้อม
+
+design ที่บันทึกไว้ของ Kafka (ส่วน "Efficiency on the Right Hardware" ของ [kafka.apache.org/documentation/#design](https://kafka.apache.org/documentation/#design) -- เหมือนที่ harness ของคอร์สนี้เองเจอสำหรับหน้า config-reference, URL ระดับบนสุด `/documentation/` เป็น client-side redirect stub ไม่มีเนื้อหา static เลย หน้าจริงอยู่ที่ path เฉพาะเวอร์ชัน `/<major><minor>/documentation.html#design`) อธิบายว่า Kafka พึ่ง OS page cache แทน cache ระดับ application และใช้ `sendfile` ส่งไบต์จาก page cache นั้นตรงไปที่ socket โดยไม่ copy ผ่าน heap ของ JVM เอง -- **zero-copy** transfer จริง บทนี้ instrument syscall `sendfile` ของ kernel ตรง ๆ จากในคอนเทนเนอร์ไม่ได้โดยไม่มีเครื่องมือเพิ่มที่ toolchain ของคอร์สนี้ไม่มี แต่พิสูจน์ครึ่งหนึ่งของ *page-cache* ทางอ้อมได้ อย่างซื่อตรง ด้วยสิ่งที่มีอยู่แล้ว:
+
+```bash
+# scripts/storage-and-segments/proc-io.sh
+PID=$(pgrep -f kafka.Kafka | head -1)
+cat /proc/$PID/io
+```
+
+output จริงจาก broker ของโมดูลนี้เองหลัง session ปกติของการสร้าง topic, produce, และ consume:
+
+```text
+rchar: 10269007
+wchar: 5668833
+syscr: 96819
+syscw: 11451
+read_bytes: 0
+write_bytes: 18747392
+cancelled_write_bytes: 20480
+```
+
+`rchar` (ไบต์ที่อ่านผ่าน syscall `read()`/`pread()` -- ตัวนับ logical I/O ของ Linux เอง [บันทึกไว้](https://man7.org/linux/man-pages/man5/proc.5.html) ใต้ `/proc/[pid]/io`) เกิน 10 MB; `read_bytes` (ไบต์ที่ block layer ดึงจริงจาก device ข้างใต้) เป็น**ศูนย์** ทุก logical read ที่ process broker นี้ทำถูกตอบสนองด้วย page cache ทั้งหมด -- ไม่มีตัวใดต้องอ่านดิสก์จริงเลย -- นี่คือผลจริงที่สังเกตได้ตามที่ design doc อธิบาย แม้จะไม่ได้ trace call `sendfile` ตรง ๆ
+
+## ทำไม fsync ไม่ใช่กลไก durability
+
+```bash
+# scripts/storage-and-segments/flush-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "log.flush"
+```
+
+output จริงบนคลัสเตอร์นี้ ไม่แก้ไขอะไรจาก default ของ image เอง:
+
+```text
+log.flush.interval.messages=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.interval.messages=9223372036854775807}
+log.flush.interval.ms=null sensitive=false synonyms={}
+log.flush.offset.checkpoint.interval.ms=60000 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.offset.checkpoint.interval.ms=60000}
+log.flush.scheduler.interval.ms=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.scheduler.interval.ms=9223372036854775807}
+```
+
+`9223372036854775807` คือ `Long.MAX_VALUE` -- `log.flush.interval.messages` default เป็นค่านี้แปลว่า "ไม่บังคับ fsync ตามจำนวนข้อความเลยจริง ๆ" Kafka ตั้งใจปล่อย fsync ให้พฤติกรรม flush เบื้องหลังของ OS เองและพึ่ง **replication** สำหรับ durability แทน: record จะ durable ทันทีที่ ISR (กลไกที่พิสูจน์แล้วใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)) มีมัน บนเครื่องอิสระหลายเครื่อง ไม่ว่าเครื่องใดเครื่องหนึ่งจะ fsync มันลงดิสก์จริงหรือยัง นี่คือการแลกที่ตั้งใจ -- บังคับ fsync ทุกข้อความจะช้ากว่าการพึ่ง page-cache write บวก replication ข้ามเครื่องมาก และดิสก์ของเครื่องเดียวพังก่อนที่มันจะ fsync เองคือ failure mode ที่ replication ครอบคลุมอยู่แล้ว
+
+## Mental Model
+
+ไฟล์ `.log` คือลำดับแบบ flat, append-only ของ record batch ที่อธิบายตัวเองได้ -- decode header ตายตัวที่ position ไหนก็รู้ทันทีว่าต้องข้ามกี่ไบต์ถึงจะถึงตัวถัดไป นี่คือสิ่งที่ทำให้ทั้ง sequential scan และ pattern "seek แล้ว scan" ของ `.index` sparse ทำงานได้ Compression เมื่อใช้ จะ compress ทั้ง batch เป็นหน่วยเดียว ไม่ใช่ record แยกกันเลย Durability มาจาก**การรวมกัน**ของ page cache (เร็ว แต่ volatile) และ replication (durable เพราะอยู่หลายเครื่อง) -- fsync-ลงดิสก์ไม่จำเป็นเลย และตาม config default จริงของคลัสเตอร์นี้เอง ไม่ถูกพยายามทำตามตารางเวลาที่คาดเดาได้ด้วยซ้ำ
+
+## Trade-offs
+
+| ตัวเลือก | ประโยชน์ | ต้นทุน |
+|---|---|---|
+| `.index` แบบ sparse (`index.interval.bytes`) | ไฟล์ index เล็ก overhead memory/disk ต่ำ | การค้นหายังต้อง scan แบบเส้นตรงจาก entry ที่ใกล้สุด -- พิสูจน์แล้วข้างบน หก entry สำหรับ 500 record แปลว่ามีงาน scan จริงต่อการค้นหา |
+| Compression ระดับ batch | pass compression หนึ่งครั้งต่อ batch ไม่ใช่ต่อ record -- overhead CPU น้อยกว่า compression ต่อ record มาก | อ่าน record แค่ตัวเดียวจาก batch ที่ compress แล้วต้อง decompress ทั้ง batch |
+| พึ่ง page cache + replication (ไม่ใช่ fsync) | พิสูจน์แล้วข้างบน: อ่านดิสก์จริงเป็นศูนย์สำหรับ logical read เกิน 10MB -- และเขียนเร็วเพราะไม่รอ fsync | เครื่องที่ไฟดับก่อน OS เอง flush dirty page อาจข้อมูลหาย **ถ้า**มันอยู่นอก ISR ณ ตอนนั้นด้วย -- replication ไม่ใช่ fsync ของเครื่องนี้เอง คือสิ่งที่ป้องกันจริง |
+| `log.cleaner.threads` > 1 | throughput compaction แบบ parallel มากขึ้นบน broker ที่มี partition compact เยอะ | แข่ง CPU/memory กับ thread จัดการ request บน broker เดียวกันมากขึ้น |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Kafka fsync ทุกการเขียนเพื่อการันตี durability"** พิสูจน์แล้วข้างบนด้วย config จริงไม่แก้ไขของคลัสเตอร์นี้เอง: `log.flush.interval.messages` default เป็น `Long.MAX_VALUE` -- durability มาจาก replication ไม่ใช่การบังคับเขียนดิสก์ทุกครั้งก่อน ack
+- **"Compression เกิดต่อ record เลยแค่ decompress record เดียวที่ต้องการได้"** พิสูจน์แล้วข้างบน: field `compresscodec` เดียวครอบคลุม batch ทั้งตัวที่มีได้ถึงหลายร้อย record -- อ่านตัวใดตัวหนึ่งต้อง decompress ทั้ง batch
+- **"ไฟล์ `.index` มีหนึ่ง entry ต่อ record เหมือน database index"** พิสูจน์แล้วข้างบนด้วย 500 record จริงและ 6 index entry จริง: มันตั้งใจให้ sparse แลกขนาด index กับปริมาณ linear scan ที่จำกัดต่อการค้นหา
+- **"อ่านข้อมูลที่ Kafka มีในหน่วยความจำอยู่แล้วยังเสียค่าอ่านดิสก์จริงทุกครั้ง"** พิสูจน์แล้วข้างบนด้วย `/proc/[pid]/io` จริง: `read_bytes` เป็นศูนย์ทั้งที่ logical read เกิน 10MB -- page cache ดูดซับไปหมด
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="properties" code={`# section: broker
+# AI-suggested "durability hardening" for a payments cluster
+log.flush.interval.messages=1
+log.flush.interval.ms=0`}>
+พิสูจน์แล้วข้างบน: การตั้งนี้บังคับ fsync หลังทุกข้อความเดียว ซึ่ง default จริงของคลัสเตอร์นี้เอง (`log.flush.interval.messages=9223372036854775807` คือไม่เกิดขึ้นจริง) ตั้งใจหลีกเลี่ยงด้วยเหตุผลจริง ไม่ใช่ความขี้เกียจ การันตี durability จริงสำหรับ topic ระดับ payments คือ `acks=all` บวก `min.insync.replicas >= 2` (กลไกจริงพิสูจน์ใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)) ซึ่งรอดจากดิสก์ของเครื่องเดียวพังไปทั้งตัว สิ่งที่ fsync ต่อข้อความบนเครื่องเดียวกันนั้นเองไม่ได้ป้องกันด้วยตัวเอง "hardening" นี้แลก throughput การเขียนส่วนใหญ่ของ Kafka ไปกับคุณสมบัติ durability ที่ replication ให้ได้แข็งแรงกว่าอยู่แล้ว
+</SpotTheBug>
+
+export const quizStorageAndSegments = [
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยการ decode hexdump จริงด้วยมือแล้ว cross-check กับ kafka-dump-log.sh ไบต์ 17-20 ของ record batch (hex d1 99 b8 4d) encode อะไรจริง ๆ?',
+    options: [
+      'The record\'s key',
+      'A CRC-32C checksum of the batch, decoded as 3516512333 -- exactly matching kafka-dump-log.sh\'s own "crc:" field on the same file',
+      'The producer ID',
+      'The compression codec',
+    ],
+    answer: 1,
+    explain: 'การ decode ด้วยมือข้างบนแปลง hex d1 99 b8 4d เป็นทศนิยม 3516512333 และ kafka-dump-log.sh --print-data-log บนไฟล์เดียวกันเป๊ะรายงาน "crc: 3516512333" -- การอ่านไบต์เดียวกันสองวิธีที่อิสระจากกันตรงกันเป๊ะ',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย 500 record ที่ produce จริงและ dump จริงของไฟล์ .index ที่เกิดขึ้นด้วย kafka-dump-log.sh มี index entry กี่ตัว?',
+    options: [
+      '500 -- one per record, like a database index',
+      '6 -- the index is deliberately sparse, gaining a new entry only every index.interval.bytes of log data, not every record',
+      '0 -- the index was empty',
+      '50 -- one per 10 records exactly',
+    ],
+    answer: 1,
+    explain: 'dump จริงข้างบนแสดง 6 entry เป๊ะสำหรับ 500 record -- proof ตรงที่นับได้ว่า offset index เป็น sparse โดยการออกแบบ ไม่ใช่โครงสร้างหนาแน่นต่อ record',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย batch 200 record จริงที่ compress ด้วย lz4 (dump ผ่าน kafka-dump-log.sh) Kafka apply compression ที่ granularity ไหน?',
+    options: [
+      'Per individual record -- each record is compressed and decompressed independently',
+      'Per batch -- the real dump showed one compresscodec field for a single batch spanning all 200 records (baseOffset 0, lastOffset 199)',
+      'Per partition -- the whole partition\'s data is one compressed blob',
+      'Per topic -- compression settings apply to the entire topic\'s log as a single unit',
+    ],
+    answer: 1,
+    explain: 'dump จริงข้างบนแสดง baseOffset: 0 lastOffset: 199 count: 200 เป็น batch เดียวพร้อม field compresscodec: lz4 เดียว -- proof ว่า compression เป็นคุณสมบัติทั้ง batch ไม่ใช่ต่อ record, partition, หรือ topic',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยการอ่าน /proc/[pid]/io จริงบน process broker ของโมดูลนี้เอง การรวมกันของ rchar จริง (เกิน 10MB) กับ read_bytes จริงที่เป็น 0 เป๊ะ แสดงอะไรจริง ๆ?',
+    options: [
+      'The broker crashed before reading any data',
+      'Every logical read this process made was satisfied by the OS page cache with zero actual block-device reads -- the real, observable half of the page-cache design the docs describe, even without tracing sendfile directly',
+      'The broker has a memory leak',
+      'Disk reads and page cache reads are always identical, so this proves nothing',
+    ],
+    answer: 1,
+    explain: 'rchar นับไบต์ read()/pread() ระดับ logical; read_bytes นับสิ่งที่ตกกระทบ block device จริง rchar เกิน 10MB จริงคู่กับ read_bytes เป็น 0 จริง คือ proof ตรง ทางอ้อมแต่ซื่อตรง ว่าการอ่านของ broker นี้ถูกตอบสนองด้วย page cache ทั้งหมดระหว่าง session นี้',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย output จริงไม่แก้ไขของ kafka-configs.sh --describe ของคลัสเตอร์นี้เอง log.flush.interval.messages default เป็นอะไร และมันพิสูจน์อะไรเกี่ยวกับกลไก durability จริงของ Kafka?',
+    options: [
+      '1 -- Kafka fsyncs after every message by default',
+      'Long.MAX_VALUE (9223372036854775807) -- fsync is effectively never forced by message count on this real, unmodified broker; durability comes from replication (the ISR), not from forcing disk writes',
+      '100 -- Kafka batches fsyncs every 100 messages',
+      'This config has no real default and must always be set manually',
+    ],
+    answer: 1,
+    explain: 'output describe จริงข้างบนแสดง log.flush.interval.messages=9223372036854775807 (Long.MAX_VALUE) บน broker ที่เป็น default เต็มที่ -- proof ตรงว่าเรื่อง durability จริงของ Kafka อิงอยู่กับ replication ไม่ใช่การบังคับ fsync',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/storage-and-segments" questions={quizStorageAndSegments} />
+
+<ProgressTracker client:visible id="kafka-internals/storage-and-segments" />

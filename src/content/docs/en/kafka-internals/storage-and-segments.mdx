@@ -1,0 +1,245 @@
+---
+title: 'Storage and Segments'
+description: 'The real byte layout of a .log segment and its sparse .index, decoded by hand from a real hexdump and cross-checked against kafka-dump-log.sh, record batch v2 compression, the sparse offset index, the log cleaner, and why fsync is not the durability mechanism -- proven on Kafka 4.3.1.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+A `.log` segment's bytes are not opaque -- the first 21 bytes of every record batch (`baseOffset`, `batchLength`, `partitionLeaderEpoch`, `magic`, `crc`) can be decoded by hand from a raw `hexdump` and cross-checked field-for-field against `kafka-dump-log.sh`, and the `.index` file next to it is deliberately sparse, not one entry per record.
+
+## Decoding a real record batch by hand
+
+Producing one record and dumping the first bytes of the segment it landed in:
+
+```text
+$ hexdump -C /tmp/kafka-logs/internals-pipeline-lesson-0/00000000000000000000.log | head -3
+00000000  00 00 00 00 00 00 00 00  00 00 00 46 00 00 00 00  |...........F....|
+00000010  02 d1 99 b8 4d 00 00 00  00 00 00 00 00 01 a0 eb  |....M...........|
+00000020  09 1e 95 00 00 01 a0 eb  09 1e 95 00 00 00 00 00  |................|
+```
+
+Record batch v2's fixed header, decoded byte-for-byte from those three rows, cross-checked against `kafka-dump-log.sh --print-data-log` on the exact same file:
+
+| Bytes | Field | Hex | Decoded | `kafka-dump-log.sh` says |
+|---|---|---|---|---|
+| 0-7 | `baseOffset` (int64) | `00 00 00 00 00 00 00 00` | `0` | `baseOffset: 0` |
+| 8-11 | `batchLength` (int32) | `00 00 00 46` | `70` | (`size: 82` = 12-byte offset+length prefix + 70) |
+| 12-15 | `partitionLeaderEpoch` (int32) | `00 00 00 00` | `0` | `partitionLeaderEpoch: 0` |
+| 16 | `magic` (int8) | `02` | `2` | `magic: 2` |
+| 17-20 | `crc` (uint32, CRC-32C) | `d1 99 b8 4d` | `3516512333` | `crc: 3516512333` |
+
+Every single field matches. `12 + 70 = 82` is not a coincidence -- `batchLength` counts everything **after** the 12-byte `baseOffset`+`batchLength` prefix, so the tool's own `size: 82` is exactly that prefix plus the decoded `batchLength`. This is the concrete meaning of "record batch format v2": a fixed 61-byte header (this table's five fields plus `attributes`, `lastOffsetDelta`, timestamps, producer ID/epoch, base sequence, and record count -- not all shown in this 3-row excerpt) followed by the records themselves, each one storing only **deltas** from the batch's `baseOffset`/base timestamp as varints rather than repeating full values -- the actual mechanism [The Log Abstraction](/kafka/en/foundations/the-log-abstraction/) already introduced from the CLI side; this lesson is the byte-level version of the same file.
+
+<Callout title="Compression is a batch-level property, not per-record">
+`attributes` (inside the header this excerpt doesn't show byte-by-byte) carries the compression codec for the **entire batch** -- proven below, one `compresscodec: lz4` batch containing 200 records compresses as a single unit, not 200 separately-compressed records. This is why a batch with one huge record and 199 tiny ones still compresses as one blob, and why decompressing requires the whole batch, not just the one record you want.
+</Callout>
+
+## The `.index` file is sparse -- proven with 500 real records
+
+```bash
+# scripts/storage-and-segments/sparse-index.sh
+TOPIC="${TOPIC_PREFIX}internals-sparse-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1 \
+  --config index.interval.bytes=512
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic "$TOPIC" --num-records 500 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers=$BOOTSTRAP acks=1 > /dev/null
+echo "=== index entries for 500 records ==="
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.index
+```
+
+Real output -- 500 records, produced with `index.interval.bytes=512` (lower than the 4096 default, specifically to make more than one entry show up in a reasonably small test):
+
+```text
+=== index entries for 500 records ===
+offset: 155 position: 16377
+offset: 233 position: 32754
+offset: 311 position: 49131
+offset: 389 position: 65508
+offset: 467 position: 81885
+offset: 499 position: 98262
+```
+
+Six index entries for five hundred records -- the index gets a new entry only every `index.interval.bytes` of *log* data written, not every record. Looking up an arbitrary offset (say, `300`) means binary-searching this small, sparse file for the nearest entry **at or before** the target (`233` here), seeking the `.log` file to that byte `position` (`32754`), and then scanning forward record-by-record from there -- a hybrid of "index gets you close" and "linear scan finishes the job," which is exactly why `index.interval.bytes` is a real latency/space trade-off (denser index = less scanning per lookup, more index bytes on disk) and not a free parameter.
+
+## Compression is real, and it is batch-wide
+
+```bash
+# scripts/storage-and-segments/compression-batch.sh
+TOPIC="${TOPIC_PREFIX}internals-lz4-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic "$TOPIC" --num-records 200 --record-size 200 \
+  --throughput -1 --producer-props bootstrap.servers=$BOOTSTRAP acks=1 compression.type=lz4 batch.size=65536 linger.ms=500 > /dev/null
+/opt/kafka/bin/kafka-dump-log.sh --files /tmp/kafka-logs/"$TOPIC"-0/00000000000000000000.log
+```
+
+Real output:
+
+```text
+baseOffset: 0 lastOffset: 199 count: 200 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1
+  partitionLeaderEpoch: 0 isTransactional: false isControl: false position: 0 CreateTime: 1790650248460
+  size: 41519 magic: 2 compresscodec: lz4 crc: 3359023082 isvalid: true
+```
+
+`count: 200` on a **single** batch (`baseOffset: 0 lastOffset: 199`) with one `compresscodec: lz4` field proves compression happened once, for the whole 200-record batch, not 200 times. 200 records × 200 bytes = 40,000 raw payload bytes; the on-disk `size` (41,519) includes the record-batch header and per-record overhead on top of the *compressed* payload -- still in the same ballpark as the uncompressed size here because short, similar-looking synthetic test records don't compress dramatically, but the mechanism (one codec field, one compressed blob, for the entire batch) is what this lesson is proving, not a specific ratio.
+
+## The log cleaner and `log.cleaner.threads`
+
+```bash
+# scripts/storage-and-segments/cleaner-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep -E "log.cleaner.threads|log.segment.bytes|log.index.interval.bytes"
+```
+
+Real output:
+
+```text
+log.cleaner.threads=1 sensitive=false synonyms={DEFAULT_CONFIG:log.cleaner.threads=1}
+log.index.interval.bytes=4096 sensitive=false synonyms={DEFAULT_CONFIG:log.index.interval.bytes=4096}
+log.segment.bytes=1073741824 sensitive=false synonyms={DEFAULT_CONFIG:log.segment.bytes=1073741824}
+```
+
+One cleaner thread by default, working across every log-compacted partition on the broker (`log.cleaner.threads` raises this for brokers with many compacted partitions and CPU to spare -- [Retention and Compaction](/kafka/en/topics-and-partitions/retention-and-compaction/) already proved compaction's actual mechanics with `kafka-dump-log.sh` before/after; this lesson only adds the thread-count knob). `log.segment.bytes` (1 GiB default) is the *other* knob controlling how many segments exist per partition -- proven throughout this course's `.log`/`.index`/`.timeindex` triples, a new segment starts once the active one crosses this size (or `log.segment.ms` elapses), each with its own fresh, sparse index restarting from that segment's own base offset.
+
+## Page cache and `sendfile`: proven indirectly
+
+Kafka's documented design (the "Efficiency on the Right Hardware" section of [kafka.apache.org/documentation/#design](https://kafka.apache.org/documentation/#design) -- like this course's own harness found for the config-reference pages, the top-level `/documentation/` URL is itself a client-side redirect stub with no static content, so the real page is served at a version-specific `/<major><minor>/documentation.html#design` path) explains that Kafka relies on the OS page cache instead of an application-level cache, and uses `sendfile` to transfer bytes from that page cache straight to a socket without copying them through the JVM's own heap -- a genuine **zero-copy** transfer. This lesson cannot instrument the kernel's `sendfile` syscall directly from inside a container without extra tooling this course's toolchain doesn't have, but it can prove the *page-cache* half indirectly, honestly, with what's already available:
+
+```bash
+# scripts/storage-and-segments/proc-io.sh
+PID=$(pgrep -f kafka.Kafka | head -1)
+cat /proc/$PID/io
+```
+
+Real output from this module's own broker after a normal session of topic creates, produces, and consumes:
+
+```text
+rchar: 10269007
+wchar: 5668833
+syscr: 96819
+syscw: 11451
+read_bytes: 0
+write_bytes: 18747392
+cancelled_write_bytes: 20480
+```
+
+`rchar` (bytes read via `read()`/`pread()` syscalls -- Linux's own logical I/O counter, [documented](https://man7.org/linux/man-pages/man5/proc.5.html) under `/proc/[pid]/io`) is over 10 MB; `read_bytes` (bytes the block layer actually pulled off the underlying device) is **zero**. Every logical read this broker process made was satisfied entirely by the page cache -- not one of them required an actual disk read -- which is the real, observable effect the design doc describes, even without tracing the `sendfile` call itself.
+
+## Why fsync is not the durability mechanism
+
+```bash
+# scripts/storage-and-segments/flush-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "log.flush"
+```
+
+Real output on this cluster, completely unmodified from the image's own defaults:
+
+```text
+log.flush.interval.messages=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.interval.messages=9223372036854775807}
+log.flush.interval.ms=null sensitive=false synonyms={}
+log.flush.offset.checkpoint.interval.ms=60000 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.offset.checkpoint.interval.ms=60000}
+log.flush.scheduler.interval.ms=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.scheduler.interval.ms=9223372036854775807}
+```
+
+`9223372036854775807` is `Long.MAX_VALUE` -- `log.flush.interval.messages` defaulting to it means "effectively never force an fsync based on message count." Kafka deliberately leaves fsync to the operating system's own background flush behavior and relies on **replication** for durability instead: a record is durable once the ISR (proven mechanism in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)) has it, on multiple independent machines, regardless of whether any single one of them has fsynced it to physical disk yet. This is a deliberate trade -- forcing an fsync on every message would be far slower than relying on page-cache writes plus cross-machine replication, and a single machine's disk failing before its own fsync is exactly the failure mode replication already covers.
+
+## Mental Model
+
+A `.log` file is a flat, append-only sequence of self-describing record batches -- decode the fixed header at any position and you know exactly how many bytes to skip to reach the next one, which is what makes both sequential scanning and the sparse `.index`'s "seek then scan" pattern work. Compression, when used, compresses one whole batch as a unit, never individual records. Durability comes from the **combination** of the page cache (fast, but volatile) and replication (durable, because it's on multiple machines) -- fsync-to-disk is neither required nor, by this cluster's own default config, even attempted on any predictable schedule.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Sparse `.index` (`index.interval.bytes`) | Small index files, low memory/disk overhead | A lookup still needs a linear scan from the nearest entry -- proven above, six entries for 500 records means real scanning work per lookup |
+| Batch-level compression | One compression pass per batch, not per record -- far less CPU overhead than per-record compression | Reading even one record from a compressed batch requires decompressing the whole batch |
+| Relying on page cache + replication (not fsync) | Proven above: zero actual disk reads for 10MB+ of logical reads -- and writes are fast because they don't wait on fsync | A machine that loses power before the OS itself flushes dirty pages can lose data **if** it was also outside the ISR at that moment -- replication, not this machine's own fsync, is what actually protects against that |
+| `log.cleaner.threads` > 1 | More parallel compaction throughput on brokers with many compacted partitions | More CPU/memory contention with the request-handling threads on the same broker |
+
+## Common Misconceptions
+
+- **"Kafka fsyncs every write to guarantee durability."** Proven above with this cluster's own real, unmodified config: `log.flush.interval.messages` defaults to `Long.MAX_VALUE` -- durability comes from replication, not from forcing every write to disk before acknowledging it.
+- **"Compression happens per-record, so you can decompress just the one record you need."** Proven above: one `compresscodec` field covers an entire batch of up to hundreds of records -- reading any one of them requires decompressing the whole batch.
+- **"The `.index` file has one entry per record, like a database index."** Proven above with 500 real records and 6 real index entries: it is intentionally sparse, trading index size for a bounded amount of linear scanning per lookup.
+- **"Reading data Kafka already has in memory still costs a real disk read every time."** Proven above with a real `/proc/[pid]/io`: `read_bytes` was zero despite over 10MB of logical reads -- the page cache absorbed all of it.
+
+## Reading AI-generated code
+
+<SpotTheBug lang="properties" code={`# section: broker
+# AI-suggested "durability hardening" for a payments cluster
+log.flush.interval.messages=1
+log.flush.interval.ms=0`}>
+Proven above: this forces an fsync after every single message, which this cluster's own real default (`log.flush.interval.messages=9223372036854775807`, effectively never) deliberately avoids -- and for a real reason, not laziness. The actual durability guarantee for a payments-grade topic is `acks=all` plus `min.insync.replicas >= 2` (real mechanism proven in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)), which survives a single machine's disk failing entirely, something per-message fsync on that same single machine does not protect against on its own. This "hardening" trades away most of Kafka's write throughput for a durability property replication already provides more robustly.
+</SpotTheBug>
+
+export const quizStorageAndSegments = [
+  {
+    q: 'Proven above by hand-decoding a real hexdump and cross-checking against kafka-dump-log.sh, what do bytes 17-20 of a record batch (hex d1 99 b8 4d) actually encode?',
+    options: [
+      'The record\'s key',
+      'A CRC-32C checksum of the batch, decoded as 3516512333 -- exactly matching kafka-dump-log.sh\'s own "crc:" field on the same file',
+      'The producer ID',
+      'The compression codec',
+    ],
+    answer: 1,
+    explain: 'The hand decode above converts hex d1 99 b8 4d to decimal 3516512333, and kafka-dump-log.sh --print-data-log on the identical file reports "crc: 3516512333" -- the two independent readings of the same bytes agree exactly.',
+  },
+  {
+    q: 'Proven above with 500 real produced records and a real kafka-dump-log.sh dump of the resulting .index file, how many index entries existed?',
+    options: [
+      '500 -- one per record, like a database index',
+      '6 -- the index is deliberately sparse, gaining a new entry only every index.interval.bytes of log data, not every record',
+      '0 -- the index was empty',
+      '50 -- one per 10 records exactly',
+    ],
+    answer: 1,
+    explain: 'The real dump above showed exactly 6 entries for 500 records -- direct, countable proof the offset index is sparse by design, not a dense per-record structure.',
+  },
+  {
+    q: 'Proven above with a real 200-record batch compressed with lz4 (dumped via kafka-dump-log.sh), at what granularity does Kafka apply compression?',
+    options: [
+      'Per individual record -- each record is compressed and decompressed independently',
+      'Per batch -- the real dump showed one compresscodec field for a single batch spanning all 200 records (baseOffset 0, lastOffset 199)',
+      'Per partition -- the whole partition\'s data is one compressed blob',
+      'Per topic -- compression settings apply to the entire topic\'s log as a single unit',
+    ],
+    answer: 1,
+    explain: 'The real dump above showed baseOffset: 0 lastOffset: 199 count: 200 as ONE batch with one compresscodec: lz4 field -- proof compression is a batch-wide property, not per-record, per-partition, or per-topic.',
+  },
+  {
+    q: 'Proven above with a real /proc/[pid]/io read on this module\'s own broker process, what did the combination of a real rchar value (over 10MB) and a real read_bytes value of exactly 0 actually demonstrate?',
+    options: [
+      'The broker crashed before reading any data',
+      'Every logical read this process made was satisfied by the OS page cache with zero actual block-device reads -- the real, observable half of the page-cache design the docs describe, even without tracing sendfile directly',
+      'The broker has a memory leak',
+      'Disk reads and page cache reads are always identical, so this proves nothing',
+    ],
+    answer: 1,
+    explain: 'rchar counts logical read()/pread() bytes; read_bytes counts what actually hit the block device. A real 10MB+ rchar with a real 0 read_bytes is direct, indirect-but-honest proof this broker\'s reads were entirely served from page cache during this session.',
+  },
+  {
+    q: 'Proven above with this cluster\'s own real, unmodified kafka-configs.sh --describe output, what does log.flush.interval.messages default to, and what does that prove about Kafka\'s actual durability mechanism?',
+    options: [
+      '1 -- Kafka fsyncs after every message by default',
+      'Long.MAX_VALUE (9223372036854775807) -- fsync is effectively never forced by message count on this real, unmodified broker; durability comes from replication (the ISR), not from forcing disk writes',
+      '100 -- Kafka batches fsyncs every 100 messages',
+      'This config has no real default and must always be set manually',
+    ],
+    answer: 1,
+    explain: 'The real describe output above showed log.flush.interval.messages=9223372036854775807 (Long.MAX_VALUE) on a completely default broker -- direct proof that Kafka\'s real durability story rests on replication, not on forcing fsyncs.',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/storage-and-segments" questions={quizStorageAndSegments} />
+
+<ProgressTracker client:visible id="kafka-internals/storage-and-segments" />
