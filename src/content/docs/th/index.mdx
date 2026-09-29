@@ -40,6 +40,12 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   <Card title="Operations & Production" icon="approve-check">
     การรัน Kafka บนเครื่อง, monitoring และ consumer lag, tuning และ security [operate →](/kafka/th/operations-and-production/running-kafka-locally/)
   </Card>
+  <Card title="Kafka ทำงานอย่างไรข้างใน" icon="seti:config">
+    pipeline จาก produce ถึง fetch, consumer group protocol (RPC แบบ classic และ KIP-848), replication กับ ISR ข้างในบน cluster 3 broker จริง, KRaft metadata log และ storage กับ segment ถอดรหัสทีละ byte — ทุก claim พิสูจน์บน Kafka 4.3.1 ด้วย request log จริง [ดูข้างใน →](/kafka/th/kafka-internals/)
+  </Card>
+  <Card title="อ่านโค้ด Kafka ที่ AI เขียน" icon="magnifier">
+    catalog 21 bug ที่ KafkaJS, config และ CLI จาก AI เขียนผิด, review checklist, บันได verification tool พร้อม TypeScript compile-check ในเบราว์เซอร์ และ worked review 3 ชุด (order producer, payment consumer แบบ EOS, pipeline Connect + Streams + Schema Registry) — ทุก bug พิสูจน์จริง [ไป review →](/kafka/th/reading-kafka/)
+  </Card>
 </CardGrid>
 
 ## คอร์สนี้ทำงานยังไง
