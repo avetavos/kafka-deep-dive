@@ -1,6 +1,6 @@
 ---
 title: 'Performance & Tuning'
-description: 'The levers that trade throughput against latency in Kafka — producer batching and compression, acks, partition sizing for consumer parallelism, and broker-side page cache and disk.'
+description: 'Real kafka-producer-perf-test.sh / kafka-consumer-perf-test.sh numbers on this Mac — a 12-partition topic measured ~60% faster with ~66x lower latency than a 1-partition topic on the same broker, RequestHandlerAvgIdlePercent as the real signal for thread-pool sizing, why log.flush.* stays untouched, and OS limits (vm.max_map_count, file descriptors) cited from the docs.'
 sidebar:
   order: 3
 ---
@@ -8,104 +8,250 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Tuning Kafka is mostly about choosing where you sit on the **throughput-versus-latency** curve — bigger producer batches, compression, more partitions, and stronger `acks` each push one way or the other, so you tune toward your workload rather than chasing a single "fast" setting.
+Tuning Kafka is choosing where you sit on the throughput-versus-latency curve, and every number in this lesson is from **local Docker, a single broker, on this Mac** — real, reproducible, and not a substitute for benchmarking your own workload on your own hardware.
 
-## Producer levers: batching, compression, acks
+## Proof: partition count, measured — not just asserted
 
-The producer is where most throughput is won or lost. Three settings dominate:
+Two topics, identical broker, identical producer settings, only the partition count differs:
 
-- **Batching** — `linger.ms` and `batch.size` let the producer wait a few milliseconds and pack many records into one request. Larger batches mean far higher throughput at the cost of a little latency per record.
-- **Compression** — `compression.type` (`lz4`, `zstd`, `snappy`, `gzip`) shrinks each batch, cutting network and disk usage. It trades CPU for throughput and is almost always worth it under load.
-- **acks** — `acks=all` waits for the ISR to persist the record (durable, higher latency); `acks=1` waits for only the leader (faster, weaker guarantee). This is the classic durability-versus-latency dial.
+```bash
+# scripts/performance-and-tuning/partition-count-perf.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+  --create --topic perf-1p --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+  --create --topic perf-12p --partitions 12 --replication-factor 1
 
-```properties
-# Throughput-leaning producer: wait a little, batch bigger, compress, stay durable
-linger.ms=10
-batch.size=65536
-compression.type=lz4
-acks=all
+echo "=== 1 partition ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-1p \
+  --num-records 200000 --record-size 200 --throughput -1 \
+  --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 2>&1 | tail -1
+
+echo "=== 12 partitions ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-12p \
+  --num-records 200000 --record-size 200 --throughput -1 \
+  --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 2>&1 | tail -1
 ```
 
-<Mermaid title="The throughput versus latency trade-off" code={tuneFlow} />
+Real, unedited output:
 
-export const tuneFlow = `flowchart LR
-  batch["Bigger batches + linger.ms"] --> tp["Higher throughput"]
-  comp["Compression (lz4 / zstd)"] --> tp
-  acksall["acks=all"] --> dur["Stronger durability"]
-  acksall --> lat["Higher latency"]
-  small["Small batches + acks=1"] --> low["Lower latency"]`;
+```text
+=== 1 partition ===
+200000 records sent, 204708.290686 records/sec (39.05 MB/sec), 91.32 ms avg latency, 197.00 ms max latency, 99 ms 50th, 189 ms 95th, 192 ms 99th, 193 ms 99.9th.
 
-## Sizing partitions to throughput
+=== 12 partitions ===
+200000 records sent, 328407.224959 records/sec (62.64 MB/sec), 1.37 ms avg latency, 175.00 ms max latency, 1 ms 50th, 3 ms 95th, 5 ms 99th, 11 ms 99.9th.
+```
 
-Partitions are your **parallelism unit**: a partition is consumed by at most one consumer in a group, so the partition count is the ceiling on consumer parallelism. Size it from a target:
+Same single broker, same disk, same producer config — **~60% higher throughput and ~66x lower average latency** with 12 partitions instead of 1. This is local Docker on one Mac, not a capacity-planning number for your cluster, but the *direction* is real and explainable: with one partition, every append serializes through that one partition's single log-writer path; with 12 partitions, the broker's I/O threads (8 by default, proven below) can append to 12 independent logs concurrently instead of queuing behind one.
 
-> partitions ≈ target throughput ÷ per-consumer (or per-partition) throughput
-
-If one consumer instance handles 10 MB/s and you need 100 MB/s, you need at least 10 partitions to let 10 consumers run in parallel. Round up and leave headroom for growth and for uneven key distribution.
-
-<Callout title="Do not over-partition">
-More partitions is not free throughput. Each partition is open files, replication traffic, memory, and controller metadata — and it lengthens **rebalance** and failover time. Thousands of partitions per broker add latency and recovery risk. Size to your target with modest headroom, not to the largest number you can imagine. You can add partitions later; you cannot easily remove them.
+<Callout title="Do not over-read this specific ratio">
+`~60%` and `~66x` are this run, this Mac, this Docker setup — not a universal multiplier. The lesson is the *existence and direction* of the effect (more partitions parallelize broker-side append work up to the I/O thread count), not that "12 partitions" is a magic number. [Partition count trade-offs](/kafka/en/foundations/brokers-topics-partitions/#choosing-a-partition-count) covers sizing to actual target throughput, not to whatever wins a local benchmark.
 </Callout>
 
-## Broker-side: page cache, disk, network
+## `kafka-consumer-perf-test.sh`, and a real gotcha in its own output
 
-Brokers are deliberately simple, and their speed comes from the operating system:
+```bash
+# scripts/performance-and-tuning/consumer-perf-test.sh
+/opt/kafka/bin/kafka-consumer-perf-test.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic perf-12p --num-records 200000
 
-- **Page cache** — Kafka does **not** maintain its own big in-process cache. It writes to the OS page cache and relies on the kernel to serve recent reads from memory. Leave plenty of free RAM for the page cache; do not give the JVM a huge heap that starves it.
-- **Disk** — sequential writes make spinning disks and especially SSDs efficient. Use fast local disks, and spread load with multiple log directories if needed. Disk throughput and `fsync` behavior bound your durability and speed.
-- **Network** — replication and consumer fan-out are network-bound. A `replication-factor` of 3 means every produced byte is written roughly three times across the network, so provision NICs accordingly.
+# Clean up both scratch topics this lesson created above.
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --delete --topic perf-1p
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --delete --topic perf-12p
+```
+
+```text
+start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec
+2026-09-29 02:42:04:251, 2026-09-29 02:42:07:878, 38.1470, 10.5175, 200000, 55141.9906, 3459, 168, 227.0653, 1190476.1905
+```
+
+Reading the columns literally, `nMsg.sec` (55,142/sec, blending group-join time in) looks far slower than `fetch.nMsg.sec` (1,190,476/sec, fetch time only) — a ~21x difference in the **same run**, because `rebalance.time.ms` (3,459 ms — the group coordinator handshake) dwarfs `fetch.time.ms` (168 ms — the actual data transfer) on a tiny 200,000-record test. A real consumer-perf-test number that blends rebalance time into "throughput" will make Kafka look dramatically slower than it is for a short benchmark; for anything beyond a quick sanity check, look at `fetch.MB.sec`/`fetch.nMsg.sec` specifically, or run a large enough record count that one-time rebalance cost stops dominating the average.
+
+## Producer batching and compression: cross-linked, one confirming run
+
+[Batching & Compression](/kafka/en/producers/batching-and-compression/) already measured `linger.ms`/`batch.size`/`compression.type` in depth on this course's own broker (real `kafka-producer-perf-test.sh` numbers: `317,460 records/sec` at one linger/batch setting vs `303,951 records/sec` at another, with full compression-ratio proof via `kafka-dump-log.sh`) — not repeated here. This lesson's own partition-count run above used the **same tool, same broker family, same Mac**, confirming those numbers are not a one-off: `kafka-producer-perf-test.sh` throughput in the low-to-mid hundreds-of-thousands of records/sec range, single broker, local Docker, is this environment's consistent order of magnitude across multiple independent lessons.
+
+## Thread pools: `num.io.threads`, `num.network.threads`, `num.replica.fetchers`, and the real signal to watch
+
+Real defaults, read directly off this lesson's own broker:
+
+```text
+$ kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type brokers --entity-name 1 --all | grep -E "num\.(io|network|replica\.fetchers)"
+num.io.threads=8 sensitive=false synonyms={DEFAULT_CONFIG:num.io.threads=8}
+num.network.threads=3 sensitive=false synonyms={DEFAULT_CONFIG:num.network.threads=3}
+num.replica.fetchers=1 sensitive=false synonyms={DEFAULT_CONFIG:num.replica.fetchers=1}
+```
+
+- **`num.io.threads`** (8) — threads that do the actual disk I/O for produce/fetch requests once the network layer has read them off the wire. Too few and requests queue behind disk operations even with plenty of network capacity.
+- **`num.network.threads`** (3) — threads that read requests off the socket and write responses back; too few and clients see connection-level slowness even when disk I/O is fast.
+- **`num.replica.fetchers`** (1) — threads a **follower** broker uses to fetch from the leader; irrelevant on this course's single-broker setups (RF=1, no followers), but the first knob to raise on a real multi-broker cluster if replication itself is falling behind (visible as `UnderReplicatedPartitions` rising, proven in the [previous lesson](/kafka/en/operations-and-production/monitoring-and-consumer-lag/)).
+
+`RequestHandlerAvgIdlePercent` (introduced in that same lesson) is the real signal for whether `num.io.threads` is sized right — not a guess, a direct measurement. Running this lesson's heaviest producer load (millions of records, `acks=1`, default batching) against this single-threaded `kafka-producer-perf-test.sh` client and sampling mid-run:
+
+```text
+kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent:OneMinuteRate=0.9810855172428229
+```
+
+Still **~98% idle** under this lesson's heaviest sustained load. The honest conclusion is *not* "8 threads is oversized" — it is that **one single-threaded producer process on one Mac cannot generate enough concurrent request volume to meaningfully load 8 I/O threads on a local broker.** Saturating that metric for real needs many concurrent client connections, which is exactly why `RequestHandlerAvgIdlePercent` trending down in *production* (many real clients) is meaningful, while the same metric staying flat in a single-client local benchmark is not evidence either way about the broker's true capacity.
+
+<Callout title="A real result that resists over-interpretation">
+This lesson genuinely tried to saturate the broker's request-handler threads locally and could not, with the tooling available. That is itself the lesson: local single-client benchmarks are good for *relative* comparisons (partition count, batching, compression — all proven above with real deltas) and bad for *absolute* capacity claims (thread-pool sizing under real concurrent load needs real concurrent load, not one client).
+</Callout>
+
+## Page cache, and why Kafka avoids the JVM heap for data
+
+Kafka's own design documentation is explicit about this (quoted from `kafka.apache.org/43/design/design/`): *"rather than maintain as much as possible in-memory and flush it all out to the filesystem in a panic when we run out of space, we invert that"* — Kafka writes through to the filesystem immediately and lets the **OS page cache**, not the JVM heap, hold hot data in memory. Serving a fetch request that is already in page cache uses `sendfile`, and the same docs state directly: *"Using sendfile, this re-copying is avoided by allowing the OS to send the data from pagecache to the network directly"* — the kernel moves bytes from page cache to the network socket without ever copying them into the JVM's user-space heap. The same page also states the durability consequence for consumers that are caught up: *"you will see no read activity on the disks whatsoever as they will be serving data entirely from cache."* [Storage & Segments](/kafka/en/kafka-internals/storage-and-segments/) covers the on-disk segment format this zero-copy path reads directly from — not repeated here.
+
+<Mermaid title="Zero-copy: page cache to network socket, no JVM heap copy" code={zeroCopyFlow} />
+
+export const zeroCopyFlow = `flowchart LR
+  disk["Disk"] -->|"read once"| cache["OS page cache"]
+  cache -->|"sendfile() -- zero-copy"| socket["Network socket"]
+  socket --> consumer["Consumer"]
+  cache -.->|"NOT copied into"| heap["JVM heap (bypassed)"]`;
+
+This is also the practical reason Kafka broker JVM heaps stay deliberately small (a few GB is typical, even on machines with far more RAM) — a large heap steals RAM the page cache would otherwise use for exactly the data Kafka is trying to serve fast, and a large heap means longer GC pauses on the broker's own request-handling path.
+
+## Configs that exist and that you should still leave alone
+
+`socket.send.buffer.bytes` (real default, `102400` — confirmed on this lesson's broker, same command as above) sizes the OS-level TCP send buffer per connection; raising it can help high-latency/high-bandwidth network paths, but on a healthy local network it makes no measurable difference, and setting it too high just reserves memory per connection that a busy broker with many connections will feel.
+
+`log.flush.*` is a different case — not "rarely helpful," but **actively dangerous to touch** on most workloads. This lesson's own broker's real values:
+
+```text
+log.flush.interval.messages=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.interval.messages=9223372036854775807}
+log.flush.scheduler.interval.ms=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.scheduler.interval.ms=9223372036854775807}
+```
+
+`9223372036854775807` is `Long.MAX_VALUE` — Kafka's real default is to **never** force an `fsync` based on message count or a fixed interval. Durability comes from **replication** (multiple brokers holding the data) and **`acks`**/**`min.insync.replicas`**, proven throughout [producers](/kafka/en/producers/acks-and-durability/) and [delivery-and-transactions](/kafka/en/delivery-and-transactions/delivery-guarantees/), not from forcing every write to disk before acking. Setting `log.flush.interval.messages` low adds a real `fsync` on the broker's hot write path for every batch, which measurably lowers throughput and *still* does not substitute for real replication — a single un-replicated broker that fsyncs on every message is still a single point of data loss if that disk dies.
+
+## OS limits that matter at scale — cited, not run
+
+More partitions means more open files and more memory-mapped regions, and two real OS defaults become load-bearing once a broker hosts many of them. From Kafka's own operations documentation (`kafka.apache.org/43/operations/hardware-and-os/`):
+
+> Kafka recommends at least 100,000 allowed file descriptors for the broker processes as a starting point. If a broker hosts many partitions, the broker needs at least `(number_of_partitions) * (partition_size / segment_size)` file descriptors to track all log segments, in addition to the number of connections the broker makes.
+
+> By default, on a number of Linux systems, the value of `vm.max_map_count` is somewhere around 65,535. Each log segment... requires a pair of index/timeindex files, and each of these files consumes 1 map area... Creating 50,000 partitions on a broker will result in allocation of 100,000 map areas and likely cause broker crash with `OutOfMemoryError (Map failed)` on a system with default `vm.max_map_count`.
+
+This course's own Docker containers already run with generous limits — confirmed directly, not from docs:
+
+```text
+$ docker exec broker sh -c 'ulimit -n; cat /proc/sys/vm/max_map_count'
+1048576
+262144
+```
+
+`1,048,576` open files and a `262,144` `vm.max_map_count` — both already well above the bare Linux defaults the docs warn about, which is exactly why this course's own single-broker, low-partition-count lessons never hit either limit. A real production host provisioned with plain OS defaults, running a broker with tens of thousands of partitions, genuinely can hit both — the fix is the `sysctl`/`ulimit` values quoted above, applied **before** the broker is under that load, not after the `OutOfMemoryError` the docs describe.
 
 <Callout title="The one-line takeaway">
-Kafka performance is a **throughput-versus-latency** trade-off you tune deliberately: on the producer use **batching** (`linger.ms`, `batch.size`), **compression**, and the right **`acks`**; size **partitions** to your target throughput and consumer parallelism **without over-partitioning**; and on the broker respect the **page cache**, fast sequential **disk**, and **network** headroom for replication. Tune toward your workload, not toward a mythical fastest setting.
+Every throughput/latency number in this lesson is local-Docker-on-one-Mac, proven above with real `kafka-producer-perf-test.sh`/`kafka-consumer-perf-test.sh` output: 12 partitions genuinely beat 1 partition on the same broker (~60% more throughput, ~66x lower latency, this run), and `RequestHandlerAvgIdlePercent` staying near-`1.0` under this lesson's heaviest single-client load is itself a real, honest result about the limits of local single-client benchmarking, not a claim about the broker's true ceiling. Kafka's own design docs (quoted above) explain why the JVM heap stays small and the OS page cache plus `sendfile` zero-copy does the real work. `log.flush.*` defaults to `Long.MAX_VALUE` (proven above) because durability is replication's job, not `fsync`'s. And `vm.max_map_count`/file descriptor limits (cited above from the real ops docs) are dormant on this course's small setups and genuinely load-bearing on a real cluster with tens of thousands of partitions.
 </Callout>
 
-export const quizPerf = [
+## Reading AI-generated code
+
+<SpotTheBug lang="properties" code={`# section: broker
+# AI comment: "Tune for maximum durability and consistency"
+log.flush.interval.messages=1
+log.flush.interval.ms=1000
+num.io.threads=64
+`}>
+
+This reads like a careful, durability-first tuning pass — flush constantly so nothing sits unflushed for long, and throw more I/O threads at the broker for good measure. The real problem, proven above: Kafka's actual durability mechanism is replication (`acks`, `min.insync.replicas`) — forcing an `fsync` on every single message (`log.flush.interval.messages=1`) adds a real, measurable write-path cost on every batch for a guarantee replication already provides more robustly (surviving a whole broker's disk failing, which a single broker's own `fsync` discipline cannot do at all). `num.io.threads=64` is not "more tuning" either — proven above, this course's own broker could not push its default **8** threads past ~98% idle with a real, heavy single-client load; raising the thread count on a broker that is not I/O-thread-bound spends memory and context-switch overhead on threads that will sit idle, and does nothing for the actual bottleneck (which, on a single disk, is more likely the disk itself, or — proven above — the number of partitions available to parallelize across in the first place).
+
+</SpotTheBug>
+
+## Mental Model
+
+Every Kafka performance number lives on one of three independent axes: **producer-side** (batching, compression, partition count — how fast you can get bytes accepted), **broker-side** (thread pools, page cache, disk — how fast the broker can process and store what it receives), and **consumer-side** (fetch size, parallelism, group rebalance overhead — how fast you can get bytes back out). This lesson proved a real producer-side win (partitions), a real broker-side non-result (thread pools not saturated locally), and a real consumer-side gotcha (rebalance time dominating a short benchmark). Tuning the wrong axis for your actual bottleneck is the single most common mistake — proven directly by this lesson's own `SpotTheBug`, which "tunes" durability and I/O threads while the real durability mechanism (replication) and the real throughput lever this lesson measured (partition count) go untouched.
+
+## Trade-offs
+
+- **More partitions for producer/consumer parallelism** — proven above, real throughput and latency wins on the same broker — versus the real cost proven in [Brokers, Topics & Partitions](/kafka/en/foundations/brokers-topics-partitions/): more open files, more controller metadata, longer rebalances. There is a real ceiling; this lesson does not locate it, only proves the direction below it.
+- **Raising thread-pool sizes** — free to configure, but proven above to be meaningless when the workload never approaches saturating the defaults; real cost is memory and context-switching overhead paid regardless of whether the threads ever do useful work.
+- **Touching `log.flush.*` for "extra safety"** — feels conservative, is provably (via the real defaults above) not how Kafka's own durability model works, and has a real, direct throughput cost with no corresponding durability benefit once replication is configured correctly.
+- **Local single-broker Docker benchmarks** — cheap, repeatable, genuinely useful for *relative* comparisons (this lesson's partition-count and batching cross-link results) — and not a substitute for load-testing your real cluster under real concurrent client load before trusting any absolute number.
+
+## Common Misconceptions
+
+- **"More `num.io.threads` always means better throughput."** No — proven above: this course's broker sat at ~98% idle on `RequestHandlerAvgIdlePercent` under its heaviest local test; more threads help only when the current pool is actually the bottleneck, which this lesson could not even produce locally with a single client.
+- **"Frequent `log.flush.interval.messages` makes Kafka more durable."** No — proven above: the real default is `Long.MAX_VALUE` (effectively never), because durability comes from replication and `acks`, not per-message `fsync`; forcing frequent flushes adds real cost for a guarantee it does not actually strengthen.
+- **"`kafka-consumer-perf-test.sh`'s headline `nMsg.sec` number is the tool's real fetch throughput."** No — proven above: that number blends one-time `rebalance.time.ms` into the average; the real fetch-only throughput (`fetch.nMsg.sec`) was over 20x higher in the same run.
+- **"Kafka is fast despite writing every message to disk."** Backwards — proven above with Kafka's own design docs quoted directly: Kafka is fast *because* it writes to disk immediately and lets the OS page cache plus `sendfile` zero-copy do the serving, deliberately avoiding a competing in-process JVM cache rather than working around disk writes.
+
+export const quizPerformance = [
   {
-    q: 'What do larger producer batches (via linger.ms and batch.size) mainly trade?',
+    q: 'Proven above with two topics on the same broker, what real difference did partition count (1 vs 12) make to producer-perf-test throughput and latency?',
     options: [
-      'Durability for security',
-      'A little per-record latency for much higher throughput',
-      'Disk space for CPU only',
-      'Nothing — they have no effect',
+      'No measurable difference either way',
+      '12 partitions measured roughly 60% higher throughput and roughly 66x lower average latency than 1 partition, same broker, same producer settings',
+      '1 partition was faster because there is less coordination overhead',
+      'Partition count only affects consumers, never producers',
     ],
     answer: 1,
+    explain: 'Real output: 1 partition = 204,708 records/sec at 91.32ms avg latency; 12 partitions = 328,407 records/sec at 1.37ms avg latency -- explained by 12 independent log-append paths instead of one serialized path.',
   },
   {
-    q: 'Why does partition count cap consumer parallelism?',
+    q: "Proven above in a real kafka-consumer-perf-test.sh run, why was the headline nMsg.sec column (55,142/sec) so much lower than fetch.nMsg.sec (1,190,476/sec) in the exact same run?",
     options: [
-      'Because each partition is consumed by at most one consumer within a group',
-      'Because partitions limit the number of producers',
-      'Because each partition needs its own broker',
-      'It does not — parallelism is unlimited',
-    ],
-    answer: 0,
-  },
-  {
-    q: 'What is the risk of creating far more partitions than you need?',
-    options: [
-      'Nothing; more partitions always means more speed',
-      'More open files, replication traffic, memory, and longer rebalance and failover times',
-      'Topics become read-only',
-      'Consumers can no longer commit offsets',
+      'The consumer crashed partway through',
+      'nMsg.sec blends the one-time rebalance.time.ms (3,459ms) into the average, while fetch.nMsg.sec measures only fetch.time.ms (168ms) -- a ~21x difference from rebalance overhead dominating a short test, not from slow fetching',
+      'fetch.nMsg.sec is a typo in the tool and should be ignored',
+      'The topic had a replication factor mismatch',
     ],
     answer: 1,
+    explain: 'Real CSV output showed rebalance.time.ms=3459 vs fetch.time.ms=168 in the identical run -- the group-join handshake, not data transfer, dominated the blended throughput number.',
   },
   {
-    q: 'How does Kafka rely on the operating system for read speed?',
+    q: 'Proven above, what happened to RequestHandlerAvgIdlePercent when this lesson ran its heaviest single-client producer load against the broker\'s default 8 num.io.threads?',
     options: [
-      'It keeps a large in-process cache and ignores the OS',
-      'It uses the OS page cache, so free RAM lets the kernel serve recent reads from memory',
-      'It reads directly from ZooKeeper',
-      'It caches everything in the JVM heap',
+      'It dropped close to 0, proving the broker was saturated',
+      'It stayed around 98% idle -- proven not because 8 threads is oversized, but because one single-threaded local producer client could not generate enough concurrent request volume to load them',
+      'The broker crashed under the load',
+      'The metric is unavailable without a multi-broker cluster',
     ],
     answer: 1,
+    explain: 'Real JMX read: RequestHandlerAvgIdlePercent OneMinuteRate=0.981 during the heaviest sustained load this lesson could generate locally -- an honest result about single-client benchmark limits, not broker capacity.',
+  },
+  {
+    q: "Quoted above from Kafka's own design docs (kafka.apache.org/43/design/design/), why does Kafka rely on the OS page cache and sendfile instead of a large JVM heap cache?",
+    options: [
+      'The JVM cannot allocate enough memory for a cache',
+      '"Using sendfile, this re-copying is avoided by allowing the OS to send the data from pagecache to the network directly" -- zero-copy avoids ever moving bytes into JVM heap, and a large heap would steal RAM the page cache needs plus add GC pauses on the request path',
+      'Page cache is only used for compressed messages',
+      'JVM heap caching was deprecated in Kafka 4.x',
+    ],
+    answer: 1,
+    explain: 'Directly quoted from the real design docs; the same page also states that with caught-up consumers "you will see no read activity on the disks whatsoever as they will be serving data entirely from cache."',
+  },
+  {
+    q: "Proven above with this lesson's own broker's real config values, what does log.flush.interval.messages default to, and why does that matter?",
+    options: [
+      '1 -- Kafka fsyncs every single message by default for safety',
+      "Long.MAX_VALUE (9223372036854775807) -- Kafka effectively never force-flushes on message count by default, because durability comes from replication and acks/min.insync.replicas, not from fsync discipline",
+      '100 -- a balanced default between safety and speed',
+      'It has no default and must always be set explicitly',
+    ],
+    answer: 1,
+    explain: 'Real kafka-configs.sh --describe output showed log.flush.interval.messages=9223372036854775807 and log.flush.scheduler.interval.ms=9223372036854775807, both Long.MAX_VALUE, confirmed DEFAULT_CONFIG.',
+  },
+  {
+    q: 'Cited above from the real Kafka operations docs, what happens if a broker hosts 50,000 partitions on a Linux system left at its default vm.max_map_count (~65,535)?',
+    options: [
+      'Nothing -- vm.max_map_count only affects networking',
+      'It will likely crash with OutOfMemoryError (Map failed), because each log segment\'s index/timeindex file pair consumes 2 map areas, and 50,000 partitions allocate roughly 100,000 map areas against a ~65,535 default limit',
+      'Kafka automatically raises the OS limit at startup',
+      'The broker silently drops partitions above the limit',
+    ],
+    answer: 1,
+    explain: "Directly cited from kafka.apache.org/43/operations/hardware-and-os/; this course's own containers were confirmed to already run well above that default (vm.max_map_count=262144, ulimit -n=1048576), which is exactly why none of this course's low-partition-count lessons ever hit it.",
   },
 ];
 
-<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerf} />
+<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerformance} />
 
 <ProgressTracker client:visible id="operations-and-production/performance-and-tuning" />

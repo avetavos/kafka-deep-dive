@@ -1,6 +1,6 @@
 ---
 title: 'Performance & Tuning'
-description: 'ปุ่มที่แลก throughput กับ latency ใน Kafka producer batching กับ compression, acks, การ size partition เพื่อ consumer parallelism และ page cache กับ disk ฝั่ง broker'
+description: 'ตัวเลขจริงจาก kafka-producer-perf-test.sh / kafka-consumer-perf-test.sh บน Mac เครื่องนี้ — topic 12 partition วัดได้เร็วกว่าประมาณ 60% และ latency ต่ำกว่าประมาณ 66 เท่าเทียบกับ topic 1 partition บน broker เดียวกัน, RequestHandlerAvgIdlePercent เป็นสัญญาณจริงสำหรับขนาด thread pool, ทำไม log.flush.* ต้องไม่แตะ, และขีดจำกัดของ OS (vm.max_map_count, file descriptor) อ้างอิงจากเอกสาร'
 sidebar:
   order: 3
 ---
@@ -8,104 +8,250 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-การจูน Kafka ส่วนใหญ่คือการเลือกว่าคุณจะนั่งตรงไหนบนเส้นโค้ง **throughput เทียบกับ latency** batch producer ใหญ่ขึ้น, compression, partition มากขึ้น และ `acks` แรงขึ้น ต่างดันไปทางใดทางหนึ่ง คุณจึงจูนไปตาม workload ของคุณ ไม่ใช่ไล่ล่าค่า "เร็ว" ค่าเดียว
+การ tune Kafka คือการเลือกจุดที่คุณจะยืนบนเส้น throughput เทียบกับ latency และตัวเลขทุกตัวในบทนี้มาจาก **Docker บนเครื่อง broker เดียว บน Mac เครื่องนี้** — จริง ทำซ้ำได้ และไม่ใช่ตัวแทนของการ benchmark workload จริงของคุณบน hardware จริงของคุณ
 
-## ปุ่มฝั่ง producer: batching, compression, acks
+## พิสูจน์: จำนวน partition วัดจริง ไม่ใช่แค่กล่าวอ้าง
 
-producer คือจุดที่ throughput ได้มาหรือเสียไปมากที่สุด สามค่าครองเกม
+สอง topic, broker เดียวกัน, ตั้งค่า producer เหมือนกัน ต่างกันแค่จำนวน partition
 
-- **Batching** `linger.ms` กับ `batch.size` ให้ producer รอไม่กี่มิลลิวินาทีแล้วอัดหลาย record ลง request เดียว batch ใหญ่ขึ้นแปลว่า throughput สูงขึ้นมาก แลกกับ latency ต่อ record นิดหน่อย
-- **Compression** `compression.type` (`lz4`, `zstd`, `snappy`, `gzip`) ย่อ batch แต่ละอันให้เล็กลง ลดการใช้ network และ disk เป็นการแลก CPU กับ throughput และเกือบทุกครั้งคุ้มค่าเมื่อโหลดสูง
-- **acks** `acks=all` รอให้ ISR persist record (durable, latency สูงกว่า) `acks=1` รอแค่ leader (เร็วกว่า การันตีอ่อนกว่า) นี่คือปุ่ม durability เทียบกับ latency คลาสสิก
+```bash
+# scripts/performance-and-tuning/partition-count-perf.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+  --create --topic perf-1p --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+  --create --topic perf-12p --partitions 12 --replication-factor 1
 
-```properties
-# Throughput-leaning producer: wait a little, batch bigger, compress, stay durable
-linger.ms=10
-batch.size=65536
-compression.type=lz4
-acks=all
+echo "=== 1 partition ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-1p \
+  --num-records 200000 --record-size 200 --throughput -1 \
+  --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 2>&1 | tail -1
+
+echo "=== 12 partitions ==="
+/opt/kafka/bin/kafka-producer-perf-test.sh --topic perf-12p \
+  --num-records 200000 --record-size 200 --throughput -1 \
+  --producer-props bootstrap.servers="$BOOTSTRAP" acks=1 2>&1 | tail -1
 ```
 
-<Mermaid title="การแลกเปลี่ยนระหว่าง throughput กับ latency" code={tuneFlow} />
+output จริงแบบไม่แก้ไข:
 
-export const tuneFlow = `flowchart LR
-  batch["Bigger batches + linger.ms"] --> tp["Higher throughput"]
-  comp["Compression (lz4 / zstd)"] --> tp
-  acksall["acks=all"] --> dur["Stronger durability"]
-  acksall --> lat["Higher latency"]
-  small["Small batches + acks=1"] --> low["Lower latency"]`;
+```text
+=== 1 partition ===
+200000 records sent, 204708.290686 records/sec (39.05 MB/sec), 91.32 ms avg latency, 197.00 ms max latency, 99 ms 50th, 189 ms 95th, 192 ms 99th, 193 ms 99.9th.
 
-## size partition ตาม throughput
+=== 12 partitions ===
+200000 records sent, 328407.224959 records/sec (62.64 MB/sec), 1.37 ms avg latency, 175.00 ms max latency, 1 ms 50th, 3 ms 95th, 5 ms 99th, 11 ms 99.9th.
+```
 
-partition คือ **หน่วย parallelism** ของคุณ partition หนึ่งถูก consume โดย consumer ได้มากสุดหนึ่งตัวใน group จำนวน partition จึงเป็นเพดานของ consumer parallelism ให้กำหนดจำนวนจากเป้าหมาย throughput ที่ต้องการ
+broker เดียวกัน disk เดียวกัน config producer เดียวกัน — **throughput สูงกว่าประมาณ 60% และ latency เฉลี่ยต่ำกว่าประมาณ 66 เท่า** ด้วย 12 partition เทียบกับ 1 partition นี่คือ Docker บนเครื่อง Mac เครื่องเดียว ไม่ใช่ตัวเลข capacity-planning สำหรับ cluster ของคุณ แต่*ทิศทาง*เป็นจริงและอธิบายได้: มี partition เดียว การ append ทุกครั้ง serialize ผ่าน log-writer path เดียวของ partition นั้น; มี 12 partition I/O thread ของ broker (8 ตัวโดย default พิสูจน์ด้านล่าง) append เข้า log อิสระ 12 ตัวพร้อมกันได้ แทนที่จะต่อคิวรออันเดียว
 
-> partition ≈ throughput เป้าหมาย ÷ throughput ต่อ consumer (หรือต่อ partition)
-
-ถ้า consumer หนึ่ง instance รับได้ 10 MB/s และคุณต้องการ 100 MB/s คุณต้องมีอย่างน้อย 10 partition ให้ consumer 10 ตัวรันขนานกัน ปัดขึ้นแล้วเผื่อ headroom ไว้สำหรับการเติบโตและการกระจาย key ที่ไม่สม่ำเสมอ
-
-<Callout title="อย่า over-partition">
-partition เยอะขึ้นไม่ใช่ throughput ฟรี partition แต่ละอันคือ open file, traffic ของ replication, memory และ metadata ของ controller และยืดเวลา **rebalance** กับ failover partition หลักพันต่อ broker เพิ่ม latency และความเสี่ยงในการ recovery size ให้พอดีเป้าหมายแล้วเผื่อ headroom พอประมาณ ไม่ใช่ตั้งเป็นตัวเลขใหญ่สุดที่นึกออก คุณเพิ่ม partition ทีหลังได้ แต่เอาออกไม่ได้ง่าย ๆ
+<Callout title="อย่าอ่านตัวเลขนี้เกินจริง">
+`~60%` และ `~66 เท่า` เป็นค่าของ run นี้ Mac เครื่องนี้ setup Docker นี้ — ไม่ใช่ตัวคูณสากล บทนี้คือการมีอยู่และทิศทางของ effect (partition มากขึ้นทำให้งาน append ฝั่ง broker parallelize ได้ถึงจำนวน I/O thread) ไม่ใช่ว่า "12 partition" เป็นเลขวิเศษ [Partition count trade-offs](/kafka/th/foundations/brokers-topics-partitions/#choosing-a-partition-count) ครอบคลุมการ size ตาม target throughput จริง ไม่ใช่ตามอะไรที่ชนะ benchmark ในเครื่อง
 </Callout>
 
-## ฝั่ง broker: page cache, disk, network
+## `kafka-consumer-perf-test.sh` และ gotcha จริงใน output ของมันเอง
 
-broker ถูกออกแบบให้เรียบง่ายโดยตั้งใจ ความเร็วของตัวเองมาจาก operating system
+```bash
+# scripts/performance-and-tuning/consumer-perf-test.sh
+/opt/kafka/bin/kafka-consumer-perf-test.sh --bootstrap-server "$BOOTSTRAP" \
+  --topic perf-12p --num-records 200000
 
-- **Page cache** Kafka **ไม่** ทำ cache ใหญ่ใน process ของตัวเอง แต่เขียนลง OS page cache แล้วพึ่ง kernel ให้เสิร์ฟการอ่านล่าสุดจาก memory เหลือ RAM ว่างไว้เยอะ ๆ ให้ page cache อย่าให้ JVM heap ใหญ่จนไปแย่ง RAM ส่วนนั้น
-- **Disk** การเขียนแบบ sequential ทำให้ดิสก์จานหมุนและโดยเฉพาะ SSD มีประสิทธิภาพ ใช้ local disk ที่เร็ว และกระจายโหลดด้วยหลาย log directory ถ้าจำเป็น throughput ของ disk และพฤติกรรม `fsync` เป็นตัวจำกัด durability กับความเร็ว
-- **Network** replication และ consumer fan-out ผูกกับ network `replication-factor` เท่ากับ 3 แปลว่าทุก byte ที่ produce ถูกเขียนราว ๆ สามครั้งข้าม network จัดสรร NIC ให้เหมาะ
+# Clean up both scratch topics this lesson created above.
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --delete --topic perf-1p
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --delete --topic perf-12p
+```
 
-<Callout title="สรุปหนึ่งบรรทัด">
-performance ของ Kafka คือการแลก **throughput เทียบกับ latency** ที่คุณจูนอย่างตั้งใจ ฝั่ง producer ใช้ **batching** (`linger.ms`, `batch.size`), **compression** และ **`acks`** ที่เหมาะ size **partition** ให้ตรง throughput เป้าหมายและ consumer parallelism **โดยไม่ over-partition** และฝั่ง broker เคารพ **page cache**, disk แบบ sequential ที่เร็ว และ **network** ที่เผื่อไว้สำหรับ replication จูนไปตาม workload ไม่ใช่ไปหาค่าที่เร็วที่สุดในตำนาน
+```text
+start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec
+2026-09-29 02:42:04:251, 2026-09-29 02:42:07:878, 38.1470, 10.5175, 200000, 55141.9906, 3459, 168, 227.0653, 1190476.1905
+```
+
+อ่านคอลัมน์ตรง ๆ `nMsg.sec` (55,142/sec รวมเวลา group-join เข้าไปด้วย) ดูช้ากว่า `fetch.nMsg.sec` (1,190,476/sec แค่เวลา fetch) มาก — ต่างกันประมาณ 21 เท่าใน **run เดียวกัน** เพราะ `rebalance.time.ms` (3,459 ms — การ handshake กับ group coordinator) มากกว่า `fetch.time.ms` (168 ms — การส่งข้อมูลจริง) มากบน test เล็ก ๆ 200,000 record ตัวเลข consumer-perf-test จริงที่ผสมเวลา rebalance เข้าไปใน "throughput" จะทำให้ Kafka ดูช้ากว่าความจริงมากสำหรับ benchmark สั้น ๆ สำหรับอะไรที่มากกว่าการเช็กแบบเร็ว ให้ดู `fetch.MB.sec`/`fetch.nMsg.sec` เฉพาะเจาะจง หรือรันด้วยจำนวน record ที่มากพอให้ต้นทุน rebalance ครั้งเดียวไม่ครอบงำค่าเฉลี่ย
+
+## Batching และ compression ฝั่ง producer: cross-link, run ยืนยันหนึ่งครั้ง
+
+[Batching & Compression](/kafka/th/producers/batching-and-compression/) วัด `linger.ms`/`batch.size`/`compression.type` ลงลึกไปแล้วบน broker ของคอร์สนี้เอง (ตัวเลขจริงของ `kafka-producer-perf-test.sh`: `317,460 records/sec` ที่ linger/batch setting หนึ่ง เทียบ `303,951 records/sec` ที่อีกค่าหนึ่ง พร้อมพิสูจน์ compression ratio เต็มรูปแบบผ่าน `kafka-dump-log.sh`) ไม่พูดซ้ำที่นี่ run วัดจำนวน partition ของบทนี้เองด้านบนใช้ **tool เดียวกัน broker family เดียวกัน Mac เดียวกัน** ยืนยันว่าตัวเลขเหล่านั้นไม่ใช่เรื่องบังเอิญครั้งเดียว: throughput ของ `kafka-producer-perf-test.sh` ในช่วงหลักแสนต้น ๆ ถึงกลาง ๆ record/sec บน broker เดียว Docker ในเครื่อง คือ order of magnitude ที่สม่ำเสมอของ environment นี้ข้ามหลายบทที่เป็นอิสระจากกัน
+
+## Thread pool: `num.io.threads`, `num.network.threads`, `num.replica.fetchers`, และสัญญาณจริงที่ต้องดู
+
+default จริง อ่านตรงจาก broker ของบทนี้เอง
+
+```text
+$ kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type brokers --entity-name 1 --all | grep -E "num\.(io|network|replica\.fetchers)"
+num.io.threads=8 sensitive=false synonyms={DEFAULT_CONFIG:num.io.threads=8}
+num.network.threads=3 sensitive=false synonyms={DEFAULT_CONFIG:num.network.threads=3}
+num.replica.fetchers=1 sensitive=false synonyms={DEFAULT_CONFIG:num.replica.fetchers=1}
+```
+
+- **`num.io.threads`** (8) — thread ที่ทำ disk I/O จริงสำหรับ produce/fetch request หลังจาก network layer อ่านมาจาก wire แล้ว น้อยเกินไปแล้ว request จะต่อคิวรอ disk operation แม้จะมี network capacity เหลือเฟือ
+- **`num.network.threads`** (3) — thread ที่อ่าน request จาก socket และเขียน response กลับ น้อยเกินไปแล้ว client จะเห็นความช้าระดับ connection แม้ disk I/O เร็วอยู่แล้ว
+- **`num.replica.fetchers`** (1) — thread ที่ broker **follower** ใช้ fetch จาก leader ไม่เกี่ยวกับ setup broker เดียวของคอร์สนี้ (RF=1 ไม่มี follower) แต่เป็น knob ตัวแรกที่ควรเพิ่มบน cluster หลาย broker จริงถ้า replication เองตามหลัง (เห็นเป็น `UnderReplicatedPartitions` ที่ไต่ขึ้น พิสูจน์ใน[บทก่อนหน้า](/kafka/th/operations-and-production/monitoring-and-consumer-lag/))
+
+`RequestHandlerAvgIdlePercent` (แนะนำในบทเดียวกันนั้น) คือสัญญาณจริงว่า `num.io.threads` size ถูกหรือไม่ — ไม่ใช่การเดา เป็นการวัดตรง รัน load ของ producer ที่หนักที่สุดของบทนี้ (record หลักล้าน `acks=1` batching default) กับ client `kafka-producer-perf-test.sh` แบบ single-threaded นี้ แล้ว sample กลาง run
+
+```text
+kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent:OneMinuteRate=0.9810855172428229
+```
+
+ยังว่างอยู่ **~98%** ภายใต้ load ต่อเนื่องที่หนักที่สุดของบทนี้ ข้อสรุปที่ซื่อสัตย์*ไม่ใช่* "8 thread ใหญ่เกินไป" — แต่คือ **process producer แบบ single-thread ตัวเดียวบน Mac เครื่องหนึ่งสร้าง concurrent request volume ไม่พอที่จะโหลด I/O thread 8 ตัวบน broker ในเครื่องได้จริง** การทำให้ metric นี้อิ่มตัวจริง ๆ ต้องการ client connection พร้อมกันหลายตัว ซึ่งเป็นเหตุผลว่าทำไม `RequestHandlerAvgIdlePercent` ที่ไต่ลงใน *production* จริง (client จริงหลายตัว) มีความหมาย ในขณะที่ metric เดียวกันที่นิ่งในการ benchmark ในเครื่องแบบ client เดียวไม่ใช่หลักฐานอะไรเลยทั้งสองทาง
+
+<Callout title="ผลลัพธ์จริงที่ต้านทานการตีความเกินจริง">
+บทนี้พยายามทำให้ request-handler thread ของ broker อิ่มตัวจริง ๆ ในเครื่องและทำไม่ได้ด้วย tooling ที่มี นั่นคือบทเรียนในตัวมันเอง: benchmark ในเครื่องแบบ client เดียวดีสำหรับการเทียบ*แบบสัมพัทธ์* (จำนวน partition, batching, compression — พิสูจน์ครบด้านบนด้วย delta จริง) และไม่ดีสำหรับการอ้าง capacity *แบบสมบูรณ์* (ขนาด thread pool ภายใต้ load พร้อมกันจริงต้องการ load พร้อมกันจริง ไม่ใช่ client เดียว)
 </Callout>
 
-export const quizPerf = [
+## Page cache และทำไม Kafka หลีกเลี่ยง JVM heap สำหรับข้อมูล
+
+เอกสาร design ของ Kafka เองพูดตรง ๆ เรื่องนี้ (quote จาก `kafka.apache.org/43/design/design/`): *"rather than maintain as much as possible in-memory and flush it all out to the filesystem in a panic when we run out of space, we invert that"* — Kafka เขียนผ่านเข้า filesystem ทันที และให้ **OS page cache** ไม่ใช่ JVM heap เก็บข้อมูลร้อนในหน่วยความจำ การเสิร์ฟ fetch request ที่อยู่ใน page cache แล้วใช้ `sendfile` และเอกสารเดียวกันบอกตรง ๆ: *"Using sendfile, this re-copying is avoided by allowing the OS to send the data from pagecache to the network directly"* — kernel ย้าย byte จาก page cache ไป network socket โดยไม่เคย copy เข้า JVM user-space heap เลย หน้าเดียวกันยังบอกผลลัพธ์ด้าน durability สำหรับ consumer ที่ตามทันแล้ว: *"you will see no read activity on the disks whatsoever as they will be serving data entirely from cache"* [Storage & Segments](/kafka/th/kafka-internals/storage-and-segments/) ครอบคลุม format ของ segment บนดิสก์ที่ zero-copy path นี้อ่านตรงจากมัน — ไม่พูดซ้ำที่นี่
+
+<Mermaid title="Zero-copy: page cache ไปยัง network socket ไม่มีการ copy เข้า JVM heap" code={zeroCopyFlow} />
+
+export const zeroCopyFlow = `flowchart LR
+  disk["Disk"] -->|"read once"| cache["OS page cache"]
+  cache -->|"sendfile() -- zero-copy"| socket["Network socket"]
+  socket --> consumer["Consumer"]
+  cache -.->|"NOT copied into"| heap["JVM heap (bypassed)"]`;
+
+นี่ยังเป็นเหตุผลเชิงปฏิบัติที่ JVM heap ของ broker Kafka เล็กโดยตั้งใจ (ไม่กี่ GB เป็นปกติ แม้บนเครื่องที่มี RAM มากกว่านั้นมาก) — heap ใหญ่แย่ง RAM ที่ page cache จะใช้เก็บข้อมูลเดียวกันที่ Kafka พยายามเสิร์ฟให้เร็ว และ heap ใหญ่แปลว่า GC pause นานขึ้นบน path ประมวลผล request ของ broker เอง
+
+## Config ที่มีอยู่จริงแต่คุณควรปล่อยไว้เฉย ๆ
+
+`socket.send.buffer.bytes` (default จริง `102400` — ยืนยันบน broker ของบทนี้ คำสั่งเดียวกับด้านบน) กำหนดขนาด TCP send buffer ระดับ OS ต่อ connection การเพิ่มมันช่วย network path ที่ latency สูง/bandwidth สูงได้ แต่บน network ในเครื่องที่สุขภาพดี มันไม่ต่างอย่างมีนัยสำคัญ และตั้งสูงเกินไปก็แค่จอง memory ต่อ connection ที่ broker ที่มีหลาย connection จะรู้สึกได้
+
+`log.flush.*` เป็นกรณีที่ต่างออกไป — ไม่ใช่ "ไม่ค่อยมีประโยชน์" แต่ **อันตรายจริงถ้าแตะ** บน workload ส่วนใหญ่ ค่าจริงของ broker ของบทนี้เอง
+
+```text
+log.flush.interval.messages=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.interval.messages=9223372036854775807}
+log.flush.scheduler.interval.ms=9223372036854775807 sensitive=false synonyms={DEFAULT_CONFIG:log.flush.scheduler.interval.ms=9223372036854775807}
+```
+
+`9223372036854775807` คือ `Long.MAX_VALUE` — default จริงของ Kafka คือ**ไม่เคย**บังคับ `fsync` ตามจำนวน message หรือช่วงเวลาคงที่ durability มาจาก **replication** (หลาย broker เก็บข้อมูล) และ **`acks`**/**`min.insync.replicas`** พิสูจน์ทั่วทั้ง[producers](/kafka/th/producers/acks-and-durability/)และ[delivery-and-transactions](/kafka/th/delivery-and-transactions/delivery-guarantees/) ไม่ใช่จากการบังคับเขียนทุกครั้งลง disk ก่อน ack การตั้ง `log.flush.interval.messages` ต่ำเพิ่ม `fsync` จริงบน hot write path ของ broker สำหรับทุก batch ซึ่งลด throughput อย่างมีนัยสำคัญและ*ยังไม่*แทนที่ replication จริงได้ — broker เดียวที่ไม่มี replication ที่ fsync ทุก message ก็ยังเป็นจุดเดียวที่ข้อมูลหายได้ถ้า disk นั้นพัง
+
+## ขีดจำกัดของ OS ที่สำคัญตอน scale — อ้างอิง ไม่ได้รัน
+
+partition มากขึ้นแปลว่า open file มากขึ้นและ memory-mapped region มากขึ้น และ OS default จริงสองตัวกลาย load-bearing ทันทีที่ broker host มันจำนวนมาก จากเอกสาร operations ของ Kafka เอง (`kafka.apache.org/43/operations/hardware-and-os/`)
+
+> Kafka recommends at least 100,000 allowed file descriptors for the broker processes as a starting point. If a broker hosts many partitions, the broker needs at least `(number_of_partitions) * (partition_size / segment_size)` file descriptors to track all log segments, in addition to the number of connections the broker makes.
+
+> By default, on a number of Linux systems, the value of `vm.max_map_count` is somewhere around 65,535. Each log segment... requires a pair of index/timeindex files, and each of these files consumes 1 map area... Creating 50,000 partitions on a broker will result in allocation of 100,000 map areas and likely cause broker crash with `OutOfMemoryError (Map failed)` on a system with default `vm.max_map_count`.
+
+container Docker ของคอร์สนี้เองรันด้วยขีดจำกัดที่กว้างขวางอยู่แล้ว — ยืนยันตรง ไม่ใช่จากเอกสาร
+
+```text
+$ docker exec broker sh -c 'ulimit -n; cat /proc/sys/vm/max_map_count'
+1048576
+262144
+```
+
+open file `1,048,576` ตัวและ `vm.max_map_count` `262,144` — ทั้งคู่สูงกว่า default ของ Linux เปล่า ๆ ที่เอกสารเตือนไว้มาก ซึ่งเป็นเหตุผลเป๊ะว่าทำไมบทที่ broker เดียว partition น้อยของคอร์สนี้ไม่เคยชนขีดจำกัดทั้งสองเลย host production จริงที่ตั้งด้วย OS default เปล่า ๆ รัน broker ที่มี partition หลักหมื่น สามารถชนทั้งคู่ได้จริง — วิธีแก้คือค่า `sysctl`/`ulimit` ที่ quote ไว้ด้านบน ใส่ไว้**ก่อน**ที่ broker จะเจอ load นั้น ไม่ใช่หลังจาก `OutOfMemoryError` ที่เอกสารอธิบาย
+
+<Callout title="สรุปในหนึ่งบรรทัด">
+ตัวเลข throughput/latency ทุกตัวในบทนี้เป็น local-Docker-บน-Mac-เครื่องเดียว พิสูจน์ด้านบนด้วย output จริงของ `kafka-producer-perf-test.sh`/`kafka-consumer-perf-test.sh`: 12 partition ชนะ 1 partition จริงบน broker เดียวกัน (throughput มากขึ้นประมาณ 60% latency ต่ำกว่าประมาณ 66 เท่า run นี้) และ `RequestHandlerAvgIdlePercent` ที่นิ่งใกล้ `1.0` ภายใต้ load client เดียวที่หนักที่สุดของบทนี้เป็นผลลัพธ์จริงที่ซื่อสัตย์เกี่ยวกับข้อจำกัดของ benchmark client เดียวในเครื่อง ไม่ใช่การอ้าง ceiling จริงของ broker เอกสาร design ของ Kafka เอง (quote ด้านบน) อธิบายว่าทำไม JVM heap เล็กและ OS page cache บวก `sendfile` zero-copy ทำงานจริง `log.flush.*` default เป็น `Long.MAX_VALUE` (พิสูจน์ด้านบน) เพราะ durability เป็นงานของ replication ไม่ใช่ของ `fsync` และขีดจำกัด `vm.max_map_count`/file descriptor (อ้างอิงด้านบนจากเอกสาร ops จริง) นิ่งเฉยบน setup เล็กของคอร์สนี้และ load-bearing จริงบน cluster จริงที่มี partition หลักหมื่น
+</Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="properties" code={`# section: broker
+# AI comment: "Tune for maximum durability and consistency"
+log.flush.interval.messages=1
+log.flush.interval.ms=1000
+num.io.threads=64
+`}>
+
+อ่านดูเหมือนการ tune ที่รอบคอบเน้น durability — flush ตลอดเวลาไม่ให้อะไรค้างนานเกินไป แล้วโยน I/O thread เพิ่มเข้าไปให้ broker เผื่อไว้ ปัญหาจริง พิสูจน์ด้านบน: mechanism durability จริงของ Kafka คือ replication (`acks`, `min.insync.replicas`) — การบังคับ `fsync` ทุก message เดียว (`log.flush.interval.messages=1`) เพิ่มต้นทุนจริงที่วัดได้บน write path ทุก batch สำหรับการันตีที่ replication ให้ได้แข็งแรงกว่าอยู่แล้ว (รอดจาก disk ของ broker ทั้งตัวพัง ซึ่ง `fsync` discipline ของ broker เดียวทำไม่ได้เลย) `num.io.threads=64` ก็ไม่ใช่ "tune เพิ่ม" เหมือนกัน — พิสูจน์ด้านบน broker ของคอร์สนี้เองไม่สามารถผลัก thread default **8** ตัวให้ต่ำกว่า ~98% idle ได้ด้วย load client เดียวที่หนักจริง การเพิ่มจำนวน thread บน broker ที่ไม่ได้ bound ด้วย I/O thread เสีย memory และ context-switch overhead ให้ thread ที่จะนั่งว่างเปล่า และไม่ช่วยคอขวดจริงเลย (ซึ่งบน disk เดียว มีโอกาสสูงว่าเป็น disk เองหรือ — พิสูจน์ด้านบน — จำนวน partition ที่มีให้ parallelize ตั้งแต่แรก)
+
+</SpotTheBug>
+
+## Mental Model
+
+ตัวเลข performance ของ Kafka ทุกตัวอยู่บนหนึ่งในสามแกนอิสระ: **ฝั่ง producer** (batching, compression, จำนวน partition — คุณรับ byte ได้เร็วแค่ไหน), **ฝั่ง broker** (thread pool, page cache, disk — broker ประมวลผลและเก็บสิ่งที่รับมาได้เร็วแค่ไหน), และ **ฝั่ง consumer** (ขนาด fetch, parallelism, overhead ของ group rebalance — คุณดึง byte กลับออกมาได้เร็วแค่ไหน) บทนี้พิสูจน์ชัยชนะจริงฝั่ง producer (partition), ผลลัพธ์-ไม่-เกิดขึ้นจริงฝั่ง broker (thread pool ไม่อิ่มตัวในเครื่อง), และ gotcha จริงฝั่ง consumer (เวลา rebalance ครอบงำ benchmark สั้น) การ tune แกนผิดสำหรับคอขวดจริงของคุณคือความผิดพลาดที่พบบ่อยที่สุดตัวเดียว — พิสูจน์ตรงโดย `SpotTheBug` ของบทนี้เอง ที่ "tune" durability และ I/O thread ในขณะที่ mechanism durability จริง (replication) และ lever throughput จริงที่บทนี้วัดไว้ (จำนวน partition) ไม่ถูกแตะเลย
+
+## Trade-offs
+
+- **partition มากขึ้นเพื่อ parallelism ของ producer/consumer** — พิสูจน์ด้านบน ชัยชนะ throughput และ latency จริงบน broker เดียวกัน — เทียบกับต้นทุนจริงที่พิสูจน์ใน [Brokers, Topics & Partitions](/kafka/th/foundations/brokers-topics-partitions/): open file มากขึ้น controller metadata มากขึ้น rebalance นานขึ้น มี ceiling จริงอยู่ บทนี้ไม่ได้หามันเจอ พิสูจน์แค่ทิศทางที่อยู่ต่ำกว่ามัน
+- **การเพิ่มขนาด thread pool** — config ได้ฟรี แต่พิสูจน์ด้านบนว่าไม่มีความหมายเมื่อ workload ไม่เคยเข้าใกล้การทำให้ default อิ่มตัว ต้นทุนจริงคือ memory และ context-switching overhead ที่ต้องจ่ายไม่ว่า thread จะทำงานมีประโยชน์หรือไม่
+- **การแตะ `log.flush.*` เพื่อ "ความปลอดภัยเพิ่ม"** — ให้ความรู้สึกระมัดระวัง แต่พิสูจน์ได้ (ผ่าน default จริงด้านบน) ว่าไม่ใช่วิธีที่ durability model ของ Kafka เองทำงาน และมีต้นทุน throughput จริงตรง ๆ โดยไม่มี durability benefit คู่กันเลยเมื่อ replication ตั้งค่าถูกต้องแล้ว
+- **Benchmark Docker broker เดียวในเครื่อง** — ถูก ทำซ้ำได้ มีประโยชน์จริงสำหรับการเทียบ*แบบสัมพัทธ์* (ผลลัพธ์ partition-count และ batching cross-link ของบทนี้) — และไม่ใช่ตัวแทนของการ load-test cluster จริงของคุณภายใต้ load client จริงพร้อมกันก่อนจะเชื่อตัวเลขสมบูรณ์ใด ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`num.io.threads` มากขึ้นแปลว่า throughput ดีขึ้นเสมอ"** ไม่ — พิสูจน์ด้านบน: broker ของคอร์สนี้นิ่งอยู่ที่ ~98% idle บน `RequestHandlerAvgIdlePercent` ภายใต้ test ในเครื่องที่หนักที่สุด thread มากขึ้นช่วยก็ต่อเมื่อ pool ปัจจุบันเป็นคอขวดจริง ซึ่งบทนี้สร้างไม่ได้เลยในเครื่องด้วย client เดียว
+- **"`log.flush.interval.messages` บ่อยขึ้นทำให้ Kafka durable ขึ้น"** ไม่ — พิสูจน์ด้านบน: default จริงคือ `Long.MAX_VALUE` (แทบไม่เกิดเลย) เพราะ durability มาจาก replication และ `acks` ไม่ใช่จาก `fsync` ต่อ message การบังคับ flush บ่อย ๆ เพิ่มต้นทุนจริงสำหรับการันตีที่มันไม่ได้ทำให้แข็งแรงขึ้นจริง
+- **"ตัวเลข `nMsg.sec` หัวเรื่องของ `kafka-consumer-perf-test.sh` คือ fetch throughput จริงของ tool"** ไม่ — พิสูจน์ด้านบน: ตัวเลขนั้นผสม `rebalance.time.ms` ครั้งเดียวเข้าไปในค่าเฉลี่ย; fetch throughput จริงล้วน ๆ (`fetch.nMsg.sec`) สูงกว่า 20 เท่าใน run เดียวกัน
+- **"Kafka เร็วทั้งที่เขียนทุก message ลง disk"** กลับกัน — พิสูจน์ด้านบนด้วย quote ตรงจากเอกสาร design ของ Kafka เอง: Kafka เร็ว*เพราะ*มันเขียนลง disk ทันทีและให้ OS page cache บวก `sendfile` zero-copy ทำการเสิร์ฟ ตั้งใจหลีกเลี่ยง in-process JVM cache ที่แข่งกัน ไม่ใช่หาทางเลี่ยงการเขียน disk
+
+export const quizPerformance = [
   {
-    q: 'batch ของ producer ที่ใหญ่ขึ้น (ผ่าน linger.ms และ batch.size) แลกอะไรเป็นหลัก',
+    q: 'พิสูจน์ด้านบนด้วยสอง topic บน broker เดียวกัน จำนวน partition (1 เทียบ 12) ทำให้ throughput และ latency ของ producer-perf-test ต่างกันจริงอย่างไร?',
     options: [
-      'durability กับ security',
-      'latency ต่อ record นิดหน่อย แลกกับ throughput ที่สูงขึ้นมาก',
-      'พื้นที่ disk กับ CPU อย่างเดียว',
-      'ไม่แลกอะไร ไม่มีผล',
+      'ไม่ต่างกันอย่างมีนัยสำคัญเลยทั้งสองทาง',
+      '12 partition วัดได้ throughput สูงกว่าประมาณ 60% และ latency เฉลี่ยต่ำกว่าประมาณ 66 เท่าเทียบกับ 1 partition broker เดียวกัน ตั้งค่า producer เดียวกัน',
+      '1 partition เร็วกว่าเพราะมี coordination overhead น้อยกว่า',
+      'จำนวน partition กระทบแค่ consumer ไม่กระทบ producer เลย',
     ],
     answer: 1,
+    explain: 'output จริง: 1 partition = 204,708 records/sec ที่ 91.32ms avg latency; 12 partition = 328,407 records/sec ที่ 1.37ms avg latency -- อธิบายด้วย log-append path อิสระ 12 เส้นแทนที่จะเป็นเส้นเดียวที่ serialize',
   },
   {
-    q: 'ทำไมจำนวน partition ถึงเป็นเพดานของ consumer parallelism',
+    q: 'พิสูจน์ด้านบนใน run จริงของ kafka-consumer-perf-test.sh ทำไมคอลัมน์หัวเรื่อง nMsg.sec (55,142/sec) ต่ำกว่า fetch.nMsg.sec (1,190,476/sec) มากใน run เดียวกันเป๊ะ?',
     options: [
-      'เพราะ partition หนึ่งถูก consume โดย consumer ได้มากสุดหนึ่งตัวใน group',
-      'เพราะ partition จำกัดจำนวน producer',
-      'เพราะแต่ละ partition ต้องมี broker ของตัวเอง',
-      'ไม่จำกัด parallelism ไม่มีเพดาน',
-    ],
-    answer: 0,
-  },
-  {
-    q: 'ความเสี่ยงของการสร้าง partition เยอะเกินที่ต้องการคืออะไร',
-    options: [
-      'ไม่มี partition เยอะแปลว่าเร็วขึ้นเสมอ',
-      'open file, traffic ของ replication, memory มากขึ้น และเวลา rebalance กับ failover ยาวขึ้น',
-      'topic กลายเป็น read-only',
-      'consumer commit offset ไม่ได้อีกต่อไป',
+      'consumer crash กลางทาง',
+      'nMsg.sec ผสม rebalance.time.ms ครั้งเดียว (3,459ms) เข้าไปในค่าเฉลี่ย ในขณะที่ fetch.nMsg.sec วัดแค่ fetch.time.ms (168ms) -- ต่างกันประมาณ 21 เท่าจาก rebalance overhead ที่ครอบงำ test สั้น ไม่ใช่จากการ fetch ที่ช้า',
+      'fetch.nMsg.sec เป็นการพิมพ์ผิดของ tool และควรเพิกเฉย',
+      'topic มี replication factor ไม่ตรงกัน',
     ],
     answer: 1,
+    explain: 'output CSV จริงแสดง rebalance.time.ms=3459 เทียบ fetch.time.ms=168 ใน run เดียวกันเป๊ะ -- การ handshake join group ไม่ใช่การส่งข้อมูล ครอบงำตัวเลข throughput ที่ผสมกัน',
   },
   {
-    q: 'Kafka พึ่ง operating system เรื่องความเร็วในการอ่านยังไง',
+    q: 'พิสูจน์ด้านบน เกิดอะไรขึ้นกับ RequestHandlerAvgIdlePercent ตอนบทนี้รัน load producer client เดียวที่หนักที่สุดกับ num.io.threads default 8 ตัวของ broker?',
     options: [
-      'เก็บ cache ใหญ่ใน process และไม่สน OS',
-      'ใช้ OS page cache RAM ที่ว่างจึงให้ kernel เสิร์ฟการอ่านล่าสุดจาก memory',
-      'อ่านตรงจาก ZooKeeper',
-      'cache ทุกอย่างใน JVM heap',
+      'ลดลงใกล้ 0 พิสูจน์ว่า broker อิ่มตัว',
+      'นิ่งอยู่ประมาณ 98% idle -- พิสูจน์ว่าไม่ใช่เพราะ 8 thread ใหญ่เกินไป แต่เพราะ producer client แบบ single-thread ในเครื่องตัวเดียวสร้าง concurrent request volume ไม่พอที่จะโหลดมันได้',
+      'broker crash ภายใต้ load',
+      'metric นี้ใช้ไม่ได้ถ้าไม่มี cluster หลาย broker',
     ],
     answer: 1,
+    explain: 'อ่าน JMX จริง: RequestHandlerAvgIdlePercent OneMinuteRate=0.981 ระหว่าง load ต่อเนื่องที่หนักที่สุดที่บทนี้สร้างได้ในเครื่อง -- ผลลัพธ์ที่ซื่อสัตย์เกี่ยวกับข้อจำกัดของ benchmark client เดียว ไม่ใช่ capacity ของ broker',
+  },
+  {
+    q: 'quote ด้านบนจากเอกสาร design ของ Kafka เอง (kafka.apache.org/43/design/design/) ทำไม Kafka ถึงพึ่ง OS page cache และ sendfile แทน JVM heap cache ขนาดใหญ่?',
+    options: [
+      'JVM allocate memory ให้ cache ไม่พอ',
+      '"Using sendfile, this re-copying is avoided by allowing the OS to send the data from pagecache to the network directly" -- zero-copy หลีกเลี่ยงการย้าย byte เข้า JVM heap เลย และ heap ใหญ่จะแย่ง RAM ที่ page cache ต้องการ บวก GC pause เพิ่มบน request path',
+      'page cache ใช้แค่กับ message ที่ compress แล้ว',
+      'JVM heap caching เลิกใช้แล้วใน Kafka 4.x',
+    ],
+    answer: 1,
+    explain: 'quote ตรงจากเอกสาร design จริง หน้าเดียวกันยังบอกว่าด้วย consumer ที่ตามทันแล้ว "you will see no read activity on the disks whatsoever as they will be serving data entirely from cache"',
+  },
+  {
+    q: 'พิสูจน์ด้านบนด้วยค่า config จริงของ broker ของบทนี้เอง log.flush.interval.messages default เป็นอะไร และทำไมมันสำคัญ?',
+    options: [
+      '1 -- Kafka fsync ทุก message เดียวโดย default เพื่อความปลอดภัย',
+      'Long.MAX_VALUE (9223372036854775807) -- Kafka แทบไม่บังคับ flush ตามจำนวน message เลยโดย default เพราะ durability มาจาก replication และ acks/min.insync.replicas ไม่ใช่จาก fsync discipline',
+      '100 -- default ที่สมดุลระหว่างความปลอดภัยและความเร็ว',
+      'ไม่มี default ต้องตั้งเองเสมอ',
+    ],
+    answer: 1,
+    explain: 'output จริงของ kafka-configs.sh --describe แสดง log.flush.interval.messages=9223372036854775807 และ log.flush.scheduler.interval.ms=9223372036854775807 ทั้งคู่ Long.MAX_VALUE ยืนยัน DEFAULT_CONFIG',
+  },
+  {
+    q: 'อ้างอิงด้านบนจากเอกสาร operations จริงของ Kafka เกิดอะไรขึ้นถ้า broker host partition 50,000 ตัวบน Linux ที่ปล่อย vm.max_map_count ไว้ที่ default (~65,535)?',
+    options: [
+      'ไม่มีอะไรเกิดขึ้น -- vm.max_map_count กระทบแค่ networking',
+      'มีโอกาสสูงที่จะ crash ด้วย OutOfMemoryError (Map failed) เพราะไฟล์ index/timeindex คู่ของแต่ละ log segment ใช้ 2 map area และ 50,000 partition จะจัดสรรประมาณ 100,000 map area เทียบกับ limit default ~65,535',
+      'Kafka เพิ่ม OS limit ให้อัตโนมัติตอน startup',
+      'broker ทิ้ง partition ที่เกิน limit เงียบ ๆ',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงตรงจาก kafka.apache.org/43/operations/hardware-and-os/; container ของคอร์สนี้เองยืนยันว่ารันสูงกว่า default นั้นมากอยู่แล้ว (vm.max_map_count=262144, ulimit -n=1048576) ซึ่งเป็นเหตุผลเป๊ะว่าทำไมบทที่ partition น้อยของคอร์สนี้ไม่เคยชนมันเลย',
   },
 ];
 
-<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerf} />
+<Quiz client:visible id="operations-and-production/performance-and-tuning" questions={quizPerformance} />
 
 <ProgressTracker client:visible id="operations-and-production/performance-and-tuning" />
