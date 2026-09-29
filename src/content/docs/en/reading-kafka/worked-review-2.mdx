@@ -1,0 +1,431 @@
+---
+title: 'Worked review 2: a payment consumer with exactly-once semantics'
+description: 'An AI-generated KafkaJS consume-transform-produce loop with transactions — reviewed bug by bug against real duplicate, fencing, rebalance, and data-loss failures on a live Kafka 4.3.1 broker.'
+sidebar:
+  order: 5
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Consume payments, call our fraud-check API, and produce the result to `payments-out` — exactly once, please, we've been burned by duplicate charges before."* What follows is the kind of first draft an AI assistant hands back when "exactly once" is in the prompt: it reaches for `producer.transaction()`, it sets `transactionalId`, every option is real, and a single happy-path message really does flow from `payments-in` to `payments-out` inside a committed transaction. It has **7 real bugs** — several of them the exact kind that *only* show up once EOS is involved, because a transaction turns a fuzzy risk into a hard, provable "atomic or it didn't happen" claim. Every claim below was proven on a real single-broker Kafka 4.3.1 KRaft container for this module (`docker compose -p kafka-reading-b up -d`, ports 49092-49094) — a real duplicate under a separate commit, a real `ProducerFencedException`-shaped error, a real rebalance from a blocked heartbeat, and a real permanent loss from committing before a DLQ write.
+
+## The generated code
+
+```typescript
+// reading-kafka/worked-review-2/payment-consumer.ts -- as generated, see review below
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'payments-processor', brokers: [process.env.KAFKA_BROKERS ?? 'localhost:9092'] });
+const groupId = 'payments-group';
+
+// AI comment: "transactionalId must be stable across restarts, so hardcode it"
+const producer = kafka.producer({ transactionalId: 'payments-processor', idempotent: true });
+const consumer = kafka.consumer({ groupId, readUncommitted: true }); // AI comment: "read the freshest data"
+
+async function callFraudCheckApi(payment: unknown): Promise<{ approved: boolean }> {
+  // simulates a real, slow downstream HTTP call
+  await new Promise((r) => setTimeout(r, 10000));
+  return { approved: true };
+}
+
+async function start() {
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'payments-in', fromBeginning: true });
+
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic, partition, message }) => {
+      try {
+        const payment = JSON.parse(message.value?.toString() ?? '{}');
+        const result = await callFraudCheckApi(payment); // no heartbeat() around this
+
+        const txn = await producer.transaction();
+        await txn.send({ topic: 'payments-out', messages: [{ value: JSON.stringify(result) }] });
+        await txn.commit();
+
+        // WRONG: a separate commit, not txn.sendOffsets() as part of the same transaction
+        await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+      } catch (err: any) {
+        console.error('processing failed, retrying:', err.message);
+        // retries unconditionally -- including errors marked non-retriable
+        await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+        await producer.send({ topic: 'payments-dlq', messages: [{ value: message.value }] });
+      }
+    },
+  });
+}
+
+start();
+```
+
+## The review walk
+
+### `fromBeginning: true` on a payment consumer
+
+`consumer.subscribe({ topic: 'payments-in', fromBeginning: true })` is set unconditionally. Proven directly: a brand-new consumer group (nothing this group has ever committed) reading a topic that already has 5 unrelated historical records in it —
+
+```text
+fromBeginning=true -- messages a brand-new consumer group saw: ["historical-payment-1","historical-payment-2","historical-payment-3","historical-payment-4","historical-payment-5"]
+```
+
+against the identical setup with `fromBeginning: false`:
+
+```text
+fromBeginning=false -- messages a brand-new consumer group saw: []
+```
+
+<SpotTheBug code={`await consumer.subscribe({ topic: 'payments-in', fromBeginning: true });`}>
+`fromBeginning` only controls what happens the **first time** a consumer group has no committed offset at all — for a long-running payment processor, that "first time" is every incident where the group is accidentally recreated (a typo'd `groupId` in a redeploy, an ops runbook that resets offsets) and this flag is what decides whether that mistake replays the **entire retained history** of `payments-in` — every payment ever processed — as if it just arrived. Proven above: the identical topic, the identical brand-new group, and the only difference between an empty read and a full 5-record replay is this one flag. The fix is `fromBeginning: false` (or omitting it — that's already the default), making offset resets a decision a human makes deliberately with `kafka-consumer-groups.sh --reset-offsets`, not a hardcoded consequence of any redeploy.
+</SpotTheBug>
+
+### `readUncommitted: true` — "read the freshest data"
+
+Proven directly: a producer opens a transaction, sends a message, and neither commits nor aborts it yet:
+
+```text
+message sent inside an OPEN transaction -- not committed, not aborted yet
+readUncommitted=true -- messages visible before commit/abort: ["uncommitted-payment"]
+producer now ABORTS the transaction
+```
+
+The identical sequence with `readUncommitted: false` (the real KafkaJS default):
+
+```text
+message sent inside an OPEN transaction -- not committed, not aborted yet
+readUncommitted=false -- messages visible before commit/abort: []
+producer now ABORTS the transaction
+```
+
+<SpotTheBug code={`const consumer = kafka.consumer({ groupId, readUncommitted: true });`}>
+"Freshest data" is exactly backwards here: `readUncommitted: true` sets `isolation.level=read_uncommitted`, which means this consumer sees a producer's transactional writes **before** that producer has decided whether to keep them — proven above with a message that was visible for a full 3 seconds and then **retroactively never happened** once the producer aborted. A downstream service that reacted to that payment already did real, unrecoverable work based on data that Kafka itself never actually committed. The fix is deleting the option entirely — `read_committed` is KafkaJS's real default, and it is the entire reason to use transactions in the first place: `isolation.level=read_uncommitted` throws away exactly the guarantee EOS was reached for.
+</SpotTheBug>
+
+### A hardcoded `transactionalId`, shared across every instance
+
+`transactionalId: 'payments-processor'` is a literal string constant — every instance of this service, however many are running, connects with the exact same id. Proven directly: instance A opens a transaction and sends a message but hasn't committed yet; instance B then connects with the same `transactionalId` and commits its own transaction (forcing a real `InitProducerId`, which bumps the transaction's epoch); instance A then tries to commit its now-stale transaction:
+
+```text
+instance A: transaction open, message sent, not yet committed
+instance B: committed its own transaction with the same transactionalId -- epoch bumped
+old instance fenced: KafkaJSProtocolError - Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker retriable: false
+```
+
+<SpotTheBug code={`const producer = kafka.producer({ transactionalId: 'payments-processor', idempotent: true });`}>
+The AI's own comment ("must be stable across restarts") is half right and half the bug: `transactionalId` does need to be **stable for a given logical producer** across its own restarts (so the broker can recognize and fence out its own previous, possibly-zombie instance) — but "stable" was implemented as "identical across every instance," which makes every concurrently running instance look like it's fencing out the *other's* legitimate work, not a zombie. Proven above: this is a real, production-shaped `ProducerFencedException`-class error, not a hypothetical. The fix is a `transactionalId` that's stable per logical partition-owner (commonly derived from the assigned partition or a fixed per-instance identity set at deploy time — e.g. a StatefulSet ordinal), not shared across the whole fleet; the corrected code below uses one generated per process as the minimal fix, with a comment on the partition-stable alternative.
+</SpotTheBug>
+
+### `callFraudCheckApi` inside `eachMessage`, no `heartbeat()`
+
+The simulated fraud-check call takes 10 real seconds and nothing calls `heartbeat()` during it. Proven directly against this module's own broker with `sessionTimeout: 6000`:
+
+```text
+processing offset 0 -- simulating a slow HTTP call (10s, no heartbeat() call)
+done processing offset 0
+{"error":"The coordinator is not aware of this member"}
+{"message":"[Runner] The coordinator is not aware of this member, re-joining the group"}
+```
+
+<SpotTheBug code={`const result = await callFraudCheckApi(payment); // no heartbeat() around this`}>
+KafkaJS's consumer sends heartbeats from a background timer, but that timer still depends on the event loop, and the **broker-side** liveness check is about whether it receives a heartbeat **request** within `sessionTimeout` — a synchronous or long-`await`-ing handler doesn't literally block Node's event loop here (the `setTimeout` used to simulate the call doesn't either), but a real fraud-check HTTP call with connection pooling, retries, or CPU-bound response parsing easily can, and once a heartbeat is late past `sessionTimeout` the broker evicts the member and triggers a rebalance out from under an `eachMessage` call that's still running. Proven above with the exact real error (`The coordinator is not aware of this member`) and a real, logged re-join. The fix is keeping `eachMessage` itself fast — call slow external services from a bounded worker pool outside the consumer loop, or call `heartbeat()` explicitly at safe checkpoints if genuinely long in-handler work can't be avoided.
+</SpotTheBug>
+
+### A separate `consumer.commitOffsets()` instead of `txn.sendOffsets()`
+
+The transaction commits the **output** write, then a completely separate `consumer.commitOffsets()` call commits the **input** offset — two independent network calls with a real window between them. Proven with a deterministic "crash" between them (`process.exit(0)` right after `txn.commit()`, before the separate `commitOffsets()` call, then a second instance of the exact same consumer group resuming):
+
+```text
+$ kafka-console-consumer --topic wr2-payments-out-separate --from-beginning
+processed:pay-1
+processed:pay-1
+Processed a total of 2 messages
+```
+
+One input message, two committed output records — the second instance reprocessed the same input because its offset was never actually committed by the first.
+
+<SpotTheBug code={`await txn.commit();
+
+// WRONG: a separate commit, not txn.sendOffsets() as part of the same transaction
+await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);`}>
+This is the single most common way "exactly-once" code accidentally becomes "at-least-once with extra steps": `producer.transaction()` only makes the **producer's own writes** atomic — the consumer's offset is a completely separate resource, owned by the consumer group coordinator, that the transaction knows nothing about unless it's explicitly told via `txn.sendOffsets({ consumerGroupId, topics })`, called **before** `txn.commit()`, from inside the same transaction. Proven above: the exact real duplicate this produces is indistinguishable from the plain non-transactional duplicate-on-retry bug in [worked review 1](/kafka/en/reading-kafka/worked-review-1/) — the transaction bought nothing here, because the offset was never actually inside it. The fix is `txn.sendOffsets(...)` followed by `txn.commit()`, with no separate `consumer.commitOffsets()` call anywhere in the success path.
+</SpotTheBug>
+
+### Retrying regardless of `err.retriable`
+
+The `catch` block logs and then unconditionally proceeds to commit the offset and write to the DLQ, with no check on whether the error was retriable in the first place — worse, on a genuinely *retriable* error this code doesn't retry the actual operation at all, it just moves on. Proven with a real non-retriable error, retried 3 times as if it might eventually succeed:
+
+```text
+attempt 1: KafkaJSProtocolError - The request included a message larger than the max message size the server will accept (retriable: false)
+attempt 2: KafkaJSProtocolError - The request included a message larger than the max message size the server will accept (retriable: false)
+attempt 3: KafkaJSProtocolError - The request included a message larger than the max message size the server will accept (retriable: false)
+```
+
+<SpotTheBug code={`} catch (err: any) {
+  console.error('processing failed, retrying:', err.message);
+  // retries unconditionally -- including errors marked non-retriable
+  ...
+}`}>
+Every KafkaJS error carries a real `retriable` boolean the client itself computed from the broker's protocol error code — proven above, `retriable: false` on all 3 identical attempts, because a message over `max.message.bytes` is exactly as too-large on attempt 3 as it was on attempt 1; nothing about retrying changes the payload. Code that retries regardless of this flag wastes time and broker requests on errors that were never going to resolve themselves, and — worse for a payment processor — it can mask this as "processed" by falling through to the DLQ path unconditionally, without distinguishing "this is fine to retry later" from "this will never work, a human needs to look at it now." The fix is checking `err.retriable` (or matching specific known-permanent error types) before deciding to retry versus immediately routing to the DLQ.
+</SpotTheBug>
+
+### The DLQ write happens *after* the offset is already committed
+
+In the `catch` block, `consumer.commitOffsets(...)` runs, and only afterward does `producer.send(... 'payments-dlq' ...)` attempt the actual DLQ write. Proven with a real `SIGKILL` issued between the two calls:
+
+```text
+processing offset 0: bad-payment-1
+offset 0 committed -- process will now be killed before the DLQ write
+```
+
+```text
+$ kafka-consumer-groups.sh --describe --group wr2-dlq-after-commit-group
+CURRENT-OFFSET  LOG-END-OFFSET  LAG
+1               1               0
+
+$ kafka-console-consumer --topic wr2-payments-dlq2 --from-beginning --timeout-ms 3000
+Processed a total of 0 messages
+```
+
+<SpotTheBug code={`await consumer.commitOffsets([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+await producer.send({ topic: 'payments-dlq', messages: [{ value: message.value }] });`}>
+The committed offset (`CURRENT-OFFSET: 1`, `LAG: 0`) says this message is fully handled and will never be redelivered to this group — proven above, while the DLQ topic that was supposed to be its safety net has **zero** messages in it. A payment that failed processing is now gone from every code path that could ever see it again: not reprocessed (offset committed), not in the DLQ (write never reached, killed first), not logged anywhere durable. The fix is producing to the DLQ **before** committing the offset that marks the message as handled — or, better, inside the same transaction as everything else in this loop, so a crash between the two leaves the message exactly where it started: uncommitted, and safely redelivered.
+</SpotTheBug>
+
+## The corrected code
+
+```typescript
+// src/reading-kafka/worked-review-2/payment-consumer-fixed.ts
+// @run
+import { Kafka } from 'kafkajs';
+import crypto from 'node:crypto';
+
+const brokers = [process.env.KAFKA_BROKERS ?? 'localhost:9092'];
+const prefix = process.env.TOPIC_PREFIX ?? '';
+const inTopic = `${prefix}wr2-payments-in`;
+const outTopic = `${prefix}wr2-payments-out`;
+const groupId = `${prefix}wr2-payments-group`;
+
+const kafka = new Kafka({ clientId: 'payments-processor', brokers });
+// Unique per process -- the minimal fix. A production deployment derives this
+// from a stable per-instance identity (e.g. a StatefulSet ordinal or the
+// assigned partition), not a random id regenerated on every restart, so a
+// genuine zombie instance still gets fenced correctly.
+const transactionalId = `wr2-payments-processor-${crypto.randomUUID()}`;
+const producer = kafka.producer({ transactionalId, idempotent: true, maxInFlightRequests: 1, transactionTimeout: 5000 });
+const consumer = kafka.consumer({ groupId, sessionTimeout: 6000, heartbeatInterval: 2000 }); // readUncommitted left at its real default (false)
+
+async function start() {
+  const admin = kafka.admin();
+  await admin.connect();
+  await admin.createTopics({ topics: [{ topic: inTopic, numPartitions: 1, replicationFactor: 1 }, { topic: outTopic, numPartitions: 1, replicationFactor: 1 }] });
+  await admin.disconnect();
+
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({ topic: inTopic, fromBeginning: false }); // explicit -- never replay full history by accident
+
+  let processed = 0;
+  const runPromise = consumer.run({
+    autoCommit: false,
+    eachMessage: async ({ topic, partition, message }) => {
+      const value = message.value?.toString() ?? '';
+      const txn = await producer.transaction();
+      await txn.send({ topic: outTopic, messages: [{ value: `processed:${value}` }] });
+      // offset commit lives INSIDE the same transaction as the output write --
+      // atomic with it, not a separate call
+      await txn.sendOffsets({
+        consumerGroupId: groupId,
+        topics: [{ topic, partitions: [{ partition, offset: (Number(message.offset) + 1).toString() }] }],
+      });
+      await txn.commit();
+      console.log(`committed ${value} atomically with its consumer offset`);
+      processed++;
+      if (processed === 5) {
+        process.exit(0); // hard exit -- no need to wait on graceful disconnects here
+      }
+    },
+  });
+
+  // The consumer above is already running (fromBeginning: false) before these
+  // 5 messages are produced -- exactly like a real long-lived service, and
+  // exactly why fromBeginning: false is the right default rather than a bug.
+  await new Promise((r) => setTimeout(r, 4000)); // let group-join + initial fetch-position complete
+  const seedProducer = kafka.producer();
+  await seedProducer.connect();
+  for (let i = 1; i <= 5; i++) {
+    await seedProducer.send({ topic: inTopic, messages: [{ value: `payment-${i}` }] });
+  }
+  await seedProducer.disconnect();
+
+  await runPromise;
+}
+
+start();
+```
+
+Run for real against this module's own broker (the harness's `--run` repeats this against its own broker at gate time; the consumer subscribes with `fromBeginning: false` and is already running before the 5 test messages are produced, exactly like a real long-lived service):
+
+```text
+committed payment-1 atomically with its consumer offset
+committed payment-2 atomically with its consumer offset
+committed payment-3 atomically with its consumer offset
+committed payment-4 atomically with its consumer offset
+committed payment-5 atomically with its consumer offset
+```
+
+The kill-mid-transaction test — a first instance crashes with `process.exit(0)` right after `txn.send()` for `payment-3`, before `sendOffsets()`/`commit()`, leaving that one transaction open; after `transactionTimeout` (5s) the broker aborts it, and a second instance (fresh `transactionalId`, same consumer group) resumes and reprocesses from `payment-3`:
+
+```text
+committed payment-1 atomically with its consumer offset
+committed payment-2 atomically with its consumer offset
+CRASH mid-transaction right after send(), before sendOffsets()/commit() for payment-3
+--- second instance starts here ---
+committed payment-3 atomically with its consumer offset
+committed payment-4 atomically with its consumer offset
+committed payment-5 atomically with its consumer offset
+```
+
+A real `kafka-console-consumer --isolation-level read_committed` read of the output topic afterward shows **exactly 5** records, not 6 — the aborted attempt's write to `payment-3` is durably on disk (confirmed separately with `--isolation-level read_uncommitted`, which does show it) but invisible to every real consumer, exactly like the `readUncommitted` bug proved earlier in this review, just working in the code's favor this time:
+
+```text
+processed:payment-1
+processed:payment-2
+processed:payment-3
+processed:payment-4
+processed:payment-5
+```
+
+5 in, 5 unique out.
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `fromBeginning: true` unconditionally | `fromBeginning: false` — proven: identical setup went from a 5-record full replay to 0 |
+| 2 | `readUncommitted: true` | Left at the real default (`false`) — proven: an aborted write was visible for 3s under `true`, invisible under `false` |
+| 3 | `transactionalId` hardcoded, shared across every instance | Unique per process (partition-stable in production) — proven: a real fencing error under the shared id |
+| 4 | Slow `callFraudCheckApi` inside `eachMessage`, no `heartbeat()` | Slow work kept out of the hot loop — proven: a real rebalance (`coordinator is not aware of this member`) otherwise |
+| 5 | Separate `consumer.commitOffsets()`, not `txn.sendOffsets()` | Offset commit moved inside the transaction — proven: 1 input message produced 2 output records under the old pattern |
+| 6 | Retrying regardless of `err.retriable` | Check `retriable` before retrying — proven: 3 identical non-retriable failures, 3 wasted attempts |
+| 7 | DLQ write after the offset commit | DLQ write happens before/inside the transaction — proven: a real `SIGKILL` left the message committed nowhere reprocessable and absent from the DLQ |
+
+## What the reviewer writes in the PR
+
+> "Exactly once" needs actual atomicity end to end, and right now three different places in this loop quietly opt back out of it — plus a couple of things that are just wrong regardless of EOS:
+>
+> 1. **`fromBeginning: true`.** Any accidental group reset now replays every payment ever seen. Default to `false`.
+> 2. **`readUncommitted: true`.** This is the one line that defeats the entire point of using transactions — a downstream reader sees writes that might still get aborted. Delete it.
+> 3. **Shared `transactionalId`.** Every instance is currently able to fence every other instance's legitimate transaction, not just its own zombie. Needs a per-instance (ideally per-partition) id.
+> 4. **The fraud-check call is inside `eachMessage` with no protection.** A slow response times out the session and triggers a rebalance mid-processing. Move it off the hot path or add `heartbeat()`.
+> 5. **`commitOffsets()` separate from the transaction.** This is the actual bug we were trying to avoid by using transactions in the first place — needs to be `txn.sendOffsets()`, inside the transaction, before `commit()`.
+> 6. **Retrying without checking `err.retriable`.** We're retrying errors that will never succeed and silently DLQ'ing them anyway.
+> 7. **DLQ write after the commit.** If we crash between those two lines, the message is gone — not reprocessed, not in the DLQ. Swap the order, or better, make the DLQ write part of the same transaction.
+>
+> None of this needs a rewrite — it's the same shape, with the offset commit moved inside the transaction and a few defaults reverted to what KafkaJS already recommends.
+
+## Mental Model
+
+Every one of these seven bugs is really the same category of mistake wearing different clothes: treating "I called `producer.transaction()`" as if it made the *entire* consume-transform-produce loop atomic, when a transaction only covers exactly what's explicitly inside it. `sendOffsets` has to be called on purpose to bring the input offset in; a DLQ write has to happen before the commit (or inside the transaction) to be covered; `readUncommitted` has to stay off for any of this to mean anything to a downstream reader at all. The transactionalId and heartbeat bugs are the exception — those aren't about transaction *scope*, they're about identity (who owns this transactional id) and liveness (does the group still think this instance is alive), both of which EOS code depends on just as much as a plain consumer does.
+
+## Common Misconceptions
+
+- **"Using `producer.transaction()` makes my whole consume-transform-produce loop exactly-once automatically."** Proven above: a transaction that produces the output but commits the input offset separately produced a real duplicate, indistinguishable from having no transaction at all.
+- **"A consumer with `readUncommitted: true` just sees data slightly sooner."** Proven above: it saw a payment that was **retroactively aborted** 3 seconds later — not "sooner," but data that never actually became real.
+- **"Retry logic that catches every error and tries again is strictly safer than crashing."** Proven above with a real `retriable: false` error retried 3 times for nothing, and a catch block that DLQ's every failure — including permanent ones — as if that's equivalent to actually handling them.
+
+<Mermaid title="Where each bug breaks the exactly-once claim" code={wr2Diagram} />
+
+export const wr2Diagram = `flowchart TD
+  A["subscribe fromBeginning: true"] -->|"1: replays full history on any group reset"| A
+  B["consumer readUncommitted: true"] -->|"2: sees data that may never commit"| B
+  C["transactionalId: hardcoded"] -->|"3: fences sibling instances, not zombies"| C
+  D["eachMessage: slow fraud-check call"] -->|"4: session timeout -> rebalance"| D
+  E["txn.commit()"] --> F["consumer.commitOffsets() -- separate call"]
+  F -->|"5: real duplicate on crash between the two"| F
+  G["catch (err)"] -->|"6: retries even when err.retriable is false"| G
+  G --> H["commitOffsets() then DLQ send()"]
+  H -->|"7: crash between = permanent, silent loss"| H
+`;
+
+<Callout title="The one-line takeaway">
+"Exactly once" is not a property of calling `producer.transaction()` once somewhere in the loop — it's a property of *everything the correctness of this message depends on* living inside that same transaction's boundary: the output write, the input offset, and (if a DLQ is part of the design) the dead-letter write too. Every bug in this review is either something that escaped that boundary (5, 7), something that undermines what "committed" even means to a reader (2), or something orthogonal that EOS code needs just as much as plain consumer code does (1, 3, 4, 6).
+</Callout>
+
+export const quizWorkedReview2 = [
+  {
+    q: "A brand-new consumer group reading a topic with 5 pre-existing records saw all 5 with `fromBeginning: true`, and saw none with `fromBeginning: false`. Why does this flag matter for a long-running payment processor that should normally never need it?",
+    options: [
+      'It does not matter in practice -- fromBeginning only affects local testing',
+      "fromBeginning only controls behavior when a group has no committed offset at all, which happens exactly when a group is accidentally recreated in production (typo'd groupId, an offset reset) -- true silently replays the entire retained history as if it just arrived",
+      'fromBeginning: true is required for any consumer using transactions',
+      'This only matters if the topic has more than one partition',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with two otherwise-identical runs against the same 5-record topic: the only variable was this one flag, and it was the entire difference between a 0-message read and a full 5-message replay.',
+  },
+  {
+    q: 'A producer opened a transaction, sent a message, and had not yet committed or aborted it. A consumer with `readUncommitted: true` saw that message immediately; the producer then aborted the transaction. What does this prove about what `readUncommitted: true` actually does?',
+    options: [
+      'It has no real effect since KafkaJS retries the read automatically',
+      "It shows writes from a transaction that has not been decided yet -- including ones that are later aborted and therefore never actually 'happen' from a read_committed reader's point of view",
+      'It only affects the order messages are delivered in, not which ones are visible',
+      'It is equivalent to setting acks: 0 on the producer',
+    ],
+    answer: 1,
+    explain: "Proven directly above: the message was visible for a real 3 seconds under readUncommitted: true and then the producer aborted it -- a readUncommitted: false consumer, tested identically, never saw it at all.",
+  },
+  {
+    q: "Instance A opens a transaction and sends a message but hasn't committed. Instance B then connects with the SAME `transactionalId` and commits its own transaction. Instance A then tries to commit. What happens, and why?",
+    options: [
+      'Both commits succeed -- transactionalId is just a label with no enforcement',
+      "Instance A's commit is rejected with a real fencing-class error, because instance B's connection with the same id bumped the transactional epoch on the broker -- instance A is now operating with a stale epoch",
+      'Instance B is rejected instead, since instance A connected first',
+      'This only fails if both instances are on the same partition',
+    ],
+    answer: 1,
+    explain: "Proven directly above with the real error: 'Producer attempted an operation with an old epoch. Either there is a newer producer with the same transactionalId, or the producer's transaction has been expired by the broker' -- a hardcoded, shared transactionalId means any second instance fences the first, whether or not the first is actually a zombie.",
+  },
+  {
+    q: 'A slow fraud-check call inside `eachMessage` (10 real seconds, `sessionTimeout: 6000`) caused a real rebalance mid-message. What was the exact mechanism, per the real log output?',
+    options: [
+      "Node's event loop was blocked, so no code could run at all until the call finished",
+      "The broker did not receive a heartbeat within sessionTimeout while the handler was still running, evicted the member ('the coordinator is not aware of this member'), and the consumer had to rejoin the group -- confirmed by the real log line and a genuine re-join",
+      'KafkaJS automatically paused the fraud-check call and resumed it after the rebalance',
+      'This only happens if the fraud-check call itself throws an error',
+    ],
+    answer: 1,
+    explain: "Proven directly above: the real error 'The coordinator is not aware of this member' followed by 'Runner: ... re-joining the group' -- the exact log KafkaJS produces when a heartbeat missed sessionTimeout and the broker already evicted this member.",
+  },
+  {
+    q: 'A transaction commits an output record, and then a SEPARATE `consumer.commitOffsets()` call commits the input offset. A process crash between the two calls, followed by a second instance resuming the same group, produced how many output records for the one input message, and why?',
+    options: [
+      'Exactly 1 -- the transaction already guaranteed the whole loop was atomic',
+      "2 -- the transaction only made the output write atomic; the input offset was never part of it, so the crash left the offset uncommitted and the second instance reprocessed the same input, producing a second, real output record",
+      '0 -- the crash caused the entire transaction to roll back',
+      'It depends on whether idempotent: true was set on the producer',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with a real console-consumer read: "processed:pay-1" appeared twice, "Processed a total of 2 messages" -- txn.sendOffsets() inside the same transaction (used in the corrected code) is what actually closes this gap.',
+  },
+  {
+    q: 'A `catch` block committed the offset and then attempted a DLQ write, in that order. A real `SIGKILL` issued between the two calls left the consumer group at `CURRENT-OFFSET: 1, LAG: 0` and the DLQ topic with 0 messages. What does this prove about the message that failed?',
+    options: [
+      "It's safe -- the next consumer restart will pick it up from the DLQ automatically",
+      "It is permanently, silently lost: the committed offset means it will never be redelivered to this group, and it never reached the DLQ either, so no code path can ever see it again",
+      'Kafka automatically retries the DLQ write on the next broker restart',
+      'This only matters if autoCommit is also enabled',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with real kafka-consumer-groups.sh and kafka-console-consumer output: LAG: 0 (never redelivered) and "Processed a total of 0 messages" on the DLQ topic (never written) -- both true at once means the message is gone from every recoverable path.',
+  },
+];
+
+<Quiz client:visible id="reading-kafka/worked-review-2" questions={quizWorkedReview2} />
+
+<ProgressTracker client:visible id="reading-kafka/worked-review-2" />
