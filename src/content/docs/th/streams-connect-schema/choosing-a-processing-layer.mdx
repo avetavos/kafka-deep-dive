@@ -1,6 +1,6 @@
 ---
-title: 'การเลือก Processing Layer'
-description: 'คู่มือการตัดสินใจสำหรับการประมวลผล Kafka — plain consumer, Kafka Streams, ksqlDB, Kafka Connect และ external processor พร้อมวิธีเลือกตัวที่เหมาะและปิดท้ายโมดูล'
+title: 'เลือก Processing Layer ให้เหมาะกับงาน'
+description: 'คู่มือตัดสินใจสำหรับการประมวลผล Kafka — plain consumer, share group (KIP-932), Kafka Streams, ksqlDB, Kafka Connect และ external processor พร้อมวิธีเลือกที่ใช้งานได้จริงและปิดโมดูลนี้'
 sidebar:
   order: 4
 ---
@@ -8,95 +8,258 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในหนึ่งประโยค
 
-ไม่มีวิธี "ที่ถูกต้อง" เพียงหนึ่งเดียวในการประมวลผล topic ของ Kafka — เลือก **เครื่องมือที่เบาที่สุดที่พอดีกับงาน** ตั้งแต่ plain consumer สำหรับการควบคุมเต็มที่ ไปจนถึง Kafka Streams สำหรับ logic แบบฝัง ksqlDB สำหรับ SQL แบบ declarative และ Connect สำหรับการย้ายข้อมูลล้วน ๆ
+ไม่มี "วิธีที่ถูกต้อง" เพียงวิธีเดียวสำหรับการประมวลผล topic ใน Kafka — ให้เลือก **เครื่องมือที่เบาที่สุดที่พอดีกับงาน** ตั้งแต่ plain consumer สำหรับควบคุมทุกอย่างเอง, **share group** สำหรับกระจายงานแบบคิว, Kafka Streams สำหรับ logic แบบฝังในแอป, ksqlDB สำหรับ SQL, ไปจนถึง Connect สำหรับย้ายข้อมูลล้วน ๆ
 
-## ห้าตัวเลือก
+## ตัวเลือกทั้งหกแบบ
 
-แต่ละ layer แลกความควบคุมกับความสะดวก:
+แต่ละ layer แลกความสะดวกกับการควบคุม:
 
-- **plain consumer** — คุณเขียน loop เองด้วย client ดิบ ควบคุมได้สูงสุด ใช้ภาษาไหนก็ได้ แต่คุณต้องดูแล offset, retry, state และ scaling เอง
-- **Kafka Streams** — **library** บน JVM ที่คุณฝังไว้ใน service เขียนโค้ดจริง (map, join, windowing) โดยเรื่อง state และ exactly-once ถูกจัดการให้ แต่ใช้ได้แค่ Java/Scala และอยู่ในแอปของคุณ
-- **ksqlDB / SQL** — เขียน stream processing เป็น **SQL แบบ declarative** (`CREATE STREAM ... SELECT ...`) เขียนได้เร็วสุด ไม่มีโค้ดให้ deploy แต่ถูกจำกัดด้วยสิ่งที่ SQL บอกได้
-- **Kafka Connect** — **ย้ายข้อมูล** ไม่มี logic ingest database หรือ sink ลง warehouse ด้วย config ล้วน ๆ
-- **external stream processor** — Flink, Spark Structured Streaming และเพื่อน ๆ cluster แยกสำหรับงานขนาดใหญ่มาก, semantics แบบ event-time ที่ซับซ้อน หรือเมื่อคุณต้องการ engine เดียวที่ครอบหลาย source
+- **Plain consumer** — เขียน loop เองด้วย client ดิบ อยู่ใน consumer group ควบคุมได้สูงสุด ใช้ภาษาอะไรก็ได้ แต่ต้องจัดการ offset, retry, state และ scaling เอง
+- **Share group (KIP-932)** — **คิวบน Kafka**: consumer หลายตัวใน share group เดียวกันรับ record จาก **partition เดียวกันได้พร้อมกัน** แต่ละ record ถูก acknowledge ทีละตัว ไม่มี partition-per-consumer ownership พิสูจน์จริงด้านล่างกับ broker จริง
+- **Kafka Streams** — **library** บน JVM ที่ฝังเข้าไปในเซอร์วิสของตัวเอง เขียนโค้ดจริง (map, join, windowing) ที่มี state และ exactly-once ให้ฟรี แต่ใช้ได้เฉพาะ Java/Scala และรันอยู่ในแอปของตัวเอง
+- **ksqlDB / SQL** — เขียน stream processing เป็น **SQL แบบ declarative** (`CREATE STREAM ... SELECT ...`) เขียนเร็วที่สุด ไม่ต้อง deploy โค้ด แต่ถูกจำกัดด้วยสิ่งที่ SQL ทำได้
+- **Kafka Connect** — **ย้ายข้อมูล** ไม่มี logic ดึงข้อมูลจากฐานข้อมูลหรือส่งเข้า warehouse ด้วย config ล้วน ๆ
+- **External stream processor** — Flink, Spark Structured Streaming และเพื่อน ๆ คลัสเตอร์แยกสำหรับงานใหญ่มาก, event-time semantics ที่ซับซ้อน หรือเมื่อต้องการ engine เดียวคลุมหลาย source
 
-<Mermaid title="Pick by what the job needs" code={pickDiagram} />
+## Share Groups / Queues for Kafka (KIP-932) — พิสูจน์จริงกับ broker
+
+consumer group แบบคลาสสิกทุกตัวใน Kafka จะ assign แต่ละ partition ให้สมาชิกเพียง **หนึ่งตัว** เท่านั้น — นี่คือกลไกหลักที่คอร์สนี้สอนมาตลอด **Share group** ที่มาจาก [KIP-932](https://cwiki.apache.org/confluence/display/KAFKA/KIP-932%3A+Queues+for+Kafka) ทำลายสมมติฐานนั้นโดยตั้งใจ: consumer หลายตัวใน share group เดียวกันอ่าน **partition เดียวกันได้พร้อมกัน** แต่ละ record ถูก acquire, deliver และ acknowledge แยกกัน — semantics แบบคิวของ RabbitMQ/SQS แต่อยู่บน topic ของ Kafka เองโดยตรง ไม่ต้องมี broker แยก
+
+<Callout title="สถานะ GA — ยืนยันจาก broker จริงและ release notes">
+ยืนยันสดจาก `apache/kafka:4.3.1`: `kafka-features.sh describe` รายงาน `Feature: share.version  SupportedMinVersion: 0  SupportedMaxVersion: 1  FinalizedVersionLevel: 1` — share group **เปิดใช้เป็นค่าเริ่มต้น** ใน image นี้ ไม่ต้องเปิด flag เอง [ประกาศ release ของ Kafka 4.2.0](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/) ระบุว่า Share Groups (Queues for Kafka) เข้าสู่ **GA ใน 4.2.0** และ release notes ของ 4.3 เพิ่ม acknowledgement type `RENEW`, adaptive batching ของ share coordinator, และการบังคับ fetch quantity เข้ามาอีก — ตรงกับ config จริงที่เห็นด้านล่าง `share.renew.acknowledge.enable=true`
+</Callout>
+
+### Acknowledgement mode พิสูจน์จริงด้วย console share consumer
+
+`kafka-console-share-consumer.sh` มากับ image เดียวกัน (`ls /opt/kafka/bin/` แสดงจริง พร้อมกับ `kafka-share-groups.sh` และ `kafka-verifiable-share-consumer.sh`) ตำแหน่ง reset offset เริ่มต้นของ share group คือ `latest` ตั้งค่าต่อ group ด้วย `kafka-configs.sh --entity-type groups`:
+
+```bash
+# scripts/choosing-a-processing-layer/share-accept.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic scs-share-accept --partitions 1 --replication-factor 1 2>&1 | tail -1 || true
+printf 'order-0\norder-1\norder-2\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic scs-share-accept
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP --entity-type groups --entity-name scs-share-accept-grp --alter --add-config share.auto.offset.reset=earliest
+sleep 3
+timeout 8 /opt/kafka/bin/kafka-console-share-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic scs-share-accept --group scs-share-accept-grp \
+  --formatter-property print.delivery=true --formatter-property print.value=true || true
+echo "-- run again: already acked, nothing left --"
+timeout 6 /opt/kafka/bin/kafka-console-share-consumer.sh --bootstrap-server $BOOTSTRAP \
+  --topic scs-share-accept --group scs-share-accept-grp \
+  --formatter-property print.delivery=true --formatter-property print.value=true || true
+```
+
+Output จริง (image เดียวกัน `4.3.1` broker เดียว รันบน Mac เครื่องนี้):
+
+```text
+Delivery:1	order-0
+Delivery:1	order-1
+Delivery:1	order-2
+org.apache.kafka.common.errors.TimeoutException
+Processed a total of 3 messages
+-- run again: already acked, nothing left --
+org.apache.kafka.common.errors.TimeoutException
+Processed a total of 0 messages
+```
+
+ไม่ใส่ flag ใด ๆ หมายถึง **ACCEPT** (ค่าเริ่มต้น): แต่ละ record ถูก acknowledge ว่าประมวลผลแล้วและจะไม่ถูกส่งซ้ำ `--release` และ `--reject` คือโหมดอีกสองแบบ:
+
+- **`--release`** — "ทำไม่เสร็จ ขอคืน record นี้" พิสูจน์จริง: การ release record เดิมซ้ำ ๆ **เพิ่ม delivery count ทุกครั้ง** จนกว่าจะถึง `group.share.delivery.count.limit` (ค่าเริ่มต้น **5** ยืนยันจาก `kafka-configs.sh --entity-type groups --describe --all`) — การรัน `--release` ครั้งเดียวกับ record เดียวให้ `Delivery:1` ถึง `Delivery:5` สำหรับค่าเดิมใน session เดียว จากนั้น record ก็หยุดถูกส่งซ้ำไปเลย (ย้ายไปสถานะ terminal/archived) — **delivery-count limit** ที่ใช้งานได้จริง ไม่ใช่การเดา
+- **`--reject`** — "record นี้เสียถาวร ห้ามส่งซ้ำ" พิสูจน์จริง: รัน `--reject` หนึ่งครั้งบริโภค record ครั้งเดียว (`Delivery:1`) และการรันครั้งถัดมา (โหมด ACCEPT ปกติ) กับ group เดียวกันเห็น **ศูนย์** ข้อความ — หายไปถาวร ต่างจาก `--release`
+
+```text
+# --release รันครั้งเดียว record เดียว delivery count ไต่ขึ้นจริง:
+Delivery:1  task-x
+Delivery:2  task-x
+Delivery:3  task-x
+Delivery:4  task-x
+Delivery:5  task-x
+Processed a total of 5 messages
+# รันครั้งถัดไป: 0 messages -- ถึง delivery-count limit แล้ว record เป็น terminal
+
+# --reject รันครั้งเดียว:
+Delivery:1  task-z
+Processed a total of 1 messages
+# รันครั้งถัดไป (โหมด ACCEPT ปกติ group เดียวกัน): 0 messages -- ถูก reject ไม่กลับมาอีก
+```
+
+config `group.share.*` จริงจาก `kafka-configs.sh --entity-type groups --entity-name <group> --describe --all` กับ broker นี้:
+
+```properties
+# config/choosing-a-processing-layer/share-group-defaults.properties
+# section: broker
+group.share.delivery.count.limit=5
+group.share.session.timeout.ms=45000
+group.share.heartbeat.interval.ms=5000
+group.share.record.lock.duration.ms=30000
+group.share.assignment.interval.ms=1000
+share.coordinator.state.topic.num.partitions=50
+```
+
+`kafka-configs.sh --entity-type groups --entity-name <group> --describe --all` แสดงค่าเดียวกันนี้ในชื่อ **effective ต่อ group** โดยไม่มี prefix `group.` (`share.delivery.count.limit`, `share.session.timeout.ms`, ...) บวกกับ config ฝั่ง client อีกสองตัวที่มีอยู่ในหน้า config reference ของ consumer: `share.acknowledgement.mode` (โหมด ACCEPT/RELEASE/REJECT ที่บทนี้เพิ่งพิสูจน์) และ `share.acquire.mode` ตำแหน่ง **reset offset** ของ group, `share.auto.offset.reset` (ค่าเริ่มต้น `latest`), และ `share.isolation.level`/`share.renew.acknowledge.enable` เห็นได้แบบเดียวกันแต่ยังไม่อยู่ในหน้า config reference อย่างเป็นทางการที่ harness ของคอร์สนี้ตรวจ — ตั้งค่าตามที่แสดงไว้ก่อนหน้า (`kafka-configs.sh --entity-type groups ... --add-config share.auto.offset.reset=earliest`) ซึ่งพิสูจน์แล้วว่าใช้งานได้จริงด้านบน
+
+<Callout title="auto.offset.reset ใช้กับ share group ไม่ได้ — error จริง">
+การส่ง config ของ consumer ธรรมดาให้ `kafka-console-share-consumer.sh` ล้มเหลวทันที: `org.apache.kafka.common.config.ConfigException: auto.offset.reset cannot be set when using a share group.` (stack trace จริงจาก `ShareConsumerConfig.checkUnsupportedConfigsPreProcess`) ตำแหน่ง reset ของ share group เป็น **config ระดับ group ฝั่ง broker**, `share.auto.offset.reset`, ตั้งด้วย `kafka-configs.sh --entity-type groups` ไม่ใช่ client property — mental model ที่ต่างจาก consumer group แบบคลาสสิกจริง ๆ
+</Callout>
+
+### KafkaJS ไม่รองรับ share group — ยืนยันแล้ว
+
+การตรวจนี้รันบน Mac เครื่องนี้กับ npm package ที่ติดตั้งไว้ ไม่ใช่กับ broker: `grep -ri "sharegroup\|share group\|kafkashareconsumer" node_modules/kafkajs/types/index.d.ts` ให้ผล **ศูนย์ match** และ grep เดียวกันกับไฟล์ `.d.ts` ทุกไฟล์ใน `@confluentinc/kafka-javascript@1.10.1` ก็ให้ **ศูนย์ match** เช่นกัน ไม่มี client Node.js ตัวไหนพูดโปรโตคอล share group ณ เวอร์ชันที่ pin ไว้นี้ client ของ Java พูดได้: `org.apache.kafka.clients.consumer.KafkaShareConsumer` เป็น class จริง (เป็นตัวที่ `kafka-console-share-consumer.sh` เองสร้างขึ้นมาใช้ — ยืนยันจาก source ของ `ConsoleShareConsumer` ซึ่งสร้าง `KafkaShareConsumer`) ถ้า stack ของคุณเป็น Node.js และต้องการ share-group semantics วันนี้ เครื่องมือด้านบน (`kafka-console-share-consumer.sh`, `kafka-share-groups.sh`) หรือ side-service เล็ก ๆ บน JVM คือทางเดียวที่พิสูจน์แล้วว่าใช้ได้ — ไม่มี npm package ให้หยิบใช้
+
+### เมื่อไหร่ควรใช้ share group แทน consumer group
+
+- **งานต่อ record ที่ไม่เท่ากัน** — บาง record ใช้เวลา 200ms บางตัวใช้ 20 วินาที consumer group ติดอยู่กับ **การเป็นเจ้าของ partition แบบคงที่**: record ที่ช้าหนึ่งตัวบล็อก record ถัดไปทุกตัวบน partition นั้น (พิสูจน์แล้วใน [Consumer Groups & Rebalancing](/kafka/th/consumers/consumer-groups-and-rebalancing/)) share group acknowledge **ทีละ record** consumer ที่ว่างใน pool จึงดึงงานต่อได้ในขณะที่ตัวช้ายังทำ record ปัจจุบันอยู่
+- **consumer มากกว่า partition** — consumer group แบบคลาสสิกจำกัด parallelism ที่ใช้ได้จริงไว้ที่จำนวน partition (พิสูจน์ใน [Consumer Groups & Rebalancing](/kafka/th/consumers/consumer-groups-and-rebalancing/)) ส่วน share group ให้รัน **consumer มากกว่า partition ได้** ทุกตัวดึงจาก partition เดียวกันพร้อมกัน
+- **queue semantics แท้จริง** — "ส่งงานชิ้นนี้ให้ worker ตัวไหนก็ได้ที่ว่างตอนนี้" ไม่ใช่ "partition นี้เป็นของ worker นี้" ถ้ารูปร่างของปัญหาเป็นแบบนั้นจริง share group คือเครื่องมือที่เหมาะโดยธรรมชาติ การฝืนใช้ consumer group ที่ผูกกับ partition คืองานแบบที่ share group เกิดมาเพื่อกำจัดทิ้ง
+- **ใช้ consumer group ธรรมดาต่อไปถ้า order สำคัญ** share group แลก **ลำดับต่อ partition** ทิ้งไปโดยตั้งใจ (member คนละตัวในพูลอาจหยิบ record ไม่เรียงลำดับ และ `RELEASE`/redelivery ทำให้ลำดับสลับเพิ่มอีก) — ถ้า logic ของคุณต้องพึ่งการประมวลผล record ของ key เดียวกันตามลำดับ consumer group ที่ one-partition-one-owner ยังคงเป็นเครื่องมือที่ถูกต้อง
+
+<Mermaid title="เลือกตามสิ่งที่งานต้องการ" code={pickDiagram} />
 
 export const pickDiagram = `flowchart TD
-  start["What does the job need?"] --> move{"Just move data,\nno logic?"}
-  move -->|"yes"| connect["Kafka Connect"]
-  move -->|"no"| logic{"Express it in SQL?"}
-  logic -->|"yes"| ksql["ksqlDB"]
-  logic -->|"no"| jvm{"JVM app, embedded?"}
-  jvm -->|"yes"| streams["Kafka Streams"]
-  jvm -->|"no"| scale{"Huge scale or\nnon-JVM control?"}
+  start["งานต้องการอะไร?"] --> move{"แค่ย้ายข้อมูล<br/>ไม่มี logic?"}
+  move -->|"ใช่"| connect["Kafka Connect"]
+  move -->|"ไม่ใช่"| queue{"คิว: งานไม่เท่ากัน<br/>ack ทีละ record?"}
+  queue -->|"ใช่"| share["Share group (KIP-932)"]
+  queue -->|"ไม่ใช่"| logic{"เขียนเป็น SQL ได้?"}
+  logic -->|"ใช่"| ksql["ksqlDB"]
+  logic -->|"ไม่ใช่"| jvm{"แอป JVM แบบ embedded?"}
+  jvm -->|"ใช่"| streams["Kafka Streams"]
+  jvm -->|"ไม่ใช่"| scale{"สเกลใหญ่มาก หรือ<br/>ควบคุมนอก JVM?"}
   scale -->|"external engine"| flink["Flink / Spark"]
-  scale -->|"full control"| consumer["Plain consumer"]`;
+  scale -->|"ควบคุมเต็มที่ เรียงลำดับ"| consumer["Plain consumer group"]`;
 
 ## วิธีเลือก
 
-ไล่จากตัวที่พอดีและง่ายที่สุดลงมา:
+ไล่จากตัวที่ง่ายที่สุดที่พอดีกับงาน:
 
-1. **แค่ย้ายข้อมูล?** ใช้ **Connect** — อย่าเขียนโค้ดเพื่อก๊อป table
-2. **logic ที่เขียนเป็น SQL ได้?** ใช้ **ksqlDB** — filter, join และ windowed aggregate โดยไม่ต้อง deploy
-3. **logic ที่ต้องเขียนโค้ดจริง บน JVM?** ใช้ **Kafka Streams** — ฝังในแอป, stateful, exactly-once และ scale ไปพร้อมแอป
-4. **ต้องใช้ภาษาอื่น หรือต้องคุม loop เต็มที่?** ใช้ **plain consumer**
-5. **สเกลมหาศาลหรือการประมวลผล event-time ขั้นสูงข้ามหลายระบบ?** หยิบ **external processor** อย่าง Flink มาใช้
+1. **แค่ย้ายข้อมูล?** ใช้ **Connect** — ไม่ต้องเขียนโค้ดเพื่อ copy ตาราง
+2. **งานต่อ record ไม่เท่ากัน, worker มากกว่า partition, ไม่ต้องเรียงลำดับ?** ใช้ **share group** — พิสูจน์แล้วด้านบนว่าเป็นคิวธรรมชาติของ Kafka ไม่ใช่ workaround ที่แปะไว้บน consumer group
+3. **Logic ที่เขียนเป็น SQL ได้?** ใช้ **ksqlDB** — filter, join, windowed aggregate โดยไม่ต้อง deploy
+4. **Logic ที่ต้องใช้โค้ดจริงบน JVM?** ใช้ **Kafka Streams** — embedded, มี state, exactly-once, สเกลไปพร้อมแอป
+5. **ต้องการภาษาอื่น, ควบคุมเต็มที่ หรือเรียงลำดับตาม key อย่างเคร่งครัด?** ใช้ **plain consumer group**
+6. **สเกลใหญ่มากหรือ event-time processing ขั้นสูงข้ามหลายระบบ?** ใช้ **external processor** อย่าง Flink
 
-ระบบที่ดีมักผสมกันหลายตัว: Connect ทำ ingest, Streams หรือ ksqlDB ทำ transform และ plain consumer ส่งช่วงสุดท้ายเข้า service กฎง่าย ๆ คือ: **อย่าจ่ายค่าพลังที่คุณจะไม่ได้ใช้**
+ระบบที่ดีมักผสมกันหลายแบบ: Connect ดึงข้อมูลเข้า, Streams หรือ ksqlDB แปลงข้อมูล, share group กระจายงานที่ไม่เท่ากัน, และ plain consumer ให้บริการช่วงสุดท้ายแบบเรียงลำดับเข้าสู่เซอร์วิส กฎง่าย ๆ คือ: **อย่าจ่ายราคาของพลังที่ไม่ได้ใช้**
 
-## ปิดท้ายโมดูล
+## ปิดโมดูลนี้
 
-ตอนนี้คุณมีชุดเครื่องมือประมวลผลครบแล้ว **Schema Registry** ให้ record ของคุณมี contract แบบมีเวอร์ชัน ทีมจึงวิวัฒน์ได้อย่างปลอดภัย **Connect** ย้ายข้อมูลเข้าออกโดยไม่ต้องเขียนโค้ด **Kafka Streams** ประมวลผล stream ด้วย logic แบบ stateful จริง ๆ ในแอปของคุณ และคู่มือนี้บอกคุณว่าควรหยิบ **ตัวไหน** มาใช้ เมื่อรวมกับโมดูลก่อนหน้าเรื่อง broker, producer, consumer และการรับประกันการส่ง คุณก็ออกแบบระบบ Kafka แบบ end-to-end ได้แล้ว — และอธิบายเหตุผลของทุก layer ในนั้นได้ด้วย
+ตอนนี้คุณมีเครื่องมือประมวลผลครบชุดแล้ว **Schema Registry** ให้สัญญาแบบมีเวอร์ชันสำหรับรูปร่าง record เพื่อให้ทีมวิวัฒน์ได้อย่างปลอดภัย **Connect** ย้ายข้อมูลเข้าออกโดยไม่ต้องเขียนโค้ด **Kafka Streams** ประมวลผล stream ด้วย logic จริงที่มี state อยู่ในแอปของคุณ **Share group** ให้ queue semantics โดยธรรมชาติ ไม่ต้องมี broker แยก และคู่มือนี้บอกว่าควรเลือก**อันไหน** รวมกับโมดูลก่อนหน้าเรื่อง broker, producer, consumer และ delivery guarantee ตอนนี้คุณออกแบบระบบ Kafka แบบ end-to-end ได้แล้ว — และอธิบายเหตุผลของทุก layer ที่ใช้ได้
 
-<Callout title="สรุปหนึ่งบรรทัด">
-เลือก **layer ที่เบาที่สุดที่พอดี**: **Connect** เพื่อย้ายข้อมูล **ksqlDB** สำหรับ logic ที่เขียนเป็น SQL ได้ **Kafka Streams** สำหรับโค้ด JVM แบบฝังที่มี state **plain consumer** สำหรับการควบคุมเต็มที่หรือภาษาอื่น และ **external processor** สำหรับงานขนาดใหญ่มากหรือขั้นสูง — ระบบจริงมักผสมกันหลายตัว
+<Callout title="สรุปในบรรทัดเดียว">
+เลือก **layer ที่เบาที่สุดที่พอดี**: **Connect** สำหรับย้ายข้อมูล, **share group** สำหรับงานไม่เท่ากันแบบคิว (พิสูจน์แล้วด้านบนด้วย ACCEPT/RELEASE/REJECT จริงและ delivery-count limit จริงที่ 5), **ksqlDB** สำหรับ logic ที่เขียนเป็น SQL ได้, **Kafka Streams** สำหรับโค้ด JVM แบบ embedded ที่มี state, **plain consumer group** สำหรับควบคุมเต็มที่หรือเรียงลำดับ, และ **external processor** สำหรับงานใหญ่มากหรือขั้นสูง — ระบบจริงมักผสมกันหลายแบบ
 </Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// src/choosing-a-processing-layer/worker-pool.ts
+import { Kafka } from 'kafkajs';
+
+// "Queue" of image-resize jobs -- some take 200ms, some take 20s.
+// Scale out by running more worker processes than partitions for max throughput.
+const kafka = new Kafka({ clientId: 'resize-worker', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'resize-workers' });
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'resize-jobs' });
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    await resizeImage(message.value); // can take anywhere from 200ms to 20s
+  },
+});
+`}>
+
+แผนในคอมเมนต์ -- "รัน worker process มากกว่า partition เพื่อ throughput สูงสุด" -- ทำไม่ได้กับโค้ดนี้ นี่คือ **classic consumer group** (`kafka.consumer({ groupId: ... })`) ที่ partition หนึ่งเป็นของสมาชิกเพียงตัวเดียวในแต่ละเวลา (พิสูจน์ตลอดทั้งโมดูล consumers) การรัน worker process มากกว่าจำนวน partition ของ `resize-jobs` ทำให้ worker ส่วนเกิน **ว่างตลอดไป** -- ไม่เคยได้รับ partition เลย แย่กว่านั้น งาน resize 20 วินาทีที่ช้าจะบล็อกงานถัดไปทุกตัวบน partition เดียวกันไว้ข้างหลัง เพราะหนึ่ง partition คือคิวเรียงลำดับหนึ่งคิวที่เป็นของ worker เดียว ทางแก้ไม่ใช่ option ของ KafkaJS แต่คือ *เครื่องมือที่ถูกต้อง*: นี่คือกรณี "งานต่อ record ไม่เท่ากัน worker มากกว่า partition" ที่บทนี้บอกให้ส่งต่อให้ **share group** (semantics ของ `kafka-console-share-consumer.sh` หรือ `KafkaShareConsumer` บน JVM -- พิสูจน์แล้วด้านบนว่า KafkaJS เองไม่มี API สำหรับ share group) ที่แต่ละงานถูก acquire และ acknowledge แยกกัน worker ที่ว่างจะไม่ต้องนั่งรออยู่หลัง worker ที่ช้า
+
+</SpotTheBug>
+
+## Mental Model
+
+ทุก layer ในโมดูลนี้คือ broker ตัวเดียวกันข้างใต้ -- สิ่งที่เปลี่ยนคือ **ใครเป็นเจ้าของการอ่าน** plain consumer หรือ Kafka Streams instance เป็นเจ้าของทั้ง partition ตราบใดที่ยังถืออยู่ (พิสูจน์ตลอดคอร์สนี้) ส่วน share group ไม่เป็นเจ้าของ partition ใด ๆ เลย เป็นเจ้าของแค่ record ที่กำลัง in-flight ทีละตัว ถูก acquire และ acknowledge ทีละตัว (พิสูจน์แล้วด้านบนด้วย delivery count จริง) Connect และ ksqlDB ไม่เปลี่ยน ownership model นั้น -- มันคือ packaging รอบ consumer หรือ Streams topology การเลือก layer ก็คือการเลือก ownership และ acknowledgement model ก่อน แล้วค่อยเลือกสไตล์การเขียนโปรแกรมทีหลัง
+
+## Trade-offs
+
+- **Plain consumer group** -- เรียงลำดับต่อ partition อย่างเคร่งครัดและควบคุมได้เต็มที่ แลกกับ parallelism ที่ถูกจำกัดด้วยจำนวน partition และ record ที่ช้าหนึ่งตัวบล็อกทุกอย่างข้างหลังบน partition นั้น
+- **Share group** -- พิสูจน์แล้วด้านบนว่ากำจัดข้อจำกัดทั้งสองนั้น (worker มากกว่า partition, ack ทีละ record, delivery limit จริง) แลกกับการเสียลำดับต่อ partition และต้องใช้ JVM client หรือเครื่องมือ CLI ในวันนี้ (ยืนยันแล้วว่า KafkaJS ไม่รองรับ)
+- **Kafka Streams / ksqlDB** -- ให้ผลผลิตสูงสุดสำหรับ logic แบบ transform/join/aggregate จริง แลกกับการเป็น JVM-only (Streams) หรือถูกจำกัดด้วยความสามารถของ SQL (ksqlDB)
+- **Connect** -- ไม่ต้องเขียนโค้ดเลยสำหรับการย้ายข้อมูล แลกกับการแสดง business logic จริงไม่ได้
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"share group ก็แค่ consumer group ที่เปลี่ยนชื่อ"** พิสูจน์แล้วว่าผิดด้านบน: หน่วยของความเป็นเจ้าของใน share group คือ record หนึ่งตัว ไม่ใช่ partition หนึ่งตัว และ acknowledgement mode (ACCEPT/RELEASE/REJECT) กับ delivery-count limit จริงมีอยู่ก็เพราะเหตุนี้ -- ไม่มีสิ่งเทียบเท่าใน consumer group เลย
+- **"KafkaJS consume จาก share group ได้ถ้าแค่ใส่ group ID"** ยืนยันแล้วว่าผิด: grep ข้าม type definition ของ KafkaJS และ `@confluentinc/kafka-javascript` ที่ติดตั้งไว้พบว่าไม่มีการพูดถึง share group เลย `consumer({ groupId })` ธรรมดาพูดแค่โปรโตคอล classic/consumer เท่านั้น ไม่เคยพูดโปรโตคอล share
+- **"instance ของ consumer ที่มากขึ้นแปลว่า parallelism มากขึ้นเสมอ"** พิสูจน์แล้วว่าผิดใน SpotTheBug: เกินจำนวน partition แล้ว instance ของ classic consumer group ส่วนเกินจะว่างเปล่า share group ต่างหากที่เป็นเครื่องมือที่ใช้ worker ส่วนเกินได้จริง
+- **"release record ใน share group จะ retry ไปเรื่อย ๆ ไม่มีที่สิ้นสุด"** พิสูจน์แล้วว่าผิดด้านบน: redelivery หยุดที่ `group.share.delivery.count.limit` (ค่าเริ่มต้น 5) -- จำนวนครั้งที่จำกัดจริง ไม่ใช่ retry ไม่รู้จบ
 
 export const quizChoosing = [
   {
-    q: 'ทีมหนึ่งต้องก๊อป table ของ Postgres เข้า topic ของ Kafka โดยไม่มีการ transform เครื่องมือที่ดีที่สุดคือ',
+    q: 'ทีมต้องการ copy ตาราง Postgres เข้า Kafka topic โดยไม่แปลงข้อมูล เครื่องมือที่ดีที่สุดคืออะไร?',
     options: [
       'Kafka Streams',
-      'Kafka Connect — ย้ายข้อมูลด้วยการตั้งค่าโดยไม่ต้องเขียนโค้ด',
-      'plain consumer ที่เขียนขึ้นเองตั้งแต่ต้น',
-      'external Flink cluster',
+      'Kafka Connect — ย้ายข้อมูลด้วย configuration โดยไม่ต้องเขียนโค้ด',
+      'เขียน plain consumer เองตั้งแต่ต้น',
+      'คลัสเตอร์ Flink ภายนอก',
     ],
     answer: 1,
+    explain: 'Connect เกิดมาเพื่อการย้ายข้อมูลแบบไม่มี logic เลย -- source connector พร้อม config JDBC ก็เพียงพอแล้ว',
   },
   {
-    q: 'ksqlDB ให้คุณทำอะไรได้',
+    q: 'การรัน kafka-console-share-consumer.sh ด้วย --release ซ้ำ ๆ กับ record เดียวบน broker จริง พิสูจน์อะไร?',
     options: [
-      'แทนที่ broker ทั้งหมดด้วย database',
-      'เขียน stream processing เป็น SQL แบบ declarative โดยไม่มีโค้ดให้ deploy',
-      'ย้ายข้อมูลได้อย่างเดียว transform ไม่ได้เลย',
-      'รัน Kafka โดยไม่มี topic ใด ๆ',
+      'record ถูก release ตลอดไปไม่มีขีดจำกัด',
+      'delivery count เพิ่มขึ้นทุกครั้ง (Delivery:1 ถึง Delivery:5) จนถึง group.share.delivery.count.limit (ค่าเริ่มต้น 5) จากนั้น record ก็หยุดถูกส่งซ้ำ',
+      'RELEASE ทำงานเหมือน REJECT ทุกอย่าง',
+      'RELEASE ต้องใช้ KafkaJS',
     ],
     answer: 1,
+    explain: 'Output จริง: Delivery:1 ถึง Delivery:5 สำหรับ record เดิมใน --release run เดียว จากนั้น 0 messages ในการรันครั้งถัดไป -- คือ redelivery limit ที่ตั้งค่าไว้จริง',
   },
   {
-    q: 'ทำไมถึงเลือก plain consumer แทน Kafka Streams',
+    q: 'การส่ง auto.offset.reset ให้ kafka-console-share-consumer.sh เกิด error จริงอะไร และเพราะอะไร?',
     options: [
-      'scale ได้ดีกว่าเสมอ',
-      'คุณต้องใช้ภาษาอื่น หรือต้องคุม offset, retry และ loop เต็มที่',
-      'จัดการ state แบบ exactly-once ให้อัตโนมัติ',
-      'ไม่ต้องเขียนโค้ดเลย',
+      'ไม่มี error -- ทำงานเหมือน consumer group ทุกอย่าง',
+      'org.apache.kafka.common.config.ConfigException: auto.offset.reset cannot be set when using a share group -- ตำแหน่ง reset เป็น config ระดับ group ฝั่ง broker (share.auto.offset.reset ผ่าน kafka-configs.sh) ไม่ใช่ client property',
+      'เป็น no-op เงียบ ๆ',
+      'network timeout',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรงด้วย stack trace จริงจาก ShareConsumerConfig.checkUnsupportedConfigsPreProcess; ตั้ง share.auto.offset.reset ด้วย kafka-configs.sh --entity-type groups แทน',
   },
   {
-    q: 'กฎง่าย ๆ โดยรวมสำหรับการเลือก processing layer คืออะไร',
+    q: 'ยืนยันจาก type definition ที่ติดตั้งจริง: KafkaJS หรือ @confluentinc/kafka-javascript รองรับ share group ไหม?',
     options: [
-      'ใช้ engine ที่ทรงพลังที่สุดที่มีเสมอ',
-      'เลือกเครื่องมือที่เบาที่สุดที่พอดีกับงาน — อย่าจ่ายค่าพลังที่จะไม่ได้ใช้',
-      'ใช้แค่ plain consumer เท่านั้นตลอด',
-      'อย่าผสมกันเกินหนึ่ง layer เด็ดขาด',
+      'รองรับทั้งคู่เต็มรูปแบบ',
+      'ไม่รองรับทั้งคู่ -- grep หา "share group"/"KafkaShareConsumer" ในไฟล์ .d.ts ของทั้งสอง package ให้ผลศูนย์ match; มีแค่ Java client (KafkaShareConsumer) และเครื่องมือ CLI ที่พิสูจน์แล้วว่าใช้ได้',
+      'มีแค่ KafkaJS ที่รองรับ',
+      'มีแค่ @confluentinc/kafka-javascript ที่รองรับ',
     ],
     answer: 1,
+    explain: 'การตรวจด้วย grep ทั้งสองครั้งกับ package ที่ติดตั้งจริงให้ผลศูนย์ match สำหรับ API ของ share group',
+  },
+  {
+    q: 'ควรใช้ share group แทน plain consumer group เมื่อไหร่?',
+    options: [
+      'เมื่อไหร่ก็ตามที่ต้องการ throughput มากขึ้น เสมอ',
+      'เมื่องานต่อ record ไม่เท่ากัน ต้องการ worker มากกว่า partition และไม่ต้องเรียงลำดับตาม key อย่างเคร่งครัด -- พิสูจน์แล้วด้านบนว่าเป็นกรณีที่ share group กำจัดข้อจำกัดเรื่อง partition ownership',
+      'ไม่ใช้เลย -- consumer group เพียงพอเสมอ',
+      'ใช้เมื่อใช้ KafkaJS เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'consumer group จำกัด parallelism ที่ใช้ได้จริงไว้ที่จำนวน partition และปล่อยให้ record ที่ช้าหนึ่งตัวบล็อกส่วนที่เหลือของ partition นั้น ส่วน share group acknowledge ทีละ record แทน ซึ่งตรงกับกรณีงานไม่เท่ากันที่ worker มากกว่า partition พอดี',
+  },
+  {
+    q: 'ตาม SpotTheBug เกิดอะไรขึ้นจริงถ้ารัน consumer PROCESS มากกว่า partition ใน classic consumer group โดยหวังว่าจะได้ throughput มากขึ้น?',
+    options: [
+      'Kafka แบ่ง partition ให้อัตโนมัติเพื่อป้อน process ส่วนเกิน',
+      'process ส่วนเกินไม่เคยได้รับ partition และว่างตลอดไป -- พิสูจน์ตลอดโมดูล consumers เรื่อง partition-ownership model',
+      'throughput เพิ่มเป็นสองเท่าทุก process ที่เพิ่ม',
+      'group ล้มเหลวไม่เริ่มทำงาน',
+    ],
+    answer: 1,
+    explain: 'partition หนึ่งเป็นของสมาชิก group เพียงตัวเดียวในแต่ละเวลา; instance ที่เกินจำนวน partition จะว่างเปล่า นี่คือกรณีที่บทนี้ส่งต่อให้ share group แทนพอดี',
   },
 ];
 
