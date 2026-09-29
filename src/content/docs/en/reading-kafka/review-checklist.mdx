@@ -1,0 +1,119 @@
+---
+title: Review checklist
+description: 'A one-page, eight-group checklist for reviewing Kafka code — each line a yes/no question linking the catalog entry and the tool that proves it.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+This is the checklist to run down — by eye, on any diff, yours or an AI's — after the tools in **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)** have run and come back clean. It fits on one printed page on purpose: a checklist nobody actually opens during a review is worthless. Every line links the catalog entry that explains *why*, so this page stays a list, not a re-run of the course. The groups follow the same order as **[How to read Kafka code you did not write](/kafka/en/reading-kafka/)**, plus a final Tooling group covering how each of the other seven actually gets verified.
+
+<Mermaid title="What actually catches each group, if anything" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["Client &amp; versions"] --> T["Mostly human review<br/>(silently-ignored keys, unmaintained defaults)"]
+  W["Producer"] --> P["Partial: tsc catches nothing here,<br/>only a real send reveals the gap"]
+  S["Consumer loop &amp; commits"] --> R["Needs a real restart or timeout to surface"]
+  N["Delivery &amp; transactions"] --> R
+  ST["Topic &amp; broker config"] --> M["Accepted, not rejected --<br/>--describe/--under-min-isr-partitions shows it"]
+  Sec["Ops &amp; security"] --> T2["CLI/broker rejects outright --<br/>easiest group to catch mechanically"]
+  O["Connect/Streams/Schema"] --> M2["REST /config/validate + /connector-plugins,<br/>not source-vs-sink semantics"]
+`;
+
+## Client & versions
+
+- Does the code import `kafkajs` or `@confluentinc/kafka-javascript` — and does the reviewer know which one before judging any default? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 3.
+- Does a KafkaJS config object carry a Java-client-only key (`group.protocol=consumer`, KIP-848) that gets silently dropped rather than rejected? See entry 2.
+- Does any shell script pass `--zookeeper` to a `kafka-*.sh` tool? Removed outright in Kafka 4.0. See entry 1.
+- Does a comment assume every compression codec or the "sticky" partition assigner ships natively on KafkaJS, when it ships only `gzip` and only `RoundRobinAssigner`? See entry 3.
+
+## Producer
+
+- Is `idempotent: true` ever set explicitly on a producer whose writes matter, rather than left at KafkaJS's real default of `false`? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 4, and **[Idempotent Producer](/kafka/en/producers/idempotent-producer/)**.
+- Does a comment claim a compression codec (`lz4`, `snappy`, `zstd`) that KafkaJS does not ship a real implementation for? See entry 5.
+- Does a producer built with `transactionalId` ever call plain `.send()` directly, instead of wrapping every write in `.transaction()`? See entry 6.
+
+## Consumer loop & commits
+
+- Does anything slow — an HTTP call, an unbounded DB write — run inside `eachMessage`, forgetting that KafkaJS's heartbeat only fires after the handler returns? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 7, proven with a real `coordinator is not aware of this member` eviction, and **[Consumer API](/kafka/en/consumers/consumer-api/)**.
+- Does a manual `commitOffsets` call pass the offset just read, instead of `offset + 1`? See entry 8, proven with a real duplicate on restart.
+- Once a record is routed to a dead-letter topic, does the code commit the *original* message's offset? See entry 9, proven with a real permanent reprocessing loop.
+
+## Delivery & transactions
+
+- Does a consume-transform-produce loop commit its consumer offset with a *separate* `commitOffsets` call, instead of `txn.sendOffsets()` inside the same transaction? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 10, proven with a real post-crash duplicate, and **[Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/)**.
+- Was `readUncommitted` ever flipped to `true` to "fix" records that were, in fact, deliberately aborted? See entry 11.
+- Does retry/abort logic check `error.retriable` before deciding to retry, or does it retry a fenced, fatal error forever? See entry 12, proven with a real `retriable: false` fencing error.
+
+## Topic & broker config
+
+- Does a topic's `replication-factor` actually support the `min.insync.replicas` it sets — or is the combination accepted silently per KIP-579? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 13, and **[Acks and Durability](/kafka/en/producers/acks-and-durability/)**.
+- Does adding partitions to an already-keyed topic happen with a plan for readers relying on per-key ordering — and does every long-lived producer/consumer client get a metadata refresh? See entry 14.
+- Is `auto.create.topics.enable` (or any other static broker config) ever assumed to take effect from a live `kafka-configs.sh --alter` call? See entry 15, proven with a real `InvalidRequestException`.
+
+## Ops & security
+
+- Does any script or runbook reference a CLI tool that does not exist (`kafka-metadata.sh`)? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 16, proven with a real "no such file" error.
+- Does any command pass a flag that does not exist on the real tool (`--run-all`)? See entry 17, proven with a real `UnrecognizedOptionException`.
+- Does a runbook call `kafka-acls.sh` on a cluster that never configured `authorizer.class.name`? See entry 18, proven with a real `SecurityDisabledException`, and **[Security and Production](/kafka/en/operations-and-production/security-and-production/)**.
+
+## Connect / Streams / Schema
+
+- Is Connect deployed `standalone` for anything that needs fault tolerance, rather than `connect-distributed.sh`? See the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**, entry 19.
+- Does a connector config reference a class that is on `plugin.path`, not just present somewhere on disk? See entry 19, proven with a real `ClassNotFoundException`-shaped `BadRequestException` despite the jar existing.
+- Is `errors.deadletterqueue.topic.name` set together with `errors.tolerance=all` (real default: `none`) — and only on a **sink** connector? See entry 20, proven live against a running worker's `/config/validate`.
+- Does code assume a KafkaJS consumer can join a **share group** (KIP-932) at all? See entry 21, proven with a real, empty grep of the client's own type definitions, and **[Choosing a Processing Layer](/kafka/en/streams-connect-schema/choosing-a-processing-layer/)**.
+
+## Tooling
+
+- Is `tsc --noEmit` run over every TypeScript snippet before trusting it compiles — knowing it validates types, never durability, ordering, or commit semantics? See **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)**.
+- Is `kafka-configs.sh --describe --all` run against the real broker before trusting a config key exists and is dynamically alterable, rather than assumed from a tutorial? See **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)**.
+- Does CI run this course's own harness (`npm run verify`, `--run`, `--cli`, `--props`) against every fence, not just a human skim? See **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)**.
+
+<Callout title="A checklist narrows the search, it does not replace it">
+Every line above maps to one of the 21 patterns in the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)** — 18 of which produce zero error at the point they're introduced. Run this list on every diff regardless of how clean `tsc` or a quick manual test came back.
+</Callout>
+
+export const quizReviewChecklist = [
+  {
+    q: "Why does the 'Ops & security' group's coverage diagram say 'CLI/broker rejects outright' while 'Topic & broker config' says 'accepted, not rejected'?",
+    options: [
+      "It's arbitrary -- every group has identical tool coverage",
+      "A hallucinated CLI tool or flag is a client-side parse error the tool itself can detect before any request reaches the broker; a self-contradictory topic config (RF=1 with min.insync.replicas=2) is a semantic question the broker has no cross-check for at creation time",
+      "Topic configs are never validated by any tool",
+      "Ops & security issues always require a live cluster to catch",
+    ],
+    answer: 1,
+    explain: "Proven throughout the AI Bug Catalog: entries 16-18 (hallucinated tools/flags/no authorizer) are real, current rejections the instant the command runs; entry 13 (KIP-579) is accepted at both topic creation AND at produce time, only failing once the single replica's status actually changes.",
+  },
+  {
+    q: "```typescript\nconst producer = kafka.producer({ transactionalId: 'payments-tx-1' });\nawait producer.connect();\nawait producer.send({ topic: 'accounts', messages: [{ value: 'debit' }] });\n```\nWhich checklist group covers reviewing this snippet, and what does catching it depend on?",
+    options: [
+      "Ops & security -- it depends on authorizer configuration",
+      "Producer -- catching it depends on noticing that a producer built with transactionalId never once calls .transaction() anywhere in the file, since kafka.producer() and this exact .send() call both succeed with errorCode 0",
+      "Topic & broker config -- min.insync.replicas is the issue here",
+      "Tooling -- only kafka-configs.sh catches this",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entry 6: this exact code returns errorCode 0 with zero error of any kind -- the Producer group's checklist item exists precisely because nothing automatic flags a producer that never calls .transaction().",
+  },
+  {
+    q: "Why does the checklist ask specifically whether errors.tolerance=all is set together with errors.deadletterqueue.topic.name, rather than just 'is a DLQ topic name configured'?",
+    options: [
+      "Those two questions are exactly the same thing",
+      "errors.deadletterqueue.topic.name validates and does nothing at all while errors.tolerance stays at its real default of 'none' -- a failing record still fails the task instead of routing anywhere, which is a real, separate incident this checklist item exists to catch before it ships",
+      "errors.tolerance is only relevant for source connectors",
+      "DLQ topic names are validated automatically by the broker",
+    ],
+    answer: 1,
+    explain: "Proven directly against a real, running Connect worker's own /config/validate endpoint: errors.tolerance reports back as 'none' by default -- setting only errors.deadletterqueue.topic.name, without errors.tolerance=all, configures nothing that actually activates.",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-kafka/review-checklist" />

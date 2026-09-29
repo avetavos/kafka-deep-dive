@@ -1,0 +1,119 @@
+---
+title: Review checklist
+description: 'checklist หน้าเดียว แปดกลุ่ม สำหรับ review โค้ด Kafka — แต่ละบรรทัดเป็นคำถามใช่/ไม่ใช่ ที่ลิงก์ไป catalog entry และ tool ที่พิสูจน์มัน'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+นี่คือ checklist ที่ควรไล่ดูด้วยตา บน diff ไหนก็ตาม ของคุณเองหรือของ AI — หลังจาก tool ใน **[Verification Tools](/kafka/th/reading-kafka/verification-tools/)** รันแล้วผ่านสะอาด มันตั้งใจให้พอดีหน้าเดียวตอนพิมพ์: checklist ที่ไม่มีใครเปิดดูจริงระหว่าง review ไม่มีค่าอะไรเลย ทุกบรรทัดลิงก์ไป catalog entry ที่อธิบายว่า *ทำไม* หน้านี้เลยยังเป็นแค่ list ไม่ใช่การรันคอร์สซ้ำ กลุ่มต่าง ๆ เรียงตามลำดับเดียวกับ **[How to read Kafka code you did not write](/kafka/th/reading-kafka/)** บวกกลุ่ม Tooling สุดท้ายที่ครอบคลุมว่าอีกเจ็ดกลุ่มถูกยืนยันได้จริงอย่างไร
+
+<Mermaid title="อะไรจับแต่ละกลุ่มได้จริง ถ้ามี" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["Client &amp; versions"] --> T["Mostly human review<br/>(silently-ignored keys, unmaintained defaults)"]
+  W["Producer"] --> P["Partial: tsc catches nothing here,<br/>only a real send reveals the gap"]
+  S["Consumer loop &amp; commits"] --> R["Needs a real restart or timeout to surface"]
+  N["Delivery &amp; transactions"] --> R
+  ST["Topic &amp; broker config"] --> M["Accepted, not rejected --<br/>--describe/--under-min-isr-partitions shows it"]
+  Sec["Ops &amp; security"] --> T2["CLI/broker rejects outright --<br/>easiest group to catch mechanically"]
+  O["Connect/Streams/Schema"] --> M2["REST /config/validate + /connector-plugins,<br/>not source-vs-sink semantics"]
+`;
+
+## Client & versions
+
+- โค้ด import `kafkajs` หรือ `@confluentinc/kafka-javascript` — และคนรีวิวรู้ว่าเป็นตัวไหนก่อนจะตัดสิน default ไหนเลยหรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 3
+- config object ของ KafkaJS พก key เฉพาะ Java client (`group.protocol=consumer`, KIP-848) ที่ถูกทิ้งเงียบ ๆ แทนที่จะถูกปฏิเสธหรือไม่? ดูรายการ 2
+- script shell ไหนส่ง `--zookeeper` ให้ tool `kafka-*.sh` หรือไม่? ถูกถอดออกเต็ม ๆ ตั้งแต่ Kafka 4.0 ดูรายการ 1
+- comment สมมติว่าทุก compression codec หรือ partition assigner แบบ "sticky" มีให้ในตัวบน KafkaJS ทั้งที่มันมีแค่ `gzip` และแค่ `RoundRobinAssigner` หรือไม่? ดูรายการ 3
+
+## Producer
+
+- `idempotent: true` ถูกตั้งชัดเจนบน producer ที่ write ของมันสำคัญ แทนที่จะทิ้งไว้ที่ default จริงของ KafkaJS คือ `false` หรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 4 และ **[Idempotent Producer](/kafka/th/producers/idempotent-producer/)**
+- comment อ้าง compression codec (`lz4`, `snappy`, `zstd`) ที่ KafkaJS ไม่มี implementation จริงให้หรือไม่? ดูรายการ 5
+- producer ที่สร้างด้วย `transactionalId` เคยเรียก `.send()` ตรง ๆ แทนการห่อทุก write ด้วย `.transaction()` หรือไม่? ดูรายการ 6
+
+## Consumer loop & commits
+
+- มีอะไรที่ช้า — HTTP call, DB write ที่ไม่มีขอบเขต — รันอยู่ใน `eachMessage` โดยลืมว่า heartbeat ของ KafkaJS ยิงแค่หลัง handler return แล้วหรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 7 พิสูจน์ด้วย eviction จริงแบบ `coordinator is not aware of this member` และ **[Consumer API](/kafka/th/consumers/consumer-api/)**
+- การเรียก `commitOffsets` แบบ manual ส่ง offset ที่อ่านมาเมื่อกี้ แทนที่จะเป็น `offset + 1` หรือไม่? ดูรายการ 8 พิสูจน์ด้วย duplicate จริงตอน restart
+- พอ record ถูก route ไป dead-letter topic แล้ว โค้ด commit offset ของ message *ต้นฉบับ* หรือไม่? ดูรายการ 9 พิสูจน์ด้วย loop ประมวลผลซ้ำถาวรจริง
+
+## Delivery & transactions
+
+- loop consume-transform-produce commit consumer offset ด้วยการเรียก `commitOffsets` *แยก* แทน `txn.sendOffsets()` ภายใน transaction เดียวกันหรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 10 พิสูจน์ด้วย duplicate จริงหลัง crash และ **[Exactly-Once Processing](/kafka/th/delivery-and-transactions/exactly-once-processing/)**
+- `readUncommitted` เคยถูกสลับเป็น `true` เพื่อ "แก้" record ที่จริง ๆ ถูก abort ไปตั้งใจหรือไม่? ดูรายการ 11
+- logic retry/abort เช็ค `error.retriable` ก่อนตัดสินใจ retry ไหม หรือ retry error ที่ fenced และ fatal ไปตลอดกาล? ดูรายการ 12 พิสูจน์ด้วย fencing error จริงที่ `retriable: false`
+
+## Topic & broker config
+
+- `replication-factor` ของ topic รองรับ `min.insync.replicas` ที่มันตั้งจริงหรือไม่ — หรือ combination นี้ถูกรับเงียบ ๆ ตาม KIP-579? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 13 และ **[Acks and Durability](/kafka/th/producers/acks-and-durability/)**
+- การเพิ่ม partition ให้ topic ที่ใช้ key อยู่แล้วมีแผนสำหรับ reader ที่พึ่ง per-key ordering หรือไม่ — และ client producer/consumer ที่รันอยู่นานทุกตัวได้ refresh metadata หรือไม่? ดูรายการ 14
+- `auto.create.topics.enable` (หรือ static broker config อื่น) ถูกสมมติว่ามีผลจากการเรียก `kafka-configs.sh --alter` แบบสด ๆ หรือไม่? ดูรายการ 15 พิสูจน์ด้วย `InvalidRequestException` จริง
+
+## Ops & security
+
+- script หรือ runbook ไหนอ้าง CLI tool ที่ไม่มีอยู่จริง (`kafka-metadata.sh`) หรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 16 พิสูจน์ด้วย error "no such file" จริง
+- command ไหนส่ง flag ที่ไม่มีอยู่จริงบน tool จริง (`--run-all`) หรือไม่? ดูรายการ 17 พิสูจน์ด้วย `UnrecognizedOptionException` จริง
+- runbook เรียก `kafka-acls.sh` บน cluster ที่ไม่เคยตั้ง `authorizer.class.name` หรือไม่? ดูรายการ 18 พิสูจน์ด้วย `SecurityDisabledException` จริง และ **[Security and Production](/kafka/th/operations-and-production/security-and-production/)**
+
+## Connect / Streams / Schema
+
+- Connect ถูก deploy แบบ `standalone` สำหรับอะไรที่ต้องการ fault tolerance แทน `connect-distributed.sh` หรือไม่? ดู **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** รายการ 19
+- connector config อ้าง class ที่อยู่บน `plugin.path` จริง ไม่ใช่แค่มีอยู่บน disk ที่ไหนสักแห่งหรือไม่? ดูรายการ 19 พิสูจน์ด้วย `BadRequestException` รูปร่าง `ClassNotFoundException` จริงทั้งที่ jar มีอยู่
+- `errors.deadletterqueue.topic.name` ถูกตั้งพร้อมกับ `errors.tolerance=all` (default จริง: `none`) — และตั้งบน connector แบบ **sink** เท่านั้นหรือไม่? ดูรายการ 20 พิสูจน์สด ๆ กับ `/config/validate` ของ worker ที่รันจริง
+- โค้ดสมมติว่า KafkaJS consumer เข้าร่วม **share group** (KIP-932) ได้เลยหรือไม่? ดูรายการ 21 พิสูจน์ด้วย grep type definition ของ client เองที่ไม่เจอเลย และ **[Choosing a Processing Layer](/kafka/th/streams-connect-schema/choosing-a-processing-layer/)**
+
+## Tooling
+
+- `tsc --noEmit` ถูกรันบนทุก TypeScript snippet ก่อนเชื่อว่ามัน compile ผ่าน โดยรู้ว่ามันตรวจแค่ type ไม่เคยตรวจ durability, ordering, หรือ commit semantics เลยหรือไม่? ดู **[Verification Tools](/kafka/th/reading-kafka/verification-tools/)**
+- `kafka-configs.sh --describe --all` ถูกรันกับ broker จริงก่อนเชื่อว่า config key มีอยู่จริงและ alter แบบ dynamic ได้ แทนที่จะสมมติจาก tutorial หรือไม่? ดู **[Verification Tools](/kafka/th/reading-kafka/verification-tools/)**
+- CI รัน harness ของคอร์สนี้เอง (`npm run verify`, `--run`, `--cli`, `--props`) กับทุก fence ไม่ใช่แค่คนสไลด์ตาดูหรือไม่? ดู **[Verification Tools](/kafka/th/reading-kafka/verification-tools/)**
+
+<Callout title="checklist แค่แคบการค้นหา ไม่ได้แทนที่มัน">
+ทุกบรรทัดข้างบน map กับหนึ่งใน 21 pattern ของ **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** — 18 ในนั้นให้ error เป็นศูนย์ ณ จุดที่ถูกใส่เข้ามา รัน list นี้กับทุก diff ไม่ว่า `tsc` หรือการทดสอบมือเร็ว ๆ จะดูสะอาดแค่ไหนก็ตาม
+</Callout>
+
+export const quizReviewChecklist = [
+  {
+    q: "ทำไม coverage diagram ของกลุ่ม 'Ops & security' บอกว่า 'CLI/broker rejects outright' ในขณะที่ 'Topic & broker config' บอกว่า 'accepted, not rejected'?",
+    options: [
+      "สุ่มเฉย ๆ -- ทุกกลุ่มมี tool coverage เหมือนกันหมด",
+      "CLI tool หรือ flag ที่หลอนเป็น parse error ฝั่ง client ที่ tool เองตรวจจับได้ก่อน request จะไปถึง broker เลยด้วยซ้ำ ส่วน topic config ที่ขัดแย้งกันเอง (RF=1 กับ min.insync.replicas=2) เป็นคำถามทาง semantic ที่ broker ไม่มี cross-check ให้ตอนสร้างเลย",
+      "topic config ไม่เคยถูกตรวจด้วย tool ไหนเลย",
+      "ปัญหา Ops & security ต้องมี cluster จริงถึงจะจับได้เสมอ",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตลอด AI Bug Catalog: รายการ 16-18 (tool/flag ที่หลอน, ไม่มี authorizer) เป็นการปฏิเสธจริง current ทันทีที่ command รัน; รายการ 13 (KIP-579) ถูกรับทั้งตอนสร้าง topic และตอน produce จะพังก็แค่ตอนสถานะของ replica เดียวนั้นเปลี่ยนจริง ๆ",
+  },
+  {
+    q: "```typescript\nconst producer = kafka.producer({ transactionalId: 'payments-tx-1' });\nawait producer.connect();\nawait producer.send({ topic: 'accounts', messages: [{ value: 'debit' }] });\n```\nกลุ่มไหนใน checklist ครอบคลุมการ review snippet นี้ และการจับมันขึ้นกับอะไร?",
+    options: [
+      "Ops & security -- ขึ้นกับการตั้ง authorizer",
+      "Producer -- การจับขึ้นกับการสังเกตว่า producer ที่สร้างด้วย transactionalId ไม่เคยเรียก .transaction() เลยแม้แต่ครั้งเดียวในไฟล์ เพราะ kafka.producer() และการเรียก .send() นี้เป๊ะ ๆ สำเร็จทั้งคู่ด้วย errorCode 0",
+      "Topic & broker config -- min.insync.replicas คือปัญหาที่นี่",
+      "Tooling -- มีแค่ kafka-configs.sh ที่จับสิ่งนี้ได้",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ใน AI Bug Catalog รายการ 6: โค้ดนี้เป๊ะ ๆ คืน errorCode 0 โดยไม่มี error อะไรเลย -- checklist item ของกลุ่ม Producer มีอยู่เพราะไม่มีอะไรอัตโนมัติที่ flag producer ที่ไม่เคยเรียก .transaction() เลย",
+  },
+  {
+    q: "ทำไม checklist ถึงถามเจาะจงว่า errors.tolerance=all ถูกตั้งพร้อมกับ errors.deadletterqueue.topic.name หรือไม่ แทนที่จะถามแค่ 'ตั้งชื่อ DLQ topic ไว้หรือยัง'?",
+    options: [
+      "สองคำถามนี้เหมือนกันเป๊ะ",
+      "errors.deadletterqueue.topic.name validate ผ่านแต่ไม่ทำอะไรเลย ตราบใดที่ errors.tolerance ยังอยู่ที่ default จริงคือ 'none' -- record ที่ fail ยังทำให้ task fail แทนที่จะ route ไปไหน ซึ่งเป็นเหตุการณ์จริงแยกต่างหากที่ checklist item นี้มีอยู่เพื่อจับก่อน ship",
+      "errors.tolerance เกี่ยวข้องแค่กับ source connector",
+      "ชื่อ DLQ topic ถูก validate อัตโนมัติโดย broker",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรงกับ endpoint /config/validate ของ Connect worker ที่รันจริง: errors.tolerance รายงานกลับมาเป็น 'none' โดย default -- การตั้งแค่ errors.deadletterqueue.topic.name โดยไม่มี errors.tolerance=all ไม่ configure อะไรที่ทำงานจริงเลย",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-kafka/review-checklist" />
