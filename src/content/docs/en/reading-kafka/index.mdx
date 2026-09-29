@@ -1,8 +1,180 @@
 ---
-title: 'reading-kafka'
-description: 'placeholder — being written'
+title: How to read Kafka code you did not write
+description: 'A reading order for AI-generated Kafka code — client and version first, then broker/topic config, producer config, consumer loop, delivery semantics, ops and security, then Connect/Streams/Schema — because most of what makes generated Kafka code wrong runs cleanly and loses data or duplicates it, later, quietly.'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+Every earlier module in this course taught you to *write* Kafka clients, topics, and configuration. This module teaches the other half: reading a producer, a consumer loop, a `docker-compose.yml`, or a `.properties` file someone — or something — else wrote, and deciding whether it is actually correct. An AI assistant hands you a KafkaJS consumer that connects, subscribes, and prints messages to the console on the first try, and that success is the trap: **`tsc --noEmit` type-checks it, the broker accepts every config key, and the demo runs perfectly** — while the code silently drops the durability guarantee the training data it copied from was actually demonstrating. Kafka's client libraries validate almost nothing semantic: KafkaJS will happily construct a producer with `idempotent` left at its real default of `false`, accept a consumer that commits the wrong offset, and let a transactional producer's writes bypass the transaction entirely — with zero warning, because none of that is a type error or a malformed request.
+
+Three training-data problems compound this. First, Kafka's client landscape genuinely changed shape mid-corpus: ZooKeeper was removed in **Kafka 4.0**, KIP-848's `group.protocol=consumer` reached GA, and **KafkaJS itself has been unmaintained since 2023-02-27** — so a huge fraction of "current" Kafka tutorials online describe a `--zookeeper` flag, a JVM-client-only setting, or a client nobody is fixing bugs in anymore, all of it still fluent-looking. Second, a majority of public KafkaJS examples are demo-grade — a quickstart tuned to "it printed a message," never a payments pipeline tuned for "it never loses one," so defaults that are fine for a demo (`acks` unset, `idempotent` unset, `autoCommit` left on) get copied verbatim into code that cannot afford them. Third, the fastest fix to almost any Kafka error an AI assistant reaches for is a config value copied from wherever it last saw that error text fixed — `enable.idempotence=false` "fixes" a duplicate-key error on the Java client by disabling the guarantee that prevents duplicates, and `unclean.leader.election.enable=true` "fixes" an offline-partition incident by trading away the promise that a leader is never elected from stale data. The seven steps below are the order that actually surfaces these failures, and every later lesson in this module drills one part of it.
+
+<Mermaid title="Reading order for Kafka code you did not write" code={readingOrderDiagram} />
+
+export const readingOrderDiagram = `flowchart TD
+  A["1. Client &amp; version<br/>which client, which Kafka version does the training data assume?"] --> B["2. Broker &amp; topic config<br/>RF, min.insync.replicas, retention -- do the numbers agree with each other?"]
+  B --> C["3. Producer config<br/>acks, idempotent, keys -- durability and ordering, both unvalidated by the client"]
+  C --> D["4. Consumer loop<br/>poll/heartbeat timing, commit offset math, autoCommit"]
+  D --> E["5. Delivery semantics &amp; transactions<br/>sendOffsets vs a separate commit, retriable vs fatal, isolation level"]
+  E --> F["6. Ops &amp; security<br/>hallucinated CLI tools/flags/keys, authorizer, listeners"]
+  F --> G["7. Connect / Streams / Schema<br/>standalone vs distributed, SMT value shapes, compatibility mode"]
+`;
+
+## 1. Client & version
+
+Before anything else, check which Kafka client the code actually uses and which Kafka version its assumptions were written against — because KafkaJS and `@confluentinc/kafka-javascript` disagree on defaults, on which settings even exist, and on which client-side protocol is spoken at all, and training data spans a client that has had no fixes since early 2023.
+
+- **What to look for:** is this KafkaJS (`kafkajs`) or the maintained, `librdkafka`-backed `@confluentinc/kafka-javascript`? Does a config object carry a Java-client-only key (`group.protocol=consumer`, KIP-848) that KafkaJS silently ignores rather than rejects? Does a shell script pass `--zookeeper` to a CLI tool, a flag removed outright in Kafka 4.0? Does the code assume every compression codec or every partition assigner ships natively, when KafkaJS ships only `gzip` and only `RoundRobinAssigner`?
+- **The question to ask:** would this exact option name resolve to anything real on the client actually imported — or does it just get accepted and dropped, silently, because JavaScript object literals don't reject unknown keys the way a typed config class would?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Client & versions group (entries 1–3) for the real, current CLI rejection and the real silent no-op; **[The Producer API](/kafka/en/producers/producer-api/)** and **[Consumer API](/kafka/en/consumers/consumer-api/)** for both clients compared in full depth.
+
+## 2. Broker & topic config
+
+Once you know the client, check whether the topic and broker configuration the code assumes is internally consistent — Kafka accepts contradictory durability settings without complaint, because no single config command sees the whole picture at once.
+
+- **What to look for:** does `replication-factor` actually support the `min.insync.replicas` the same topic sets — or is `min.insync.replicas=2` sitting on a replication factor of 1, silently accepted per **KIP-579**, with `acks=all` writes that succeed today and fail the moment a broker so much as restarts? Is `retention.bytes` the number the comment claims (byte-for-byte, not "roughly a gigabyte")? Is `auto.create.topics.enable` being flipped with a plain `kafka-configs.sh --alter`, assuming it takes effect without a broker restart? Does adding partitions to an already-keyed topic happen without a plan for the readers?
+- **The question to ask:** if this exact topic loses its current leader and reforms a new ISR from scratch, does the configuration on paper still hold the guarantee its `acks`/`min.insync.replicas` combination implies — and does every client that already has this topic's old partition count cached know that it changed?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Topic & broker config group (entries 13–15) for the real silent-accept and the real stale-metadata partition remap; **[Retention and Compaction](/kafka/en/topics-and-partitions/retention-and-compaction/)** and **[Replication and ISR](/kafka/en/topics-and-partitions/replication-and-isr/)** for both mechanisms proven in full.
+
+## 3. Producer config
+
+A producer that connects and sends without error has told you nothing about whether it will lose a message or duplicate one — `acks`, `idempotent`, and the transactional lifecycle are all client-side choices the broker accepts without ever knowing what guarantee the caller thought they were getting.
+
+- **What to look for:** is `idempotent` ever set explicitly, or left at KafkaJS's real default of `false`? Is `acks` set to `0` or `1` on a path that matters, based on a Java-client mental model, when KafkaJS's own default is already `-1`/`all`? Does a comment claim a compression codec (`lz4`, `snappy`, `zstd`) that KafkaJS does not ship natively? Does a producer built with a `transactionalId` ever call plain `.send()` directly, instead of `.transaction()` — silently bypassing the transaction it was configured for?
+- **The question to ask:** if this exact `send()` call is retried by the client after a network blip, does anything about this producer's configuration make that retry safe — and does every write this producer instance makes actually go through the transaction its constructor implies?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Producer group (entries 4–6) for the real source-code defaults and the real silent non-transactional write; **[Idempotent Producer](/kafka/en/producers/idempotent-producer/)** and **[Acks and Durability](/kafka/en/producers/acks-and-durability/)** for both mechanisms in full depth.
+
+## 4. Consumer loop
+
+A consumer's `eachMessage` handler and its commit calls are the two places generated code most often gets subtly, silently wrong — because KafkaJS's heartbeat and its offset semantics both have a real, exact contract the client enforces at exactly the wrong moment to notice in a quick test.
+
+- **What to look for:** does a handler do anything slow — an HTTP call, a DB write with no timeout — inside `eachMessage`, forgetting that KafkaJS's heartbeat only fires *after* the handler returns? Does a manual `commitOffsets` call pass the offset just read, instead of `offset + 1` (the position to *resume from*)? Is `autoCommit` left at its default `true` on a path where a message gets routed to a dead-letter topic — and if so, does the code ever commit the *original* message's offset once that routing succeeds?
+- **The question to ask:** if this handler takes longer than `session.timeout.ms` on a slow day, does the consumer get evicted mid-processing — and if the process restarts right now, does it resume from a position that reprocesses one message twice, or skips one it never actually finished?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Consumer loop & commits group (entries 7–9) for the real `coordinator is not aware of this member` eviction, the real off-by-one duplicate on restart, and the real permanent DLQ loop; **[Consumer API](/kafka/en/consumers/consumer-api/)** and **[Offsets and Commits](/kafka/en/consumers/offsets-and-commits/)** for both mechanisms proven in full.
+
+## 5. Delivery semantics & transactions
+
+Exactly-once processing is assembled from several separate pieces that all have to agree, and Kafka has no single check that confirms they do — a transaction that commits successfully tells you nothing about whether the consumer offset it was supposed to protect was committed atomically with it.
+
+- **What to look for:** does a consume-transform-produce loop commit the consumer offset with a *separate* `commitOffsets` call, instead of `txn.sendOffsets()` inside the same transaction? Was `readUncommitted` ever flipped to `true` as a "fix" for a consumer that seemed to be "missing" records — records that were, in fact, aborted on purpose? Does retry/abort logic ever act on a producer error without checking `error.retriable` first, retrying a fenced, fatal error forever?
+- **The question to ask:** if this producer crashes between the transaction commit and the separate offset commit, does the next run duplicate the downstream write — and does this error-handling branch actually know the difference between "try again" and "this producer is dead, stop"?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Delivery & transactions group (entries 10–12) for the real post-crash duplicate, the real aborted record read back, and the real fatal `KafkaJSProtocolError` retried on purpose; **[Transactions](/kafka/en/delivery-and-transactions/transactions/)** and **[Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/)** for both mechanisms in full.
+
+## 6. Ops & security
+
+Command-line tools and broker security are where hallucination is easiest to catch mechanically — a CLI either has a flag or it does not — and easiest to miss by eye, because the error text alone rarely explains what's actually missing.
+
+- **What to look for:** does a script invoke a tool that does not exist (`kafka-metadata.sh`) or pass a flag that does not exist on a real one (`--run-all`)? Does a runbook call `kafka-acls.sh` on a cluster with `authorizer.class.name` never configured? Does `advertised.listeners` point at a hostname the calling client cannot actually resolve?
+- **The question to ask:** does this exact command run, verbatim, against a real broker of the version this course targets — or does it only look plausible because the flag name and the tool name both sound like ones that exist?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Ops & security group (entries 16–18) for the real `UnrecognizedOptionException` and the real `SecurityDisabledException`; **[Security and Production](/kafka/en/operations-and-production/security-and-production/)** for the full authorizer story.
+
+## 7. Connect / Streams / Schema
+
+Kafka Connect, Streams, and Schema Registry each add their own layer of configuration that is validated even less than the client libraries above — a connector's class name is just a string until the worker actually tries to load it, and a schema's compatibility mode is a promise the registry checks, not the writer.
+
+- **What to look for:** is Connect deployed `standalone` for anything that needs fault tolerance? Does a connector config reference a class that is not actually on the worker's discoverable plugin path, even if the jar exists somewhere on disk? Is `errors.deadletterqueue.topic.name` set without `errors.tolerance=all` — the setting that actually activates it (default `none`)? Does a schema evolution drop a field with no default under `BACKWARD` compatibility? Does code assume a KafkaJS consumer can join a **share group** (KIP-932) at all?
+- **The question to ask:** does the Connect REST API's own `/config/validate` for this exact connector class report this config as clean — and does this exact class name resolve on this exact worker, right now, not in principle?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s Connect/Streams/Schema group (entries 19–21) for the real `ClassNotFoundException` despite the jar existing on disk, and the real, empty KafkaJS type surface for share groups; **[Kafka Connect](/kafka/en/streams-connect-schema/kafka-connect/)**, **[Kafka Streams](/kafka/en/streams-connect-schema/kafka-streams/)**, and **[Schema Registry](/kafka/en/streams-connect-schema/schema-registry/)** for each mechanism proven in full, including this module's own honest limits on what a laptop docker stack can run for each of the three.
+
+## What this module covers next
+
+- **[The AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)** — 21 specific patterns, each with the code AI typically writes, the real, freshly captured output it produces against a live Kafka 4.3.1 broker, and the fix.
+- **[Review Checklist](/kafka/en/reading-kafka/review-checklist/)** — the same 21 patterns as a one-page, seven-group checklist, each line linking the lesson that proves it.
+- **[Verification Tools](/kafka/en/reading-kafka/verification-tools/)** — what `tsc --noEmit`, `kafka-configs.sh --describe --all`, `kafka-topics.sh --describe`, `kafka-consumer-groups.sh`, `kafka-dump-log.sh`, `kafka-console-share-consumer.sh`, `kafka-features.sh`, `kafka-acls.sh`, the Connect and Schema Registry REST APIs, and this course's own harness each actually prove.
+- Three worked reviews — **[Worked Review 1](/kafka/en/reading-kafka/worked-review-1/)**, **[Worked Review 2](/kafka/en/reading-kafka/worked-review-2/)**, **[Worked Review 3](/kafka/en/reading-kafka/worked-review-3/)** — applying this reading order to full, AI-generated services (an order-service producer with acks/idempotence choices to review, a payment consumer built on exactly-once transactions plus a dead-letter queue, and a streaming pipeline spanning Connect, Streams, and Schema Registry). These three lessons are written and maintained separately from this one; if a link below 404s while that work is still in progress, the reading order and the catalog above stand on their own regardless.
+- Every earlier Phase 3 lesson in this course already has its own **`## Reading AI-generated code`** section with a `<SpotTheBug>` — this module's catalog does not repeat those, it groups a new, broader set of 21 patterns around the same reading order. Start from **[What Is Kafka](/kafka/en/foundations/what-is-kafka/)** if you want the full lesson-by-lesson path instead.
+
+## Mental Model
+
+```text
+Reading order for Kafka code you did not write:
+
+1. Client & version        → which client, which Kafka version does this assume?
+2. Broker & topic config   → do RF, min.insync.replicas, and retention actually agree?
+3. Producer config         → acks, idempotent, keys -- durability the client never validates
+4. Consumer loop           → heartbeat timing, commit offset math, autoCommit
+5. Delivery & transactions → sendOffsets vs a separate commit, retriable vs fatal
+6. Ops & security          → hallucinated tools/flags/keys, authorizer, listeners
+7. Connect/Streams/Schema  → standalone vs distributed, SMT value shapes, compatibility
+
+"It ran without an error" answers almost none of these -- most of this module's 21
+catalog entries run cleanly and lose data, duplicate it, or silently do nothing.
+```
+
+## Common Misconceptions
+
+- **"If `tsc` and the broker both accept it, it's correct."** Proven throughout this module's catalog: a KafkaJS producer with `idempotent` left at its real default of `false` type-checks, connects, and sends — the client validates types and connectivity, never the durability guarantee the caller assumed they were getting.
+- **"AI-generated Kafka code just needs a newer prompt."** The problem is not staleness alone — `group.protocol=consumer` is a real, current, GA KIP-848 setting that is simply meaningless on the client it keeps getting copied into (KafkaJS), because that client was never updated to speak it.
+- **"A silent no-op is rarer than a rejected config, so it matters less."** The opposite is closer to true in this catalog: `min.insync.replicas=2` on a replication factor of 1 is *accepted*, not rejected, and only shows its cost the day a broker restarts; a manual commit one offset short of correct is *accepted*, not rejected, and only shows its cost as a reprocessed record days later.
+- **"KafkaJS and the Java client are the same API in a different language."** They diverge on defaults (`acks`, `idempotent`), on lifecycle (no separate `initTransactions()`), on what ships natively (one compression codec, one partition assigner), and on what they can join at all (no share-group support) — treating one client's mental model as universal is itself one of this catalog's most common patterns.
+
+<Callout title="The one-line takeaway">
+Read Kafka code in this order — client and version, broker and topic config, producer config, consumer loop, delivery semantics and transactions, ops and security, then Connect/Streams/Schema — because each layer's config is accepted without validating what the layer above it assumed, and "it ran without an error" tells you the client and the broker agreed on syntax, never that either one agreed with the guarantee the code's author had in mind.
+</Callout>
+
+export const quizReadingKafkaIndex = [
+  {
+    q: "Why does this module check the client and its version before checking anything about producer config or the consumer loop?",
+    options: [
+      "Because import statements are always the shortest lines to read",
+      "Because a config key or a CLI flag that simply does not exist on the client or version actually in use is silently ignored or rejected outright -- every later question about durability or ordering is moot if the setting meant to provide it was never real to begin with",
+      "Because producer config never depends on the client",
+      "The order does not matter",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entries 1-3: group.protocol=consumer is a real, current KIP-848 setting that KafkaJS silently drops, and --zookeeper is a flag removed in Kafka 4.0 -- both are meaningless before any producer/consumer logic is even reached.",
+  },
+  {
+    q: "```text\n$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic t --replication-factor 1 --config min.insync.replicas=2\nCreated topic t.\n```\nGiven this real output, what does a successful topic creation actually prove about whether acks=all writes to this topic are safe?",
+    options: [
+      "That writes are safe -- the broker validated the combination",
+      "Nothing at all -- proven in the AI Bug Catalog, KIP-579 lets this combination through creation and even through a produce request while the single replica is in sync, silently setting up a topic that cannot tolerate that broker restarting or falling out of ISR",
+      "That min.insync.replicas is ignored on RF=1 topics",
+      "That the topic will reject all future writes",
+    ],
+    answer: 1,
+    explain: "Proven directly: this exact topic accepted a produce request with acks=-1 and returned errorCode 0 -- the accepted-but-fragile combination is invisible until the single replica actually falls behind or the broker restarts.",
+  },
+  {
+    q: "Why does this module treat 'the consumer printed every message correctly in my test' as a Consumer loop reading-order concern rather than proof the commit logic is correct?",
+    options: [
+      "A working demo always proves the commit logic is correct",
+      "KafkaJS's heartbeat only fires after eachMessage returns, and a manual commit's exact offset value only matters across a restart -- neither failure mode appears during a single, uninterrupted, fast test run, which is exactly the case a quick demo always is",
+      "Consumer loops cannot have bugs if the topic has only one partition",
+      "This only matters when auto.create.topics.enable is true",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entries 7-8: the eviction only appears once a handler runs longer than session.timeout.ms, and the off-by-one duplicate only appears on the SECOND run against the same group -- a single successful pass proves neither is fixed.",
+  },
+  {
+    q: "Which step in this reading order specifically asks whether a connector's class name resolves on the worker's actual, discoverable plugin path -- not just whether the jar exists somewhere on disk?",
+    options: [
+      "Client & version",
+      "Ops & security",
+      "Connect / Streams / Schema",
+      "Producer config",
+    ],
+    answer: 2,
+    explain: "Proven directly in the AI Bug Catalog's entry 19: connect-file-4.3.1.jar is physically present in /opt/kafka/libs on the exact image this course uses, and connect-standalone.sh still raises a real ClassNotFoundException for FileStreamSource, because plugin discovery and 'the jar exists somewhere' are not the same question.",
+  },
+  {
+    q: "Why does this module say a silently-accepted config (like min.insync.replicas=2 on RF=1) is MORE concerning than one the broker rejects outright, rather than less?",
+    options: [
+      "It doesn't -- rejected configs are always worse",
+      "A rejected config is loud and immediate -- a reader notices instantly and fixes it before shipping. A silently-accepted one looks identical to a correct one until the exact condition it can't survive actually happens, often much later and in production",
+      "Silent acceptance is rarer in practice than rejection",
+      "The broker always eventually rejects unsafe combinations on its own",
+    ],
+    answer: 1,
+    explain: "Proven throughout the catalog: entries like the off-by-one commit or the separate-offset-commit-vs-sendOffsets bug apply cleanly, run cleanly, and only surface as a duplicate or a loss once a restart or a crash depends on the exact behaviour that was silently wrong.",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/index" questions={quizReadingKafkaIndex} />
+
+<ProgressTracker client:visible id="reading-kafka/index" />
