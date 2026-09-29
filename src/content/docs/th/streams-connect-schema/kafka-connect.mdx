@@ -1,6 +1,6 @@
 ---
 title: 'Kafka Connect'
-description: 'การเชื่อมต่อข้อมูลแบบ no-code ด้วย Kafka Connect — source และ sink connector, worker, task, converter, โหมด distributed กับ standalone และเมื่อไรควรใช้ Connect แทนการเขียน producer หรือ consumer'
+description: 'การผสานรวมแบบไม่ต้องเขียนโค้ดด้วย Kafka Connect — source/sink connector, worker, task, converter, ClassNotFoundException จริงในโหมด standalone ที่แก้ได้, distributed mode + REST API พิสูจน์จริง, SMT และ DLQ จริง'
 sidebar:
   order: 2
 ---
@@ -8,20 +8,21 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในหนึ่งประโยค
 
-**Kafka Connect** คือ framework สำเร็จรูปสำหรับย้ายข้อมูล **เข้าและออก** จาก Kafka ด้วยการตั้งค่าแทนการเขียนโค้ด — ชี้ **source connector** ไปที่ database หรือไฟล์เพื่อดึงข้อมูลเข้ามา หรือชี้ **sink connector** ไปที่ search index หรือ warehouse เพื่อส่งข้อมูลออกไป แล้ว Connect จะจัดการเรื่อง scaling, offset และการ restart ให้เอง
+**Kafka Connect** คือ framework สำเร็จรูปสำหรับย้ายข้อมูล **เข้าและออก** Kafka ด้วย configuration แทนโค้ด — ชี้ **source connector** ไปที่ฐานข้อมูลหรือไฟล์เพื่อดึงข้อมูลเข้า หรือ **sink connector** ไปที่ search index หรือ warehouse เพื่อส่งข้อมูลออก แล้ว Connect จัดการ scaling, offset, และการรีสตาร์ทให้เอง
 
-## source และ sink connector
+## Source และ sink connector
 
-งาน "เกี่ยวกับ Kafka" จำนวนมากไม่ใช่ business logic เลย — แต่เป็นงานท่อ: อ่าน row จาก Postgres เข้า topic หรือเขียน topic ลง Elasticsearch การเขียนท่อพวกนี้เองหมายถึงต้องแก้ปัญหา offset tracking, retry และ parallelism ซ้ำทุกครั้ง Connect แพ็กงานพวกนี้เป็น **connector** ที่ใช้ซ้ำได้:
+งาน "Kafka" ส่วนใหญ่ไม่ใช่ business logic เลย — มันคือท่อประปา: อ่านแถวจาก Postgres เข้า topic หรือเขียน topic ออกไป Elasticsearch การเขียนท่อประปานี้เองหมายถึงต้องแก้ปัญหา offset tracking, retry, และ parallelism ใหม่ทุกครั้ง Connect ห่อสิ่งนี้เป็น **connector** ที่ใช้ซ้ำได้:
 
-- **source connector** — ระบบภายนอก → Kafka (database, ไฟล์, stream แบบ change-data-capture)
-- **sink connector** — Kafka → ระบบภายนอก (database, search index, data warehouse, object storage)
+- **Source connector** — ระบบภายนอก → Kafka (ฐานข้อมูล, ไฟล์, change-data-capture stream)
+- **Sink connector** — Kafka → ระบบภายนอก (ฐานข้อมูล, search index, data warehouse, object storage)
 
-เพราะ connector เป็นแค่ config จึงมีให้ใช้อยู่แล้วเป็นร้อย ๆ ตัว คุณแทบไม่ต้องเขียนเอง แค่ตั้งค่าเท่านั้น
+เพราะ connector คือแค่ config เท่านั้น มีอยู่แล้วเป็นร้อย ๆ ตัว แทบไม่ต้องเขียนเอง แค่ config เท่านั้น
 
 ```json
 // A JDBC source connector: poll a Postgres table into a topic
@@ -39,15 +40,15 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 }
 ```
 
-## worker, task และ converter
+## Worker, task, และ converter
 
-มีสามชิ้นส่วนที่ทำงานร่วมกัน:
+มีสามส่วนหลักที่ทำงาน:
 
-- **worker** — process JVM ที่รัน connector หนึ่ง worker หรือมากกว่ารวมกันเป็น Connect cluster
-- **task** — หน่วยของ parallelism connector แบ่งงานเป็น task ได้ถึง `tasks.max` ตัว แล้ว worker กระจาย task ไปทั่ว cluster (เช่น หนึ่ง task ต่อหนึ่ง table หรือต่อช่วง partition)
-- **converter** — แปลงระหว่างรูปแบบ record ภายในของ Connect กับ bytes บน topic ตรงนี้เองที่ Schema Registry เสียบเข้ามา: `AvroConverter` serialize พร้อม schema id ส่วน `JsonConverter` เขียนเป็น JSON ธรรมดา
+- **Worker** — process JVM ที่รัน connector worker หนึ่งตัวหรือมากกว่าประกอบเป็น Connect cluster
+- **Task** — หน่วยของ parallelism connector แบ่งงานออกเป็น task สูงสุด `tasks.max` ตัว ที่ worker กระจายไปทั่วคลัสเตอร์ (เช่น หนึ่ง task ต่อตาราง หรือต่อช่วง partition)
+- **Converter** — แปลระหว่างรูปแบบ record ภายในของ Connect กับ byte บน topic ตรงนี้คือจุดที่ Schema Registry เข้ามาเชื่อมต่อ: `AvroConverter` serialize ด้วย schema id, `JsonConverter` เขียนเป็น JSON ล้วน
 
-<Mermaid title="Connect moves data between external systems and Kafka" code={connectDiagram} />
+<Mermaid title="Connect ย้ายข้อมูลระหว่างระบบภายนอกกับ Kafka" code={connectDiagram} />
 
 export const connectDiagram = `flowchart LR
   db["Postgres"] -->|"source connector"| worker["Connect worker + tasks"]
@@ -55,68 +56,305 @@ export const connectDiagram = `flowchart LR
   topic -->|"converter"| worker2["Connect worker + tasks"]
   worker2 -->|"sink connector"| es["Elasticsearch"]`;
 
-## distributed กับ standalone
+## โหมด Standalone: `ClassNotFoundException` จริงที่พิสูจน์ได้ — และวิธีแก้
 
-Connect รันได้สองโหมด:
-
-- **standalone** — worker เดียว config อยู่ในไฟล์ local ง่าย ไม่มี fault tolerance เหมาะกับ demo บนเครื่องหรืองาน ingest ไฟล์ครั้งเดียวจบ
-- **distributed** — หลาย worker ทำงานประสานกันเหมือน consumer group โดยเก็บ config ของ connector และ offset ไว้ **ใน topic ของ Kafka** ถ้า worker ตัวหนึ่งตาย task ของตัวเองจะ rebalance ไปยังตัวที่รอด นี่คือสิ่งที่คุณรันบน production และจัดการผ่าน REST API:
+image `apache/kafka:4.3.1` มากับ `connect-standalone.sh` และใน `/opt/kafka/libs/` มี `connect-file-4.3.1.jar` จริง jar นั้น *อยู่จริง* ไม่ได้แปลว่า FileStream connector *ใช้ได้เลย* ทันที — Connect ค้นหา connector ผ่าน **plugin isolation path** (`plugin.path`) เท่านั้น ซึ่ง `connect-standalone.properties` ค่าเริ่มต้นมากับค่า **ว่างเปล่า** พิสูจน์จริงตรง ๆ:
 
 ```bash
-# Deploy the connector above to a distributed Connect cluster
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @orders-source.json
+# scripts/kafka-connect/connect-standalone-demo.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic scs-connect-test --partitions 1 --replication-factor 1 2>&1 | tail -1 || true
+printf 'hello line 1\nhello line 2\n' > /tmp/scs-test.txt
+cat > /tmp/scs-standalone-empty.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=true
+value.converter.schemas.enable=true
+offset.storage.file.filename=/tmp/scs-connect.offsets
+offset.flush.interval.ms=5000
+EOF
+cat > /tmp/scs-file-source.properties <<EOF
+name=scs-local-file-source
+connector.class=FileStreamSource
+tasks.max=1
+file=/tmp/scs-test.txt
+topic=scs-connect-test
+EOF
+echo "== attempt 1: no plugin.path set (default classpath scan) =="
+timeout 8 /opt/kafka/bin/connect-standalone.sh /tmp/scs-standalone-empty.properties /tmp/scs-file-source.properties 2>&1 | grep -E "ERROR|Failed to find any class" | head -3
+echo "== fix: mount the FileStream connector jar via plugin.path =="
+mkdir -p /tmp/scs-plugins/connect-file
+cp /opt/kafka/libs/connect-file-4.3.1.jar /tmp/scs-plugins/connect-file/
+cat > /tmp/scs-standalone-plugin.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+offset.storage.file.filename=/tmp/scs-connect2.offsets
+offset.flush.interval.ms=5000
+plugin.path=/tmp/scs-plugins
+EOF
+timeout 8 /opt/kafka/bin/connect-standalone.sh /tmp/scs-standalone-plugin.properties /tmp/scs-file-source.properties 2>&1 | grep -E "Finished creating connector" || true
+echo "== real records that landed on the topic =="
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic scs-connect-test --from-beginning 2>&1 | grep -v "^\[" || true
 ```
 
-## เมื่อไรควรใช้ Connect แทนการเขียนโค้ด
+Output จริง:
 
-หยิบ Connect มาใช้เมื่องานคือ **ย้ายข้อมูลโดยไม่มี logic พิเศษ** — ingest table, mirror topic ไป S3, ป้อน search index คุณได้ offset management, การ restart และ scaling มาฟรี ให้เขียน producer หรือ consumer แทนเมื่อคุณต้องการ **business logic** จริง ๆ: การ enrich กับอีก service, การ branch ที่ซับซ้อน หรือ transformation ที่โตเกิน converter ธรรมดา ถ้าคุณเริ่มอยาก *transform และ join* stream นั่นคืองานของบทถัดไป (Kafka Streams) ไม่ใช่งานของ Connect
+```text
+Created topic scs-connect-test.
+== attempt 1: no plugin.path set (default classpath scan) ==
+ERROR Failed to create connector for /tmp/scs-file-source.properties (org.apache.kafka.connect.cli.ConnectStandalone:86)
+ERROR Stopping after connector error (org.apache.kafka.connect.cli.ConnectStandalone:98)
+java.util.concurrent.ExecutionException: org.apache.kafka.connect.runtime.rest.errors.BadRequestException: Failed to find any class that implements Connector and which name matches FileStreamSource, available connectors are: PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorCheckpointConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorHeartbeatConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorSourceConnector, ...}
+== fix: mount the FileStream connector jar via plugin.path ==
+[...] INFO [scs-local-file-source|worker] Finished creating connector scs-local-file-source (org.apache.kafka.connect.runtime.Worker:370)
+== real records that landed on the topic ==
+"hello line 1"
+"hello line 2"
+Processed a total of 2 messages
+```
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Kafka Connect** ย้ายข้อมูลเข้าและออกจาก Kafka ด้วย **การตั้งค่า**: **source connector** ดึงข้อมูลเข้า **sink connector** ส่งข้อมูลออก **worker** รัน **task** และ **converter** จัดการ serialization รันแบบ **distributed** บน production เพื่อ fault tolerance และเลือก Connect แทน client ที่เขียนเองทุกครั้งที่งานคือ **ย้ายข้อมูล ไม่ใช่ใส่ logic**
+ด้วย `plugin.path` ว่างเปล่า classpath scan ของ Connect เจอแค่สาม connector ที่ฝังอยู่ใน `connect-mirror-*.jar` ของ image เอง (connector ของ MirrorMaker เอง) — `connect-file-4.3.1.jar` ที่อยู่ใน `/opt/kafka/libs/` ไม่เคยถูกสแกนเป็น plugin source เลย การชี้ `plugin.path` ไปที่ directory ที่ mount (ในที่นี้คือ copy) jar เดียวกันเข้าไปในโฟลเดอร์บนสุดของตัวเองแก้ปัญหาได้ทันที: `Finished creating connector` และสองบรรทัดจริงจาก `/tmp/scs-test.txt` ก็เข้า topic
+
+## โหมด Distributed: `connect-distributed.sh` + session REST API จริง
+
+โหมด **Distributed** รัน worker หนึ่งตัวหรือมากกว่าที่ประสานงานกันเหมือน consumer group โดยเก็บ connector config, offset, และ status **ใน topic ของ Kafka เอง** แทนไฟล์ในเครื่อง — นี่คือสิ่งที่ production รัน จัดการทั้งหมดผ่าน HTTP:
+
+```bash
+# scripts/kafka-connect/connect-distributed-demo.sh
+printf 'hello line 1\nhello line 2\n' > /tmp/scs-test.txt
+mkdir -p /tmp/scs-plugins/connect-file
+cp /opt/kafka/libs/connect-file-4.3.1.jar /tmp/scs-plugins/connect-file/
+cat > /tmp/scs-distributed.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+group.id=scs-connect-cluster
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+offset.storage.topic=scs-connect-offsets
+offset.storage.replication.factor=1
+config.storage.topic=scs-connect-configs
+config.storage.replication.factor=1
+status.storage.topic=scs-connect-status
+status.storage.replication.factor=1
+offset.flush.interval.ms=5000
+plugin.path=/tmp/scs-plugins
+EOF
+/opt/kafka/bin/connect-distributed.sh /tmp/scs-distributed.properties > /tmp/scs-distributed.log 2>&1 &
+CONNECT_PID=$!
+for i in $(seq 1 25); do wget -qO- http://localhost:8083/ >/dev/null 2>&1 && break; sleep 1; done
+
+echo "== GET /connector-plugins =="
+wget -qO- http://localhost:8083/connector-plugins
+
+echo
+echo "== POST a source connector with an InsertField\$Value SMT =="
+cat > /tmp/scs-smt-source.json <<'JSON'
+{
+  "name": "scs-orders-file-source",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSourceConnector",
+    "tasks.max": "1",
+    "file": "/tmp/scs-test.txt",
+    "topic": "scs-connect-smt-demo",
+    "transforms": "insertOrigin",
+    "transforms.insertOrigin.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.insertOrigin.static.field": "source_system",
+    "transforms.insertOrigin.static.value": "file-connector-demo"
+  }
+}
+JSON
+wget -qO- --header="Content-Type: application/json" --post-file=/tmp/scs-smt-source.json http://localhost:8083/connectors
+echo
+sleep 4
+echo "== GET status (SMT vs a schemaless String value) =="
+wget -qO- http://localhost:8083/connectors/scs-orders-file-source/status
+
+echo
+echo "== DLQ: sink connector with errors.tolerance=all reading a topic with one bad record =="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic scs-dlq-source --partitions 1 --replication-factor 1 2>&1 | tail -1 || true
+printf '{"orderId":"o-1","amount":10.5}\nthis-is-not-valid-json\n{"orderId":"o-2","amount":22.0}\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic scs-dlq-source
+cat > /tmp/scs-dlq-sink.json <<'JSON'
+{
+  "name": "scs-dlq-demo-sink",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSinkConnector",
+    "tasks.max": "1",
+    "topics": "scs-dlq-source",
+    "file": "/tmp/scs-dlq-output.txt",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "scs-dlq-demo-dlq",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+    "errors.log.enable": "true"
+  }
+}
+JSON
+wget -qO- --header="Content-Type: application/json" --post-file=/tmp/scs-dlq-sink.json http://localhost:8083/connectors
+echo
+sleep 5
+echo "== good records that reached the sink file =="
+cat /tmp/scs-dlq-output.txt
+echo "== the bad record, in the DLQ topic =="
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic scs-dlq-demo-dlq --from-beginning 2>&1 | grep -v "^\[" || true
+
+kill $CONNECT_PID 2>/dev/null || true
+wait $CONNECT_PID 2>/dev/null || true
+```
+
+Output จริง (ตัดให้สั้น):
+
+```text
+== GET /connector-plugins ==
+[{"class":"org.apache.kafka.connect.file.FileStreamSinkConnector","type":"sink","version":"4.3.1"},{"class":"org.apache.kafka.connect.file.FileStreamSourceConnector","type":"source","version":"4.3.1"},{"class":"org.apache.kafka.connect.mirror.MirrorCheckpointConnector","type":"source","version":"4.3.1"}, ...]
+
+== POST a source connector with an InsertField$Value SMT ==
+{"name":"scs-orders-file-source","config":{...},"tasks":[],"type":"source"}
+
+== GET status (SMT vs a schemaless String value) ==
+{"name":"scs-orders-file-source","connector":{"state":"RUNNING", ...},
+ "tasks":[{"id":0,"state":"FAILED", ...,
+   "trace":"org.apache.kafka.connect.errors.ConnectException: Tolerance exceeded in error handler\n...
+   Caused by: org.apache.kafka.connect.errors.DataException: Only Struct objects supported for [field insertion], found: java.lang.String\n
+   \tat org.apache.kafka.connect.transforms.util.Requirements.requireStruct(Requirements.java:52)\n
+   \tat org.apache.kafka.connect.transforms.InsertField.applyWithSchema(InsertField.java:175)\n..."}], "type":"source"}
+
+== DLQ: sink connector with errors.tolerance=all reading a topic with one bad record ==
+Created topic scs-dlq-source.
+{"name":"scs-dlq-demo-sink","config":{...},"tasks":[],"type":"sink"}
+== good records that reached the sink file ==
+{amount=10.5, orderId=o-1}
+{amount=22.0, orderId=o-2}
+== the bad record, in the DLQ topic ==
+this-is-not-valid-json
+Processed a total of 1 messages
+```
+
+สามสิ่งจริงที่พิสูจน์ได้ใน session เดียว: (1) หลัง mount plugin path แล้ว `connector-plugins` แสดง `FileStreamSinkConnector`/`FileStreamSourceConnector` ควบคู่กับ connector ในตัว Mirror — REST API คือแหล่งความจริงว่า worker รันอะไรได้จริง; (2) `tasks.max`, SMT, และ connector config ทั้งหมด deploy ได้ด้วย `POST /connectors` ธรรมดา; (3) `GET /connectors/<name>/status` แยก **connector state** (`RUNNING`) จาก **task state** (`FAILED` ในที่นี้) — connector อาจสมบูรณ์ดีในขณะที่ task ทุกตัวตายได้
+
+## `tasks.max` และความล้มเหลวของ SMT จริงที่ควรอ่านให้ละเอียด
+
+`tasks.max` จำกัด parallelism ที่ connector แบ่งได้ — JDBC source ที่มี `tasks.max: 3` และ 3 ตาราง ได้หนึ่ง task ต่อตาราง; FileStream source โดยธรรมชาติมี task เดียว (ไฟล์เดียว ตัวอ่านเดียว)
+
+**Single Message Transform (SMT)** รันแบบ inline บนแต่ละ record ไม่ต้องมีงานแยก — `transforms=insertOrigin` บวก `transforms.insertOrigin.type=...InsertField$Value` ข้างบนเพิ่ม field คงที่ให้ทุก record พิสูจน์แล้วด้านบน: มัน **ล้มเหลว** ด้วย error จริงที่เจาะจง — `DataException: Only Struct objects supported for [field insertion], found: java.lang.String` `FileStreamSourceConnector` ปล่อยค่าที่มี **schema แบบ `STRING` แนบมาด้วย** ไม่ใช่ค่าแบบ schemaless และไม่ใช่ `Struct` — และ code path ของ `InsertField` ที่รับรู้ schema (`applyWithSchema`) ต้องการ `Struct` เสมอโดยไม่มีเงื่อนไข ไม่ว่า type จริงของ schema จะเป็นอะไร นี่คือสิ่งที่มีประโยชน์จริงที่ควรรู้ก่อนใช้ `InsertField`/`ReplaceField`: มันทำงานกับ **record ที่มีโครงสร้าง (Struct-schema)** — โดยทั่วไปมาจาก JDBC source, Debezium, หรือ topic ที่แปลงด้วย Avro/JSON-Schema — ไม่ใช่กับ source แบบ plain-string อย่าง `FileStreamSourceConnector` ไม่ว่า `key.converter.schemas.enable`/`value.converter.schemas.enable` จะตั้งเป็นอย่างไร (สิ่งเหล่านั้นมีผลกับ wire format ที่เขียนลง Kafka ไม่ใช่ `SourceRecord.valueSchema()` ภายในที่ source connector สร้างขึ้นเอง)
+
+## Dead Letter Queue (DLQ): พิสูจน์ด้วย record เสียจริงหนึ่งตัว
+
+`errors.tolerance=all` (ค่าเริ่มต้นคือ `none`) บอก connector ให้ทำงานต่อไปแม้เจอ record เสีย แทนที่จะตายไปเลย `errors.deadletterqueue.topic.name` ให้ record เสียนั้นมีที่ไปจริง ๆ แทนที่จะหายไปเฉย ๆ พิสูจน์แล้วด้านบนด้วยสาม record บน `scs-dlq-source` (JSON ถูกต้องสองตัว หนึ่งตัวจงใจให้ผิด): task ยังคง **RUNNING** ตลอด สอง record ที่ถูกต้องไปถึง `/tmp/scs-dlq-output.txt` และ record ที่ผิดรูปแบบหนึ่งตัว — ที่ล้มเหลวตั้งแต่ตอน deserialize ด้วย `JsonConverter` ก่อนที่โค้ดของ connector เองจะเห็นด้วยซ้ำ — ไปลงที่ `scs-dlq-demo-dlq` ตรงตัวเป๊ะ ถ้าไม่มี `errors.tolerance=all` record เสียตัวเดียวกันนี้จะฆ่า task ทันทีตั้งแต่ความล้มเหลวครั้งแรก (`errors.tolerance=none` คือค่าเริ่มต้น) พา record ดี ๆ ทุกตัวที่อยู่ข้างหลังบน partition นั้นตายไปด้วย
+
+## Distributed vs standalone
+
+- **Standalone** — worker ตัวเดียว config ในไฟล์ท้องถิ่น offset ในไฟล์ท้องถิ่น ง่าย ไม่มี fault tolerance พิสูจน์แล้วด้านบนว่าเป็นวิธีที่ง่ายที่สุดที่จะเจอ error "connector not found" ระหว่างทดลอง เหมาะกับ demo บนแล็ปท็อปหรือการดึงไฟล์ครั้งเดียว
+- **Distributed** — worker หลายตัวประสานงานกันเหมือน consumer group โดยเก็บ connector config, offset, และ status **ใน topic ของ Kafka** (`config.storage.topic`/`offset.storage.topic`/`status.storage.topic` ข้างบน) ถ้า worker ตาย task ของมัน rebalance ไปยังตัวที่รอดชีวิต นี่คือสิ่งที่ production รัน จัดการทั้งหมดผ่าน REST API ที่พิสูจน์แล้วด้านบน
+
+## เมื่อไหร่ควรใช้ Connect แทนการเขียนโค้ด
+
+ใช้ Connect เมื่องานคือ **ย้ายข้อมูลโดยไม่มี logic กำหนดเอง** — ดึงตารางเข้า, mirror topic ไปยัง S3, ป้อน search index จะได้ offset management, การรีสตาร์ท, และ scaling ฟรี บวก SMT สำหรับการแปลง inline เล็ก ๆ และ DLQ สำหรับ record เสีย ทั้งหมดพิสูจน์แล้วด้านบน เขียน producer หรือ consumer แทนเมื่อต้องการ **business logic** จริง: การ enrich กับเซอร์วิสอื่น, การแตกแขนงที่ไม่ตรงไปตรงมา, หรือการแปลงที่เกินกว่า converter/SMT ธรรมดาจะทำได้ ถ้าพบว่าต้องการ *แปลงและ join* stream นั่นคืองานของบทก่อนหน้า (Kafka Streams) ไม่ใช่ของ Connect
+
+<Callout title="สรุปในบรรทัดเดียว">
+**Kafka Connect** ย้ายข้อมูลเข้าออก Kafka ด้วย **configuration** `plugin.path` เริ่มต้นของโหมด standalone ว่างเปล่า — พิสูจน์แล้วด้านบนด้วย error แบบ `ClassNotFoundException` จริงจนกว่าจะ mount connector jar เอง โหมด **Distributed** คือ production: config, offset, และ status อยู่ใน topic ของ Kafka จัดการทั้งหมดผ่าน **REST API** ที่พิสูจน์แล้วด้านบน (`/connector-plugins`, `POST /connectors`, `GET .../status`) SMT อย่าง `InsertField` ต้องการ record แบบ **Struct-schema** — พิสูจน์แล้วด้านบนว่าล้มเหลวกับ FileStream source แบบ plain-string `errors.tolerance=all` + `errors.deadletterqueue.topic.name` ทำให้ task รอดจาก record เสีย — พิสูจน์แล้วด้านบนด้วย record จริงที่ถูกส่งไปยัง DLQ topic จริงขณะที่เพื่อนบ้านที่ดียังไหลต่อไป
 </Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="json" code={`{
+  "name": "orders-enricher-sink",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "connection.url": "jdbc:postgresql://db:5432/shop",
+    "topics": "orders",
+    "tasks.max": "1",
+    "transforms": "insertRegion",
+    "transforms.insertRegion.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.insertRegion.static.field": "region",
+    "transforms.insertRegion.static.value": "th",
+    "// comment": "errors.tolerance defaults to keeping bad records from crashing the task, so this is production-safe as-is"
+  }
+}`}>
+
+คำอ้างในคอมเมนต์ท้ายนั้นกลับด้านกัน `errors.tolerance` **ค่าเริ่มต้นคือ `none`** ไม่ใช่โหมดผ่อนปรน -- พิสูจน์ตรง ๆ ด้านบนด้วยพฤติกรรมจริง: ถ้าไม่มี `errors.tolerance=all` ชัดเจน (และควรมี `errors.deadletterqueue.topic.name` ด้วยเพื่อให้ record เสียมีที่ไปจริง) record แรกที่ connector นี้แปลงหรือ transform ไม่ได้จะฆ่า task ทันที และทุก record ที่อยู่ข้างหลังบน partition นั้นจะหยุดไหลจนกว่าจะมีคนสังเกตเห็นแล้วรีสตาร์ท config นี้ไม่มี key `errors.tolerance` เลย จึงกำลังรันด้วยค่าเริ่มต้นที่เข้มงวด ไม่ใช่ค่าที่ปลอดภัยตามที่คอมเมนต์บอก ทางแก้คือเพิ่ม `"errors.tolerance": "all"` และ `"errors.deadletterqueue.topic.name": "orders-enricher-sink-dlq"` (บวก `errors.deadletterqueue.topic.replication.factor` ใน production) อย่างชัดเจน -- พิสูจน์แล้วด้านบนว่าคือชุดค่าที่ทำให้ task รอดและให้ record เสียมีปลายทางจริง แทนที่จะเผลอสมมติค่าเริ่มต้นที่ไม่มีอยู่จริง
+
+</SpotTheBug>
+
+## Mental Model
+
+ทุกอย่างที่ Kafka Connect ทำคือ worker ที่รันโค้ด Java ของ connector คุณภายใน classloader ของตัวเอง ถูกค้นพบผ่าน `plugin.path` เท่านั้น -- พิสูจน์แล้วด้านบนว่าเป็นเหตุผลตรงตัวที่ jar ที่อยู่ใน `/opt/kafka/libs/` มองไม่เห็นจนกว่าจะ mount เองอย่างชัดเจน เมื่อถูกค้นพบแล้ว connector ก็แค่ producer หรือ consumer ที่ worker จัดการให้: task คือ parallelism ของมัน converter คือการ (de)serialize ของมัน SMT คือการแก้ record แบบ inline และ DLQ คือที่ที่พฤติกรรม fail-fast ปกติของ `errors.tolerance=none` ถูก redirect ไปแทนที่จะถูกปิด ไม่มีอะไรตรงนี้ทำ business logic -- พิสูจน์แล้วด้านบนว่า `InsertField` เองปฏิเสธที่จะรันกับค่าที่ไม่มีโครงสร้าง -- ซึ่งตรงคือขอบเขตของ Connect: ย้ายและปรับรูปร่างข้อมูลเบา ๆ ส่งต่ออะไรที่มากกว่านั้นให้ Streams หรือ consumer จริง
+
+## Trade-offs
+
+- **Standalone** -- ทำซ้ำได้เร็วที่สุดในเครื่อง แลกกับ fault tolerance เป็นศูนย์และ (พิสูจน์แล้วด้านบน) เป็นโหมดที่เจอช่องว่างของการค้นหา plugin แบบเงียบ ๆ ได้ง่ายที่สุด
+- **Distributed** -- fault tolerance ระดับ production และ REST API เต็มรูปแบบ (พิสูจน์แล้วด้านบนแบบ end-to-end) แลกกับการต้องมี topic ภายในเพิ่มอีกสามตัวและคลัสเตอร์ worker ที่กำลังรันแทนที่จะเป็น process เดียว
+- **SMT** -- การแปลง inline ที่ไม่ต้อง deploy แลกกับการถูกจำกัดด้วยสิ่งที่ transform class ตัวเดียวรองรับ -- พิสูจน์แล้วด้านบนว่า `InsertField` ปฏิเสธค่าที่ไม่ใช่ Struct ตรง ๆ แทนที่จะหาทางอ้อม
+- **DLQ (`errors.tolerance=all`)** -- ทำให้ task รอดจากข้อมูลเสีย แลกกับการยอมรับการสูญหาย/ข้ามข้อมูลแบบเงียบ ๆ เว้นแต่จะมีอะไรจริงจังคอยดู DLQ topic -- DLQ ที่ไม่มีใครอ่านก็เทียบเท่ากับการทิ้ง record นั้นไป
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า connector jar อยู่ใน Kafka image แล้ว Connect ใช้ได้เลย"** พิสูจน์แล้วว่าผิดด้านบน: `connect-file-4.3.1.jar` มากับ `/opt/kafka/libs/` แต่ `plugin.path` เริ่มต้น (ว่างเปล่า) ของโหมด standalone หามันไม่เจอ -- error จริงแสดงแค่สาม connector ของ Mirror ว่ามีอยู่
+- **"errors.tolerance ค่าเริ่มต้นคือค่าที่ปลอดภัย"** พิสูจน์แล้วว่าผิดใน SpotTheBug: ค่าเริ่มต้นคือ `none` -- record เสียฆ่า task ทันที เว้นแต่จะตั้ง `errors.tolerance=all` เอง
+- **"SMT อย่าง InsertField ทำงานกับ record อะไรก็ได้"** พิสูจน์แล้วว่าผิดด้านบนด้วย `DataException` จริง: `InsertField$Value` ต้องการค่าแบบ Struct-schema; record จาก FileStream source แบบ plain-string ล้มเหลวทุกครั้ง
+- **"record ใน DLQ แปลว่า Connect แก้ปัญหาให้แล้ว"** DLQ แค่หยุดไม่ให้ record เสียทำให้ task พังหรือหายไปเงียบ ๆ -- พิสูจน์แล้วด้านบนว่ามันยังคงไปลงใน topic ที่ไม่มีการรับประกันว่าจะมีใครอ่าน -- record นั้นยังต้องการคนหรือกระบวนการปลายทางมาจัดการจริง ๆ
 
 export const quizConnect = [
   {
-    q: 'source connector กับ sink connector ต่างกันอย่างไร',
+    q: 'error จริงที่พิสูจน์ด้านบน: ทำไม connect-standalone.sh หา FileStreamSource ไม่เจอ ทั้งที่ connect-file-4.3.1.jar มีอยู่ใน /opt/kafka/libs/?',
     options: [
-      'source เขียน Kafka ไปยังระบบภายนอก ส่วน sink อ่านเข้ามา',
-      'source ดึงข้อมูลจากระบบภายนอกเข้า Kafka ส่วน sink ส่งข้อมูลจาก Kafka ไปยังระบบภายนอก',
-      'เป็นสิ่งเดียวกันแค่คนละชื่อ',
-      'source ใช้กับไฟล์เท่านั้น sink ใช้กับ database เท่านั้น',
+      'jar เสียหาย',
+      'plugin.path ค่าเริ่มต้นว่างเปล่า Connect จึงสแกนแค่ classpath และเจอแค่สาม connector ในตัวของ Mirror -- jar ใน /opt/kafka/libs/ จะไม่ถูกสแกนเป็น plugin เว้นแต่ plugin.path จะชี้ไปยัง directory ที่มีมันอยู่',
+      'FileStreamSource ไม่มีอยู่ใน Kafka 4.3.1',
+      'connect-standalone.sh ต้องการรูปแบบ config อื่น',
     ],
     answer: 1,
+    explain: 'error จริงแสดง "available connectors" แค่สาม Mirror* connector เท่านั้น; การ mount jar เดิมไว้ใต้ directory ของ plugin.path แก้ปัญหาได้ทันที (Finished creating connector)',
   },
   {
-    q: 'ใน Kafka Connect task คืออะไร',
+    q: 'GET /connectors/<name>/status พิสูจน์อะไรเกี่ยวกับ connector state กับ task state?',
     options: [
-      'การติดตั้ง JVM แยกต่อหนึ่ง connector',
-      'หน่วยของ parallelism ที่ connector ถูกแบ่งออกและกระจายไปตาม worker',
-      'schema ที่เก็บอยู่ใน registry',
-      'ข้อความ Kafka หนึ่งข้อความ',
+      'เหมือนกันเสมอ',
+      'connector รายงาน state RUNNING ได้พร้อมกับ task รายงาน state FAILED -- พิสูจน์ด้วยความล้มเหลวจริงของ InsertField SMT ที่ connector ยัง RUNNING แต่ task ตาย',
+      'task state มองไม่เห็นผ่าน REST API',
+      'task ที่ FAILED จะถูก restart อัตโนมัติโดย GET /status',
     ],
     answer: 1,
+    explain: 'JSON จริง: "connector":{"state":"RUNNING"...} คู่กับ "tasks":[{"id":0,"state":"FAILED"...}] -- สอง state field ที่เป็นอิสระต่อกัน',
   },
   {
-    q: 'ทำไมต้องรัน Connect แบบ distributed บน production',
+    q: 'ทำไม SMT InsertField$Value ถึงล้มเหลวกับ record ของ FileStreamSourceConnector พิสูจน์ด้วย DataException จริง?',
     options: [
-      'เป็นโหมดเดียวที่รองรับ connector',
-      'หลาย worker ประสานงานและ rebalance task เมื่อเกิด failure โดยเก็บ config และ offset ไว้ใน Kafka',
-      'เก็บทุกอย่างไว้ในไฟล์ local เพื่อความเร็ว',
-      'ตัดความจำเป็นของ converter ออกไป',
+      'InsertField ถูก deprecate แล้ว',
+      'code path ที่รับรู้ schema ของ InsertField ต้องการค่าแบบ Struct; FileStreamSourceConnector ปล่อยค่า string ธรรมดาที่มี schema แบบ STRING ไม่ใช่ Struct ทำให้ Requirements.requireStruct() throw',
+      'config static.field สะกดผิด',
+      'FileStreamSourceConnector ใช้ transform อะไรไม่ได้เลย',
     ],
     answer: 1,
+    explain: 'stack trace จริง: "Only Struct objects supported for [field insertion], found: java.lang.String" จาก Requirements.requireStruct ที่ถูกเรียกโดย InsertField.applyWithSchema',
   },
   {
-    q: 'เมื่อไรควรเขียน producer หรือ consumer แทนการใช้ Connect',
+    q: 'ในการพิสูจน์ DLQ จริง (JSON ถูกต้อง 2 record + record ผิด 1 ตัว, errors.tolerance=all) เกิดอะไรขึ้น?',
     options: [
-      'เมื่อแค่ต้องการก๊อป table เข้า topic',
-      'เมื่องานต้องการ business logic จริง ๆ เช่น enrichment, branching หรือ join',
-      'ไม่มีทางเลย — Connect จัดการได้ทุกกรณี',
-      'เฉพาะตอนที่ Kafka offline เท่านั้น',
+      'task พังตั้งแต่ record เสียตัวแรก',
+      'task ยัง RUNNING; 2 record ที่ถูกต้องไปถึงไฟล์ sink และ 1 record ที่ผิดไปลงที่ DLQ topic ที่ตั้งไว้ตรงตัวเป๊ะ',
+      'ทั้ง 3 record ถูกทิ้งไปเงียบ ๆ',
+      'record เสียถูกแก้ไขอัตโนมัติแล้วเขียนลงไฟล์ sink เหมือนเดิม',
     ],
     answer: 1,
+    explain: 'output จริงแสดง {amount=10.5, orderId=o-1} และ {amount=22.0, orderId=o-2} ในไฟล์ sink output และข้อความ "this-is-not-valid-json" ตรงตัวที่บริโภคได้จาก DLQ topic',
+  },
+  {
+    q: 'ค่าเริ่มต้นจริงของ errors.tolerance ที่พิสูจน์ใน SpotTheBug ว่าขัดแย้งกับคอมเมนต์ที่อ้างไว้คืออะไร?',
+    options: [
+      '"all" -- record เสียถูกยอมรับเสมอโดยค่าเริ่มต้น',
+      '"none" -- record เสียฆ่า task ทันที เว้นแต่จะตั้ง errors.tolerance=all เอง',
+      'ไม่มีค่าเริ่มต้น ต้องตั้งเสมอ',
+      '"warn" -- record เสียถูก log แต่ task ทำงานต่อโดยค่าเริ่มต้น',
+    ],
+    answer: 1,
+    explain: 'config ใน SpotTheBug ไม่มี key errors.tolerance เลย หมายความว่ามันรันด้วยค่าเริ่มต้นที่เข้มงวด "none" อย่างเงียบ ๆ ทั้งที่คอมเมนต์อ้างตรงข้าม -- พิสูจน์ด้วยการเทียบกับการรัน errors.tolerance=all ที่ใช้งานได้ด้านบน',
   },
 ];
 

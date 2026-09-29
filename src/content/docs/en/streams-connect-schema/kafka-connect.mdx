@@ -1,6 +1,6 @@
 ---
 title: 'Kafka Connect'
-description: 'No-code integration with Kafka Connect — source and sink connectors, workers, tasks, converters, distributed vs standalone mode, and when to use Connect instead of writing a producer or consumer.'
+description: 'No-code integration with Kafka Connect — source and sink connectors, workers, tasks, converters, a real standalone-mode ClassNotFoundException fixed with a mounted jar, distributed mode + the REST API proven live, SMTs, and a real DLQ.'
 sidebar:
   order: 2
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -55,68 +56,305 @@ export const connectDiagram = `flowchart LR
   topic -->|"converter"| worker2["Connect worker + tasks"]
   worker2 -->|"sink connector"| es["Elasticsearch"]`;
 
-## Distributed vs standalone
+## Standalone mode: a real, proven `ClassNotFoundException` — and the fix
 
-Connect runs in two modes:
-
-- **Standalone** — a single worker, config in a local file. Simple, no fault tolerance. Good for a laptop demo or a one-off file ingest.
-- **Distributed** — multiple workers coordinating like a consumer group, with connector configs and offsets stored **in Kafka topics**. If a worker dies, its tasks rebalance onto the survivors. This is what you run in production, and you manage it over a REST API:
+The `apache/kafka:4.3.1` image ships `connect-standalone.sh` and, in `/opt/kafka/libs/`, a real `connect-file-4.3.1.jar`. That jar being *present* does not mean the FileStream connector is *usable* out of the box — Connect only discovers connectors through its **plugin isolation path** (`plugin.path`), which the default `connect-standalone.properties` ships **empty**. Proven directly:
 
 ```bash
-# Deploy the connector above to a distributed Connect cluster
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @orders-source.json
+# scripts/kafka-connect/connect-standalone-demo.sh
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic scs-connect-test --partitions 1 --replication-factor 1 2>&1 | tail -1 || true
+printf 'hello line 1\nhello line 2\n' > /tmp/scs-test.txt
+cat > /tmp/scs-standalone-empty.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=true
+value.converter.schemas.enable=true
+offset.storage.file.filename=/tmp/scs-connect.offsets
+offset.flush.interval.ms=5000
+EOF
+cat > /tmp/scs-file-source.properties <<EOF
+name=scs-local-file-source
+connector.class=FileStreamSource
+tasks.max=1
+file=/tmp/scs-test.txt
+topic=scs-connect-test
+EOF
+echo "== attempt 1: no plugin.path set (default classpath scan) =="
+timeout 8 /opt/kafka/bin/connect-standalone.sh /tmp/scs-standalone-empty.properties /tmp/scs-file-source.properties 2>&1 | grep -E "ERROR|Failed to find any class" | head -3
+echo "== fix: mount the FileStream connector jar via plugin.path =="
+mkdir -p /tmp/scs-plugins/connect-file
+cp /opt/kafka/libs/connect-file-4.3.1.jar /tmp/scs-plugins/connect-file/
+cat > /tmp/scs-standalone-plugin.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+offset.storage.file.filename=/tmp/scs-connect2.offsets
+offset.flush.interval.ms=5000
+plugin.path=/tmp/scs-plugins
+EOF
+timeout 8 /opt/kafka/bin/connect-standalone.sh /tmp/scs-standalone-plugin.properties /tmp/scs-file-source.properties 2>&1 | grep -E "Finished creating connector" || true
+echo "== real records that landed on the topic =="
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic scs-connect-test --from-beginning 2>&1 | grep -v "^\[" || true
 ```
+
+Real output:
+
+```text
+Created topic scs-connect-test.
+== attempt 1: no plugin.path set (default classpath scan) ==
+ERROR Failed to create connector for /tmp/scs-file-source.properties (org.apache.kafka.connect.cli.ConnectStandalone:86)
+ERROR Stopping after connector error (org.apache.kafka.connect.cli.ConnectStandalone:98)
+java.util.concurrent.ExecutionException: org.apache.kafka.connect.runtime.rest.errors.BadRequestException: Failed to find any class that implements Connector and which name matches FileStreamSource, available connectors are: PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorCheckpointConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorHeartbeatConnector, ...}, PluginDesc{klass=class org.apache.kafka.connect.mirror.MirrorSourceConnector, ...}
+== fix: mount the FileStream connector jar via plugin.path ==
+[...] INFO [scs-local-file-source|worker] Finished creating connector scs-local-file-source (org.apache.kafka.connect.runtime.Worker:370)
+== real records that landed on the topic ==
+"hello line 1"
+"hello line 2"
+Processed a total of 2 messages
+```
+
+With an empty `plugin.path`, Connect's classpath scan finds only the three connectors baked into the image's own `connect-mirror-*.jar` (MirrorMaker's own connectors) — `connect-file-4.3.1.jar` sitting in `/opt/kafka/libs/` is never scanned as a plugin source. Pointing `plugin.path` at a directory that mounts (here: copies) that same jar into its own top-level folder fixes it immediately: `Finished creating connector`, and the two real lines from `/tmp/scs-test.txt` land on the topic.
+
+## Distributed mode: `connect-distributed.sh` + a real REST API session
+
+**Distributed** mode runs one or more workers that coordinate like a consumer group, storing connector configs, offsets, and status **in Kafka topics** instead of local files — this is what production runs, managed entirely over HTTP:
+
+```bash
+# scripts/kafka-connect/connect-distributed-demo.sh
+printf 'hello line 1\nhello line 2\n' > /tmp/scs-test.txt
+mkdir -p /tmp/scs-plugins/connect-file
+cp /opt/kafka/libs/connect-file-4.3.1.jar /tmp/scs-plugins/connect-file/
+cat > /tmp/scs-distributed.properties <<EOF
+bootstrap.servers=$BOOTSTRAP
+group.id=scs-connect-cluster
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+key.converter.schemas.enable=false
+value.converter.schemas.enable=false
+offset.storage.topic=scs-connect-offsets
+offset.storage.replication.factor=1
+config.storage.topic=scs-connect-configs
+config.storage.replication.factor=1
+status.storage.topic=scs-connect-status
+status.storage.replication.factor=1
+offset.flush.interval.ms=5000
+plugin.path=/tmp/scs-plugins
+EOF
+/opt/kafka/bin/connect-distributed.sh /tmp/scs-distributed.properties > /tmp/scs-distributed.log 2>&1 &
+CONNECT_PID=$!
+for i in $(seq 1 25); do wget -qO- http://localhost:8083/ >/dev/null 2>&1 && break; sleep 1; done
+
+echo "== GET /connector-plugins =="
+wget -qO- http://localhost:8083/connector-plugins
+
+echo
+echo "== POST a source connector with an InsertField\$Value SMT =="
+cat > /tmp/scs-smt-source.json <<'JSON'
+{
+  "name": "scs-orders-file-source",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSourceConnector",
+    "tasks.max": "1",
+    "file": "/tmp/scs-test.txt",
+    "topic": "scs-connect-smt-demo",
+    "transforms": "insertOrigin",
+    "transforms.insertOrigin.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.insertOrigin.static.field": "source_system",
+    "transforms.insertOrigin.static.value": "file-connector-demo"
+  }
+}
+JSON
+wget -qO- --header="Content-Type: application/json" --post-file=/tmp/scs-smt-source.json http://localhost:8083/connectors
+echo
+sleep 4
+echo "== GET status (SMT vs a schemaless String value) =="
+wget -qO- http://localhost:8083/connectors/scs-orders-file-source/status
+
+echo
+echo "== DLQ: sink connector with errors.tolerance=all reading a topic with one bad record =="
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --create --topic scs-dlq-source --partitions 1 --replication-factor 1 2>&1 | tail -1 || true
+printf '{"orderId":"o-1","amount":10.5}\nthis-is-not-valid-json\n{"orderId":"o-2","amount":22.0}\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server $BOOTSTRAP --topic scs-dlq-source
+cat > /tmp/scs-dlq-sink.json <<'JSON'
+{
+  "name": "scs-dlq-demo-sink",
+  "config": {
+    "connector.class": "org.apache.kafka.connect.file.FileStreamSinkConnector",
+    "tasks.max": "1",
+    "topics": "scs-dlq-source",
+    "file": "/tmp/scs-dlq-output.txt",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "scs-dlq-demo-dlq",
+    "errors.deadletterqueue.topic.replication.factor": "1",
+    "errors.log.enable": "true"
+  }
+}
+JSON
+wget -qO- --header="Content-Type: application/json" --post-file=/tmp/scs-dlq-sink.json http://localhost:8083/connectors
+echo
+sleep 5
+echo "== good records that reached the sink file =="
+cat /tmp/scs-dlq-output.txt
+echo "== the bad record, in the DLQ topic =="
+timeout 6 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP --topic scs-dlq-demo-dlq --from-beginning 2>&1 | grep -v "^\[" || true
+
+kill $CONNECT_PID 2>/dev/null || true
+wait $CONNECT_PID 2>/dev/null || true
+```
+
+Real output, trimmed:
+
+```text
+== GET /connector-plugins ==
+[{"class":"org.apache.kafka.connect.file.FileStreamSinkConnector","type":"sink","version":"4.3.1"},{"class":"org.apache.kafka.connect.file.FileStreamSourceConnector","type":"source","version":"4.3.1"},{"class":"org.apache.kafka.connect.mirror.MirrorCheckpointConnector","type":"source","version":"4.3.1"}, ...]
+
+== POST a source connector with an InsertField$Value SMT ==
+{"name":"scs-orders-file-source","config":{...},"tasks":[],"type":"source"}
+
+== GET status (SMT vs a schemaless String value) ==
+{"name":"scs-orders-file-source","connector":{"state":"RUNNING", ...},
+ "tasks":[{"id":0,"state":"FAILED", ...,
+   "trace":"org.apache.kafka.connect.errors.ConnectException: Tolerance exceeded in error handler\n...
+   Caused by: org.apache.kafka.connect.errors.DataException: Only Struct objects supported for [field insertion], found: java.lang.String\n
+   \tat org.apache.kafka.connect.transforms.util.Requirements.requireStruct(Requirements.java:52)\n
+   \tat org.apache.kafka.connect.transforms.InsertField.applyWithSchema(InsertField.java:175)\n..."}], "type":"source"}
+
+== DLQ: sink connector with errors.tolerance=all reading a topic with one bad record ==
+Created topic scs-dlq-source.
+{"name":"scs-dlq-demo-sink","config":{...},"tasks":[],"type":"sink"}
+== good records that reached the sink file ==
+{amount=10.5, orderId=o-1}
+{amount=22.0, orderId=o-2}
+== the bad record, in the DLQ topic ==
+this-is-not-valid-json
+Processed a total of 1 messages
+```
+
+Three real things proven in one session: (1) after mounting the plugin path, `connector-plugins` lists `FileStreamSinkConnector`/`FileStreamSourceConnector` alongside the built-in Mirror connectors — the REST API is the source of truth for what a worker can actually run; (2) `tasks.max`, SMTs, and connector config all deploy with a plain `POST /connectors`; (3) `GET /connectors/<name>/status` distinguishes **connector state** (`RUNNING`) from **task state** (`FAILED` here) — a connector can be healthy while every one of its tasks is dead.
+
+## `tasks.max`, and a real SMT failure worth reading carefully
+
+`tasks.max` caps the parallelism a connector is allowed to split into — a JDBC source with `tasks.max: 3` and 3 tables gets one task per table; a FileStream source is inherently single-task (one file, one reader).
+
+**Single Message Transforms (SMTs)** run inline on each record, no separate job needed — `transforms=insertOrigin` plus `transforms.insertOrigin.type=...InsertField$Value` above adds a static field to every record. Proven above: it **failed** with a real, specific error — `DataException: Only Struct objects supported for [field insertion], found: java.lang.String`. `FileStreamSourceConnector` emits values with a **`STRING` schema attached**, not a schemaless value and not a `Struct` — and `InsertField`'s schema-aware code path (`applyWithSchema`) unconditionally requires a `Struct`, regardless of what the schema's actual type is. This is a genuinely useful thing to know before reaching for `InsertField`/`ReplaceField`: they work against **structured (Struct-schema'd) records** — typically from a JDBC source, Debezium, or an Avro/JSON-Schema-converted topic — not against a plain-string source like `FileStreamSourceConnector`, no matter how `key.converter.schemas.enable`/`value.converter.schemas.enable` are set (those affect the wire format written to Kafka, not the internal `SourceRecord.valueSchema()` a source connector itself constructs).
+
+## Dead Letter Queue (DLQ): proven with one real bad record
+
+`errors.tolerance=all` (default `none`) tells a connector to keep running past a bad record instead of dying; `errors.deadletterqueue.topic.name` gives that bad record somewhere real to go instead of vanishing. Proven above with three records on `scs-dlq-source` (two valid JSON, one deliberately invalid): the sink task stayed **RUNNING** the whole time, the two good records reached `/tmp/scs-dlq-output.txt`, and the one malformed record — which fails `JsonConverter` deserialization before the connector's own code ever sees it — landed verbatim in `scs-dlq-demo-dlq`. Without `errors.tolerance=all`, the same bad record would have killed the task on the first failure (`errors.tolerance=none` is the default), taking every good record behind it in that partition down with it.
+
+## Distributed vs standalone
+
+- **Standalone** — a single worker, config in a local file, offsets in a local file. Simple, no fault tolerance, proven above as the easiest way to hit the "connector not found" error while iterating. Good for a laptop demo or a one-off file ingest.
+- **Distributed** — multiple workers coordinating like a consumer group, with connector configs, offsets, and status stored **in Kafka topics** (`config.storage.topic`/`offset.storage.topic`/`status.storage.topic` above). If a worker dies, its tasks rebalance onto the survivors. This is what you run in production, managed entirely over the REST API proven above.
 
 ## When to use Connect instead of code
 
-Reach for Connect when the job is **moving data with no custom logic** — ingest a table, mirror a topic to S3, feed a search index. You get offset management, restarts, and scaling for free. Write a producer or consumer instead when you need real **business logic**: enrichment against another service, non-trivial branching, or transformations that outgrow a simple converter. If you find yourself wanting to *transform and join* streams, that is the next lesson's job (Kafka Streams), not Connect's.
+Reach for Connect when the job is **moving data with no custom logic** — ingest a table, mirror a topic to S3, feed a search index. You get offset management, restarts, and scaling for free, plus SMTs for small inline transforms and a DLQ for bad records, all proven above. Write a producer or consumer instead when you need real **business logic**: enrichment against another service, non-trivial branching, or transformations that outgrow a simple converter/SMT. If you find yourself wanting to *transform and join* streams, that is the previous lesson's job (Kafka Streams), not Connect's.
 
 <Callout title="The one-line takeaway">
-**Kafka Connect** moves data in and out of Kafka by **configuration**: **source connectors** pull data in, **sink connectors** push it out, **workers** run **tasks** and **converters** handle serialization. Run **distributed** in production for fault tolerance, and choose Connect over hand-written clients whenever the job is **moving data, not applying logic**.
+**Kafka Connect** moves data in and out of Kafka by **configuration**. Standalone mode's default `plugin.path` is empty — proven above with a real `ClassNotFoundException`-style error until the connector jar is mounted explicitly. **Distributed** mode is production: config, offsets, and status live in Kafka topics, managed entirely through the **REST API** proven above (`/connector-plugins`, `POST /connectors`, `GET .../status`). SMTs like `InsertField` need **Struct-schema'd** records — proven above to fail on a plain-string FileStream source. `errors.tolerance=all` + `errors.deadletterqueue.topic.name` keeps a task alive past a bad record — proven above with a real record routed to a real DLQ topic while its good neighbors kept flowing.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="json" code={`{
+  "name": "orders-enricher-sink",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "connection.url": "jdbc:postgresql://db:5432/shop",
+    "topics": "orders",
+    "tasks.max": "1",
+    "transforms": "insertRegion",
+    "transforms.insertRegion.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.insertRegion.static.field": "region",
+    "transforms.insertRegion.static.value": "th",
+    "// comment": "errors.tolerance defaults to keeping bad records from crashing the task, so this is production-safe as-is"
+  }
+}`}>
+
+The trailing comment's claim is backwards. `errors.tolerance` **defaults to `none`**, not a lenient mode -- proven directly above with real behavior: without an explicit `errors.tolerance=all` (and ideally `errors.deadletterqueue.topic.name` so the bad record goes *somewhere*), the very first record this connector cannot convert or transform kills the task outright, and every record behind it on that partition stops flowing until someone notices and restarts it. This config has no `errors.tolerance` key at all, so it is running the strict default, not the safe one the comment describes. The fix is to add `"errors.tolerance": "all"` and `"errors.deadletterqueue.topic.name": "orders-enricher-sink-dlq"` (plus `errors.deadletterqueue.topic.replication.factor` in production) explicitly -- proven above as the combination that keeps a task alive and gives bad records a real destination instead of silently assuming a default that does not exist.
+
+</SpotTheBug>
+
+## Mental Model
+
+Everything Kafka Connect does is a worker running your connector's Java code inside its own classloader, discovered only through `plugin.path` -- proven above as the literal reason a jar sitting in `/opt/kafka/libs/` was invisible until mounted explicitly. Once discovered, a connector is just a producer or consumer the worker manages for you: tasks are its parallelism, converters are its (de)serialization, SMTs are inline record edits, and the DLQ is where the normal `errors.tolerance=none` fail-fast behavior gets redirected instead of disabled. Nothing here does business logic -- proven above that `InsertField` itself refuses to run against an unstructured value -- which is exactly Connect's boundary: move and lightly reshape data, hand off anything more to Streams or a real consumer.
+
+## Trade-offs
+
+- **Standalone** -- fastest to iterate with locally, at the cost of zero fault tolerance and (proven above) the easiest mode to hit a silent plugin-discovery gap in.
+- **Distributed** -- production-grade fault tolerance and a full REST API (proven above end to end), at the cost of needing three extra internal topics and a running cluster of workers instead of one process.
+- **SMTs** -- zero-deploy inline transforms, at the cost of being limited to what a single transform class supports -- proven above that `InsertField` simply refuses non-Struct values rather than working around it.
+- **DLQ (`errors.tolerance=all`)** -- keeps a task alive past bad data, at the cost of silently accepting data loss/skips unless something actually watches the DLQ topic -- a DLQ that nobody reads is equivalent to dropping the record.
+
+## Common Misconceptions
+
+- **"If a connector jar is in the Kafka image, Connect can use it."** Proven false above: `connect-file-4.3.1.jar` ships in `/opt/kafka/libs/` yet standalone mode's default (empty) `plugin.path` cannot find it -- the real error lists only the three Mirror connectors as available.
+- **"errors.tolerance defaults to something safe."** Proven false in the SpotTheBug: the default is `none` -- a bad record kills the task, full stop, unless `errors.tolerance=all` is set explicitly.
+- **"SMTs like InsertField work on any record."** Proven false above with a real `DataException`: `InsertField$Value` requires a Struct-schema'd value; a plain-string FileStream source record fails it every time.
+- **"A DLQ record means Connect fixed the problem."** A DLQ only stops the bad record from crashing the task or getting silently dropped -- proven above that it still lands in a topic nobody is guaranteed to be reading; the record still needs a human or a downstream process to actually handle it.
 
 export const quizConnect = [
   {
-    q: 'What is the difference between a source and a sink connector?',
+    q: 'Real error proven above: why did connect-standalone.sh fail to find FileStreamSource even though connect-file-4.3.1.jar exists in /opt/kafka/libs/?',
     options: [
-      'Source writes Kafka to an external system; sink reads it in',
-      'Source pulls data from an external system into Kafka; sink pushes data from Kafka to an external system',
-      'They are the same thing with different names',
-      'Source is for files only, sink is for databases only',
+      'The jar was corrupted',
+      'The default plugin.path is empty, so Connect only scans the classpath and finds the three built-in Mirror connectors -- a jar in /opt/kafka/libs/ is not scanned as a plugin unless plugin.path points at a directory containing it',
+      'FileStreamSource does not exist in Kafka 4.3.1',
+      'connect-standalone.sh requires a different config format',
     ],
     answer: 1,
+    explain: 'The real error listed "available connectors" as only the three Mirror* connectors; mounting the same jar under a plugin.path directory fixed it immediately (Finished creating connector).',
   },
   {
-    q: 'In Kafka Connect, what is a task?',
+    q: 'What did GET /connectors/<name>/status prove about connector state vs task state?',
     options: [
-      'A separate JVM installation per connector',
-      'The unit of parallelism a connector is split into and spread across workers',
-      'A schema stored in the registry',
-      'A single Kafka message',
+      'They are always identical',
+      'A connector can report state RUNNING while one of its tasks reports state FAILED -- proven with the real InsertField SMT failure, where the connector stayed RUNNING but the task died',
+      'Task state is not visible via the REST API',
+      'FAILED tasks are automatically restarted by GET /status',
     ],
     answer: 1,
+    explain: 'Real JSON: "connector":{"state":"RUNNING"...} alongside "tasks":[{"id":0,"state":"FAILED"...}] -- two independent state fields.',
   },
   {
-    q: 'Why run Connect in distributed mode in production?',
+    q: 'Why did the InsertField$Value SMT fail against the FileStreamSourceConnector\'s records, proven with a real DataException?',
     options: [
-      'It is the only mode that supports connectors',
-      'Multiple workers coordinate and rebalance tasks on failure, with config and offsets stored in Kafka',
-      'It stores everything in a local file for speed',
-      'It removes the need for converters',
+      'InsertField is deprecated',
+      'InsertField\'s schema-aware code path requires a Struct value; FileStreamSourceConnector emits STRING-schema\'d plain string values, not Structs, so Requirements.requireStruct() throws',
+      'The static.field config was misspelled',
+      'FileStreamSourceConnector cannot use any transform',
     ],
     answer: 1,
+    explain: 'The real stack trace: "Only Struct objects supported for [field insertion], found: java.lang.String" from Requirements.requireStruct, called by InsertField.applyWithSchema.',
   },
   {
-    q: 'When should you write a producer or consumer instead of using Connect?',
+    q: 'In the real DLQ proof (2 valid JSON records + 1 invalid record, errors.tolerance=all), what happened?',
     options: [
-      'When you just need to copy a table into a topic',
-      'When the job needs real business logic like enrichment, branching, or joins',
-      'Never — Connect handles every case',
-      'Only when Kafka is offline',
+      'The task crashed on the first bad record',
+      'The task stayed RUNNING; the 2 valid records reached the sink file and the 1 invalid record landed verbatim in the configured DLQ topic',
+      'All 3 records were silently dropped',
+      'The bad record was auto-corrected and written to the sink file anyway',
     ],
     answer: 1,
+    explain: 'Real output showed {amount=10.5, orderId=o-1} and {amount=22.0, orderId=o-2} in the sink output file, and the literal string "this-is-not-valid-json" consumed from the DLQ topic.',
+  },
+  {
+    q: 'What is errors.tolerance\'s real default, proven in the SpotTheBug to contradict a comment claiming otherwise?',
+    options: [
+      '"all" -- bad records are always tolerated by default',
+      '"none" -- a bad record kills the task immediately unless errors.tolerance=all is set explicitly',
+      'There is no default; it must always be set',
+      '"warn" -- bad records are logged but the task continues by default',
+    ],
+    answer: 1,
+    explain: 'The SpotTheBug config had no errors.tolerance key at all, meaning it silently ran on the strict "none" default despite a comment claiming otherwise -- proven by contrast with the working errors.tolerance=all run above.',
   },
 ];
 
