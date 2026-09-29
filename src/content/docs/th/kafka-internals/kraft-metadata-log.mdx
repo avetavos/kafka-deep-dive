@@ -1,0 +1,228 @@
+---
+title: 'KRaft Metadata Log'
+description: 'record type จริงของ __cluster_metadata ที่ decode ด้วย kafka-dump-log.sh --cluster-metadata-decoder, config snapshot, metadata propagate ยังไง, field ของ kafka-metadata-quorum.sh describe --replication, และ controller failover จริง -- พิสูจน์บน Kafka 4.3.1 KRaft.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## สรุปในหนึ่งบรรทัด
+
+cluster metadata ไม่ใช่ฐานข้อมูลที่ controller query -- มันคือ log แบบ append-only สไตล์ Kafka ปกติ (topic ภายในชื่อ `__cluster_metadata`) replicate ด้วย Raft quorum ของ controller decode ได้ด้วยเครื่องมือ `kafka-dump-log.sh` ตัวเดียวกับที่ใช้กับ topic ข้อมูลทั่วไป แค่มี decoder ที่รู้จัก schema ของ record metadata
+
+<Callout title="แก้ชื่อเครื่องมือหนึ่งตัวจากแผนเดิม">
+brief ของบทนี้ระบุ `kafka-metadata.sh` เป็นเครื่องมือที่ต้องเช็ค binary ตัวนั้นไม่มีอยู่บน `apache/kafka:4.3.1` -- `ls /opt/kafka/bin | grep metadata` แสดงแค่ `kafka-metadata-quorum.sh` (ใช้ตลอดบทนี้) และ `kafka-metadata-shell.sh` (shell แบบ interactive สำหรับดู tree ของ metadata log ไม่ได้ใช้ที่นี่) นี่คือรายละเอียดเล็ก ๆ ที่หลอนง่ายพอดีที่โมดูลนี้มีไว้เพื่อจับ ด้วยการรันคำสั่งจริงแทนการสันนิษฐานชื่อ
+</Callout>
+
+## record type จริง decode แล้ว
+
+dump partition 0 ของ `__cluster_metadata` ของโมดูลนี้เองด้วย cluster-metadata decoder:
+
+```bash
+# scripts/kraft-metadata-log/dump-cluster-metadata.sh
+/opt/kafka/bin/kafka-dump-log.sh --cluster-metadata-decoder \
+  --files /tmp/kafka-logs/__cluster_metadata-0/00000000000000000000.log \
+  | grep -o '"type":"[A-Z_]*"' | sort -u
+```
+
+output จริง ไม่แก้ไข -- record type ทุกตัวที่คลัสเตอร์นี้เขียนจริงระหว่าง startup ปกติและการสร้าง topic ไม่มีตัวอย่างสังเคราะห์เลย:
+
+```text
+"type":"BEGIN_TRANSACTION_RECORD"
+"type":"BROKER_REGISTRATION_CHANGE_RECORD"
+"type":"CONFIG_RECORD"
+"type":"END_TRANSACTION_RECORD"
+"type":"FEATURE_LEVEL_RECORD"
+"type":"NO_OP_RECORD"
+"type":"PARTITION_RECORD"
+"type":"PRODUCER_IDS_RECORD"
+"type":"REGISTER_BROKER_RECORD"
+"type":"REGISTER_CONTROLLER_RECORD"
+"type":"TOPIC_RECORD"
+```
+
+`PARTITION_CHANGE_RECORD` (การเปลี่ยน ISR) ไม่ปรากฏที่นี่ -- คลัสเตอร์ single-broker นี้ ISR ไม่เคยเปลี่ยน มันถูกพิสูจน์ตรง พร้อมเนื้อหาจริง ใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)'s คลัสเตอร์ 3-broker: `{"type":"PARTITION_CHANGE_RECORD","version":2,"data":{"partitionId":0,"topicId":"...","isr":[1,2]}}` แล้วต่อมา `{"...,"isr":[2,3],"leader":2}` ระหว่าง ISR shrink และ controller failover ของบทนั้น
+
+record จริงบางตัวที่คุ้มค่าอ่านให้ละเอียด ตามลำดับที่เขียนจริงตอน startup คลัสเตอร์:
+
+```text
+baseOffset: 0 ... isControl: true ...
+| offset: 0 ... LeaderChange: {"version":0,"leaderId":1,"voters":[{"voterId":1}],"grantingVoters":[{"voterId":1}]}
+```
+
+record แรกสุดใน log คือ **control record** ชื่อ `LeaderChange` -- นี่คือ proof การเลือก leader ของ Raft เอง ไม่ใช่ metadata ของ application; มันมีอยู่เพราะ `__cluster_metadata` ถูก replicate ด้วยกลไก Raft เดียวกันที่ controller ใช้ตกลงกันเรื่องอื่นทั้งหมด ดังนั้นแม้แต่*ความเป็น leader ของ log ตัวนี้เอง*ก็ถูกบันทึกใน*log ตัวนี้เอง*
+
+```text
+| offset: 2 ... payload: {"type":"FEATURE_LEVEL_RECORD","version":0,"data":{"name":"metadata.version","featureLevel":30}}
+| offset: 3 ... payload: {"type":"FEATURE_LEVEL_RECORD","version":0,"data":{"name":"eligible.leader.replicas.version","featureLevel":1}}
+| offset: 8 ... payload: {"type":"CONFIG_RECORD","version":0,"data":{"resourceType":4,"resourceName":"","name":"min.insync.replicas","value":"1"}}
+| offset: 10 ... payload: {"type":"REGISTER_CONTROLLER_RECORD","version":0,"data":{"controllerId":1,"incarnationId":"...","endPoints":[{"name":"CONTROLLER","host":"localhost","port":29093,...}],"features":[...]}}
+| offset: 11 ... payload: {"type":"REGISTER_BROKER_RECORD","version":4,"data":{"brokerId":1,"incarnationId":"...","brokerEpoch":11,"endPoints":[...],"fenced":true,"logDirs":[...]}}
+```
+
+`eligible.leader.replicas.version` ที่ `featureLevel:1` ที่นี่คือข้อเท็จจริง finalized-feature ของ [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas) เดียวกันที่ [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) พิสูจน์ด้วย `kafka-features.sh describe` -- ที่นี่มันคือ record จริงในตัว metadata log ที่*ทำให้*มันเป็นจริง ไม่ใช่แค่ผลลัพธ์ของ query ที่รายงานมัน `"fenced":true` ของ `REGISTER_BROKER_RECORD` ก็จริงเช่นกัน: ทุก broker เริ่มต้นแบบ**ถูก fence** (lead partition ไม่ได้) จนกว่า controller จะยืนยันว่ามันตามทัน metadata แล้ว `BROKER_REGISTRATION_CHANGE_RECORD` ที่มี `"fenced":-1` (sentinel สำหรับ "unset/false" ใน encoding ของ record นี้) ตามมาไม่นานหลังจากนั้น unfence มัน
+
+ต่อมา การสร้าง topic สร้าง record type สองตัวตรงตามที่คาด:
+
+```text
+{"type":"TOPIC_RECORD","version":0,"data":{"name":"internals-pipeline-demo","topicId":"FQwkK_oVSZeJP5dIDq-bSw"}}
+{"type":"PARTITION_RECORD","version":2,"data":{"partitionId":0,"topicId":"FQwkK_oVSZeJP5dIDq-bSw","replicas":[1],"isr":[1],
+  "removingReplicas":[],"addingReplicas":[],"leader":1,"leaderEpoch":0,"partitionEpoch":0,"directories":["..."]}}
+```
+
+หนึ่ง `TOPIC_RECORD` สำหรับ mapping ชื่อ/ID หนึ่ง `PARTITION_RECORD` ต่อ partition ที่พก field `replicas`/`isr`/`leader` เดียวกันเป๊ะที่ `kafka-topics.sh --describe` อ่านกลับมา -- output ของ CLI นั้นไม่ใช่แหล่งความจริงแยกต่างหาก มันคือ record นี้ ที่ถูก format แล้ว
+
+## Snapshot: config พิสูจน์แล้ว snapshot ตัวจริงไม่ (อย่างซื่อตรง)
+
+```bash
+# scripts/kraft-metadata-log/snapshot-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "metadata.log.max"
+```
+
+output จริง:
+
+```text
+metadata.log.max.record.bytes.between.snapshots=20971520 sensitive=false synonyms={DEFAULT_CONFIG:metadata.log.max.record.bytes.between.snapshots=20971520}
+metadata.log.max.snapshot.interval.ms=3600000 sensitive=false synonyms={DEFAULT_CONFIG:metadata.log.max.snapshot.interval.ms=3600000}
+```
+
+`20971520` ไบต์คือ 20 MiB -- snapshot (ภาพรวม state metadata ทั้งหมด ณ จุดเวลาหนึ่ง แบบ compact ให้ controller/broker ที่ restart หรือ join ใหม่ตามทันได้โดยไม่ต้อง replay log ทั้งหมดจาก offset 0) ถูก trigger เมื่อ record ใหม่สะสมถึงจำนวนไบต์นี้นับจากครั้งล่าสุด หรือ `metadata.log.max.snapshot.interval.ms` (1 ชั่วโมงโดย default) ผ่านไป แล้วแต่อันไหนถึงก่อน คลัสเตอร์ของโมดูลนี้เองไม่เคยเขียน metadata record ใกล้ 20 MiB เลยในช่วงชีวิตสั้น ๆ ของมัน ดังนั้น `ls /tmp/kafka-logs/__cluster_metadata-0/*.checkpoint` บนคลัสเตอร์นี้คืนค่าเปล่าจริง ๆ -- **ไม่มีการแทนที่ด้วย proof สังเคราะห์ที่นี่**; ไฟล์ snapshot จริง (ชื่อ `<offset>-<epoch>.checkpoint`) จะปรากฏเมื่อข้ามขอบเขตไบต์หรือเวลานั้นไปแล้ว และบทนี้ซื่อตรงว่าการไปถึงจุดนั้นไม่สมเหตุสมผลภายในขอบเขตของ session พิสูจน์นี้
+
+## broker fetch metadata ยังไง: คลัสเตอร์นี้เป็น combined-mode อย่างซื่อตรง
+
+ทุก "broker" ใน compose ของโมดูลนี้คือ `process.roles=broker,controller` -- node แบบ **combined** เดียวกับที่ [KRaft & the Cluster](/kafka/th/foundations/kraft-and-the-cluster/) แนะนำไปแล้ว ใน combined mode บทบาท broker และ controller รันอยู่ **ใน JVM process เดียวกัน** ดังนั้นไม่มี `FetchRequest` แบบข้าม process ที่คลัสเตอร์นี้จะแสดงใน request log ได้ -- ฝั่ง broker แค่อ่าน state ของ metadata log ในหน่วยความจำของ controller ตรง ๆ ไม่ต้องมี RPC เลย บนคลัสเตอร์แบบ **isolated** (node controller-only และ broker-only แยกกัน -- topology ที่แนะนำสำหรับ production ตาม [KRaft & the Cluster](/kafka/th/foundations/kraft-and-the-cluster/)) broker จะส่ง `FetchRequest` จริงไปหา leader ของ controller quorum เพื่อ replicate `__cluster_metadata` โดยใช้ API key `FETCH` ตัวเดียวกับที่ data replication ใช้ คลัสเตอร์ 3-broker *combined* ของโมดูลนี้เอง ([Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)) ยังแสดงสิ่งที่ใกล้เคียงและจริง: `raft-client-2`/`raft-client-3` ส่ง request `FETCH` ที่ `clientId` ระบุ Raft client ตรง ๆ และ `replicaState.replicaId` ตรงกับ controller ID -- proof ว่ากลไก replication ข้างใต้ของ `__cluster_metadata` คือคู่ `FetchRequest`/`FetchResponse` เดียวกันกับ data replication ของ topic แค่ส่งไปที่ leader ของ controller quorum แทน leader ของ partition:
+
+```text
+"requestHeader":{"requestApiKey":1,"clientId":"raft-client-3","requestApiKeyName":"FETCH"},
+"request":{"clusterId":"5L6g3nShT-eMCtK--X86sw","replicaState":{"replicaId":3,"replicaEpoch":-1},
+  "topics":[{"topicId":"AAAAAAAAAAAAAAAAAAAAAQ","partitions":[{"partition":0,"fetchOffset":55,...,"highWatermark":55}]}]},
+"response":{...,"currentLeader":{"leaderId":1,"leaderEpoch":1},...}}
+```
+
+`"topicId":"AAAAAAAAAAAAAAAAAAAAAQ"` ที่นี่คือ topic ID ตายตัวของ `__cluster_metadata` เอง (base64 ของ UUID ที่รู้จักกันดี ไม่ใช่ตัวที่สุ่มมาแบบ topic ปกติ) -- นี่คือ metadata log ที่ถูก fetch ผ่านกลไกเดียวกันเป๊ะกับ partition อื่นใด
+
+## `kafka-metadata-quorum.sh describe --replication`: field จริง
+
+```bash
+# scripts/kraft-metadata-log/quorum-replication.sh
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $BOOTSTRAP describe --replication
+```
+
+output จริงบน combined node เดียวของโมดูลนี้เอง:
+
+```text
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status
+1     	AAAAAAAAAAAAAAAAAAAAAA	1227        	0  	1790650194864     	1790650194864        	Leader
+```
+
+บน quorum 3-node จริงของ [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) คำสั่งเดียวกันทันทีหลัง broker 1 ถูกหยุด แสดงพอดีว่า voter ที่ lag/เข้าถึงไม่ได้หน้าตาเป็นยังไงจากมุมมองของ quorum leader เอง:
+
+```text
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status
+2     	AAAAAAAAAAAAAAAAAAAAAA	342         	0  	1790650466818     	1790650466818        	Leader
+1     	AAAAAAAAAAAAAAAAAAAAAA	-1          	343	-1                	-1                   	Follower
+3     	AAAAAAAAAAAAAAAAAAAAAA	342         	0  	1790650466611     	1790650466611        	Follower
+```
+
+`LogEndOffset:-1` และ `LastFetchTimestamp:-1` ของ broker 1 (sentinel value จริง ไม่ใช่ศูนย์) แปลว่า "voter นี้ไม่ได้ fetch เลยตั้งแต่เข้าถึงไม่ได้" -- ต่างจาก `Lag:343` ซึ่งคือ position ล่าสุดที่รู้ของมันตามหลัง end offset ของ leader ใหม่แค่ไหน `Status: Leader`/`Follower` ที่นี่อธิบายบทบาทของแต่ละ node ใน **metadata quorum โดยเฉพาะ** -- node หนึ่งเป็น follower ของ data-partition และเป็น leader ของ metadata quorum ในเวลาเดียวกันได้ การเลือกตั้งแบบ Raft สองอัน (leader ต่อ partition, leader ของ controller-quorum) เป็นอิสระจากกัน
+
+## Controller failover เต็มรูปแบบ
+
+[Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) พิสูจน์เลขหลักไปแล้ว -- controller leader ตัวใหม่ถูกเลือกและให้บริการได้ภายในประมาณ 4.2 วินาทีหลังหยุดตัวเก่า `LeaderEpoch` เพิ่มจาก `1` → `2` มุมมองระดับ metadata-log ของเหตุการณ์เดียวกันนี้: ทันทีที่ broker 2 กลายเป็น quorum leader ใหม่ มันเขียน control record `LeaderChange` ใหม่ (record type เดียวกับที่เปิดบทนี้) เข้า `__cluster_metadata` ที่ leader epoch ใหม่ของมัน เหมือนกับ record แรกสุดที่คลัสเตอร์นี้เคยเขียนตอน startup เป๊ะ controller ตัวอื่นทุกตัว (และใน topology แบบ isolated broker ทุกตัว) รู้จัก leader ใหม่ด้วยการ replicate record ตัวนั้นตัวเดียว ผ่านกลไก `FetchRequest` เดียวกันที่แสดงข้างบน -- ไม่มี protocol "ประกาศ leader" แยกต่างหากจาก metadata log เอง
+
+## Mental Model
+
+`__cluster_metadata` คือ Kafka replicate Kafka: log แบบ append-only เดียวกัน replication ที่ขับเคลื่อนด้วย `FetchRequest` เดียวกัน เครื่องมือ `kafka-dump-log.sh` เดียวกัน แค่เอามาใช้อีกระดับหนึ่งกับข้อมูลที่อธิบาย topic อื่นทุกตัว แทนข้อมูลของ application **Snapshot** คือสิ่งที่เทียบเท่ากับการ collapse tombstone ของ compaction ในบริบทของ log นี้ -- สรุปภาพ ณ จุดเวลาหนึ่งที่ให้ member ใหม่หรือที่กำลังฟื้นตัวข้าม replay ประวัติที่ไม่ต้องการได้ ทุกข้อเท็จจริงที่ broker หรือ client เคยรู้เกี่ยวกับ cluster state -- broker ไหน lead partition ไหน, ISR คืออะไร, feature ไหน finalized แล้ว -- สุดท้ายย้อนกลับไปที่ record ตัวหนึ่งที่ offset ตัวหนึ่งใน log ตัวเดียวนี้ พิสูจน์ได้ด้วย decoder ตัวเดียวกันที่ใช้ตลอดบทนี้
+
+## Trade-offs
+
+| ตัวเลือก | ประโยชน์ | ต้นทุน |
+|---|---|---|
+| Combined mode (คลัสเตอร์ของโมดูลนี้) | รันง่ายกว่า -- หนึ่ง process ต่อ node พิสูจน์ตลอดการตั้งค่า `running-kafka-locally` ของคอร์สนี้ | ไม่มี `FetchRequest` broker→controller แยกให้สังเกต (พิสูจน์แล้วข้างบน); topology production เลือก isolated mode ด้วยเหตุผลนี้และอื่น ๆ |
+| Isolated mode (controller แยกเฉพาะ) | controller quorum แยกจาก load ของ data-plane; `FetchRequest` ที่บทนี้อธิบายเป็นของจริงและสังเกตได้ | process/node ให้รันและ monitor เยอะขึ้น |
+| `metadata.log.max.record.bytes.between.snapshots` ต่ำ | node ใหม่/ที่ฟื้นตัวตามทันเร็วขึ้น (log ให้ replay น้อยลง) | overhead การเขียน snapshot บ่อยขึ้น |
+| `metadata.log.max.snapshot.interval.ms` สูง | overhead snapshot น้อยลงบนคลัสเตอร์ที่เงียบ | node ที่ฟื้นตัวด้วย snapshot เก่า replay log มากขึ้นกว่าจะตามทัน |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"controller เก็บ cluster state ในฐานข้อมูล แยกจากกลไก log ของ Kafka เอง"** พิสูจน์แล้วข้างบน: มันคือ `__cluster_metadata` log สไตล์ Kafka ปกติ decode ด้วย `kafka-dump-log.sh` ตัวเดียวกับที่ใช้กับ topic ใดก็ได้
+- **"`kafka-metadata.sh` คือเครื่องมือสำหรับตรวจ metadata quorum"** แก้ไขแล้วข้างบน: binary นั้นไม่มีอยู่บน 4.3.1 เครื่องมือจริงคือ `kafka-metadata-quorum.sh` (ใช้ตลอดบทนี้) และ `kafka-metadata-shell.sh`
+- **"snapshot คือกลไก backup พิเศษแยกต่างหากที่ operator ต้องตั้งค่า"** พิสูจน์แล้วข้างบน: มันขับเคลื่อนด้วย config (`metadata.log.max.record.bytes.between.snapshots`/`...interval.ms`) และเกิดอัตโนมัติ -- บทนี้พูดตรง ๆ ว่าไม่ได้สังเกต snapshot ตัวจริงเพราะคลัสเตอร์นี้อายุสั้นไม่เคยข้ามขอบเขตทั้งสองเลย
+- **"broker ที่ fetch metadata ใช้ protocol ต่างจาก replication ปกติ"** พิสูจน์แล้วข้างบนด้วยบรรทัด request log จริง: request `FETCH` ของ Raft client คือ API key `FETCH` ตัวเดียวกันเป๊ะ แค่ส่งไปที่ topic ID ตายตัวของ `__cluster_metadata` แทน topic ข้อมูลปกติ
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="bash" code={`# AI-suggested "faster recovery" runbook step
+# "Delete __cluster_metadata's snapshot files to force a clean resync
+# from the beginning of the log -- guarantees consistency."
+rm /tmp/kraft-combined-logs/__cluster_metadata-0/*.checkpoint`}>
+ปัญหาจริงสองข้อ ทั้งคู่พิสูจน์ได้จากบทนี้ ข้อแรก path ผิดสำหรับ `log.dirs` default จริงของ image นี้ (`/tmp/kafka-logs` พิสูจน์ตลอดคอร์สนี้และโมดูลนี้ -- ไม่ใช่ `/tmp/kraft-combined-logs` ซึ่งเป็น path จาก config ตัวอย่างของ Kafka รุ่นเก่าที่ image นี้ไม่ได้ใช้เว้นแต่ตั้ง `log.dirs` ไว้เป็นอื่นตรง ๆ) ข้อสอง และร้ายแรงกว่า: snapshot คือการ optimize ไม่ใช่แหล่งความจริง การลบมันไม่ได้ "บังคับ resync สะอาด" มันแค่แปลว่า restart ครั้งถัดไป replay log มากขึ้น (หรือถ้า log เองถูกตัดไปแล้วโดยอิงว่า snapshot นี้มีอยู่ ก็ replay จากจุดที่อาจไม่มีประวัติเต็มแล้ว) วิธีที่ปลอดภัยจริงในการบังคับ broker เข้าร่วมใหม่จากศูนย์คือ procedure decommission/rejoin ที่บันทึกไว้ ไม่ใช่การลบไฟล์มือใน `log.dirs`
+</SpotTheBug>
+
+export const quizKraftMetadataLog = [
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยการ dump __cluster_metadata ผ่าน kafka-dump-log.sh --cluster-metadata-decoder record แรกสุดที่ถูกเขียนเข้า log นี้ตอน startup คลัสเตอร์คืออะไร?',
+    options: [
+      'A TOPIC_RECORD for the first user topic',
+      'A control record, LeaderChange -- Raft\'s own leader-election proof for the metadata log itself',
+      'A CONFIG_RECORD with the cluster\'s default settings',
+      'An empty NO_OP_RECORD placeholder',
+    ],
+    answer: 1,
+    explain: 'dump จริงข้างบนแสดง offset 0 เป็น isControl:true พร้อม payload LeaderChange -- metadata log บันทึกความเป็น leader Raft ของตัวเองแบบเดียวกับที่บันทึกอย่างอื่นทุกอย่าง เพราะมันถูก replicate ด้วยกลไกเดียวกัน',
+  },
+  {
+    q: 'brief ของบทนี้ระบุเครื่องมือ "kafka-metadata.sh" พิสูจน์แล้วข้างบนด้วยการเช็ค /opt/kafka/bin จริง อะไรคือความจริง?',
+    options: [
+      'kafka-metadata.sh exists and works as expected',
+      'That binary does not exist on apache/kafka:4.3.1 -- the real tools are kafka-metadata-quorum.sh and kafka-metadata-shell.sh',
+      'kafka-metadata.sh was renamed to kafka-dump-log.sh',
+      'It only exists in isolated-controller mode',
+    ],
+    answer: 1,
+    explain: '`ls /opt/kafka/bin | grep metadata` จริงคืนแค่ kafka-metadata-quorum.sh และ kafka-metadata-shell.sh -- บทนี้แก้ชื่อเครื่องมือที่แผนสันนิษฐานไว้ให้ตรงกับ image จริง แทนการสันนิษฐานเอา',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบน (บทนี้ซื่อตรงว่าไม่ได้สังเกตตัวจริง) ทำไมคลัสเตอร์ของโมดูลนี้เองไม่เคยสร้างไฟล์ snapshot (.checkpoint) ของ __cluster_metadata เลย?',
+    options: [
+      'Snapshots are disabled by default and must be manually enabled',
+      'Neither snapshot trigger (20 MiB of new records via metadata.log.max.record.bytes.between.snapshots, or the 1-hour metadata.log.max.snapshot.interval.ms) was crossed during this short-lived proof session',
+      'Snapshots only exist in isolated-controller mode',
+      'The broker crashed before it could write one',
+    ],
+    answer: 1,
+    explain: 'kafka-configs.sh --describe แสดงขอบเขตจริงที่ไม่ได้แก้ไข (20971520 ไบต์ / 3600000ms) -- metadata log ของคลัสเตอร์นี้ไม่เคยโตขนาดนั้นหรืออยู่นานขนาดนั้น และบทนี้พูดตรง ๆ แทนการปั้น snapshot ตัวอย่างขึ้นมา',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย quorum 3-node จริง describe --replication ทันทีหลังหยุด voter ตัวหนึ่ง LogEndOffset:-1 และ LastFetchTimestamp:-1 ของ voter นั้นแปลว่าอะไรจริง ๆ?',
+    options: [
+      'The voter has zero data replicated, ever',
+      'Real sentinel values meaning this voter has not fetched at all since becoming unreachable -- distinct from Lag, which measures how far behind the new leader\'s end offset its last-known position was',
+      'A formatting error in the CLI output',
+      'The voter was removed from the cluster permanently',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรงจาก output describe --replication จริง: -1 คือ sentinel สำหรับ "ไม่ได้ fetch ล่าสุด" ไม่ใช่ศูนย์หรือ error -- และมันปรากฏคู่กับค่า Lag ที่ไม่ใช่ศูนย์จริง (343) สำหรับ voter ที่ถูกหยุดตัวเดียวกัน',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนโดยเทียบคลัสเตอร์ combined-mode ของโมดูลนี้กับ request log จากคลัสเตอร์ 3-broker ความสัมพันธ์จริงระหว่าง metadata replication กับ data replication ปกติของ partition คืออะไร?',
+    options: [
+      'They are completely unrelated, separate protocols',
+      'They use the identical FETCH API key and FetchRequest/FetchResponse mechanism -- metadata replication just addresses __cluster_metadata\'s fixed topic ID instead of a data topic',
+      'Metadata replication uses a special METADATA_FETCH API key not used for data',
+      'Metadata is replicated via a completely separate gRPC service',
+    ],
+    answer: 1,
+    explain: 'request FETCH จริงของ raft-client-3 ข้างบนใช้ requestApiKey:1 (API key FETCH ตัวเดียวกับที่ data replication ใช้) แค่ชี้ไปที่ topicId AAAAAAAAAAAAAAAAAAAAAQ -- topic ID ตายตัวที่รู้จักกันดีของ __cluster_metadata แทนตัวที่สุ่มมา',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/kraft-metadata-log" questions={quizKraftMetadataLog} />
+
+<ProgressTracker client:visible id="kafka-internals/kraft-metadata-log" />

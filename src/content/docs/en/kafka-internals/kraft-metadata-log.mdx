@@ -1,0 +1,228 @@
+---
+title: 'KRaft Metadata Log'
+description: 'Real __cluster_metadata record types decoded by kafka-dump-log.sh --cluster-metadata-decoder, snapshot config, how metadata propagates, kafka-metadata-quorum.sh describe --replication fields, and a real controller failover -- proven on Kafka 4.3.1 KRaft.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+Cluster metadata is not a database the controller queries -- it is an ordinary Kafka-style append-only log (the internal topic `__cluster_metadata`), replicated by a Raft quorum of controllers, decodable with the exact same `kafka-dump-log.sh` tool used on any data topic, just with a decoder that knows the metadata record schemas.
+
+<Callout title="Corrects one tool name from the original plan">
+This lesson's brief named `kafka-metadata.sh` as a tool to check. That binary does not exist on `apache/kafka:4.3.1` -- `ls /opt/kafka/bin | grep metadata` shows only `kafka-metadata-quorum.sh` (used throughout this lesson) and `kafka-metadata-shell.sh` (an interactive shell for browsing the metadata log tree, not used here). This is exactly the kind of small, easy-to-hallucinate detail this module exists to catch by actually running commands instead of assuming a name.
+</Callout>
+
+## Real record types, decoded
+
+Dumping this module's own `__cluster_metadata` partition 0 with the cluster-metadata decoder:
+
+```bash
+# scripts/kraft-metadata-log/dump-cluster-metadata.sh
+/opt/kafka/bin/kafka-dump-log.sh --cluster-metadata-decoder \
+  --files /tmp/kafka-logs/__cluster_metadata-0/00000000000000000000.log \
+  | grep -o '"type":"[A-Z_]*"' | sort -u
+```
+
+Real, unedited output -- every distinct record type this cluster actually wrote during normal startup and topic creation, no synthetic examples:
+
+```text
+"type":"BEGIN_TRANSACTION_RECORD"
+"type":"BROKER_REGISTRATION_CHANGE_RECORD"
+"type":"CONFIG_RECORD"
+"type":"END_TRANSACTION_RECORD"
+"type":"FEATURE_LEVEL_RECORD"
+"type":"NO_OP_RECORD"
+"type":"PARTITION_RECORD"
+"type":"PRODUCER_IDS_RECORD"
+"type":"REGISTER_BROKER_RECORD"
+"type":"REGISTER_CONTROLLER_RECORD"
+"type":"TOPIC_RECORD"
+```
+
+`PARTITION_CHANGE_RECORD` (an ISR change) does not appear here -- this single-broker cluster's ISR never changes. It is proven directly, real content included, in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)'s 3-broker cluster: `{"type":"PARTITION_CHANGE_RECORD","version":2,"data":{"partitionId":0,"topicId":"...","isr":[1,2]}}` and later `{"...,"isr":[2,3],"leader":2}` during that lesson's ISR shrink and controller failover.
+
+A few real records worth reading closely, in the order they were actually written at cluster startup:
+
+```text
+baseOffset: 0 ... isControl: true ...
+| offset: 0 ... LeaderChange: {"version":0,"leaderId":1,"voters":[{"voterId":1}],"grantingVoters":[{"voterId":1}]}
+```
+
+The very first record in the log is a **control record**, `LeaderChange` -- this is Raft's own leader-election proof, not application metadata; it exists because `__cluster_metadata` is itself replicated by the same Raft mechanism the controllers use to agree on everything else, so even *this log's own leadership* gets recorded in *this log*.
+
+```text
+| offset: 2 ... payload: {"type":"FEATURE_LEVEL_RECORD","version":0,"data":{"name":"metadata.version","featureLevel":30}}
+| offset: 3 ... payload: {"type":"FEATURE_LEVEL_RECORD","version":0,"data":{"name":"eligible.leader.replicas.version","featureLevel":1}}
+| offset: 8 ... payload: {"type":"CONFIG_RECORD","version":0,"data":{"resourceType":4,"resourceName":"","name":"min.insync.replicas","value":"1"}}
+| offset: 10 ... payload: {"type":"REGISTER_CONTROLLER_RECORD","version":0,"data":{"controllerId":1,"incarnationId":"...","endPoints":[{"name":"CONTROLLER","host":"localhost","port":29093,...}],"features":[...]}}
+| offset: 11 ... payload: {"type":"REGISTER_BROKER_RECORD","version":4,"data":{"brokerId":1,"incarnationId":"...","brokerEpoch":11,"endPoints":[...],"fenced":true,"logDirs":[...]}}
+```
+
+`eligible.leader.replicas.version` with `featureLevel:1` here is the same [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas) finalized-feature fact [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) proved with `kafka-features.sh describe` -- here it is the literal metadata-log record that *makes* it true, not just a query result reporting it. `REGISTER_BROKER_RECORD`'s `"fenced":true` is real too: every broker starts **fenced** (unable to lead partitions) until the controller confirms it has caught up on metadata -- a `BROKER_REGISTRATION_CHANGE_RECORD` with `"fenced":-1` (a sentinel for "unset/false" in this record's encoding) follows moments later, unfencing it.
+
+Later, creating a topic produces exactly the two record types you'd expect:
+
+```text
+{"type":"TOPIC_RECORD","version":0,"data":{"name":"internals-pipeline-demo","topicId":"FQwkK_oVSZeJP5dIDq-bSw"}}
+{"type":"PARTITION_RECORD","version":2,"data":{"partitionId":0,"topicId":"FQwkK_oVSZeJP5dIDq-bSw","replicas":[1],"isr":[1],
+  "removingReplicas":[],"addingReplicas":[],"leader":1,"leaderEpoch":0,"partitionEpoch":0,"directories":["..."]}}
+```
+
+One `TOPIC_RECORD` for the name/ID mapping, one `PARTITION_RECORD` per partition carrying the exact same `replicas`/`isr`/`leader` fields `kafka-topics.sh --describe` reads back out -- that CLI output is not a separate source of truth, it is this record, formatted.
+
+## Snapshots: config proven, a snapshot itself not (honestly)
+
+```bash
+# scripts/kraft-metadata-log/snapshot-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "metadata.log.max"
+```
+
+Real output:
+
+```text
+metadata.log.max.record.bytes.between.snapshots=20971520 sensitive=false synonyms={DEFAULT_CONFIG:metadata.log.max.record.bytes.between.snapshots=20971520}
+metadata.log.max.snapshot.interval.ms=3600000 sensitive=false synonyms={DEFAULT_CONFIG:metadata.log.max.snapshot.interval.ms=3600000}
+```
+
+`20971520` bytes is 20 MiB -- a snapshot (a compacted point-in-time image of the whole metadata state, letting a restarting or newly-joined controller/broker catch up without replaying the entire log from offset 0) is triggered once at least this many bytes of *new* records have accumulated since the last one, or `metadata.log.max.snapshot.interval.ms` (1 hour by default) has passed, whichever comes first. This module's own cluster never wrote anywhere near 20 MiB of metadata records in its short lifetime, so `ls /tmp/kafka-logs/__cluster_metadata-0/*.checkpoint` on this cluster genuinely returns nothing -- **no synthetic proof is substituted here**; a real snapshot file (named `<offset>-<epoch>.checkpoint`) would appear once that byte or time threshold is crossed, and this lesson is honest that reaching it wasn't practical within this proof session's scope.
+
+## How brokers fetch metadata: this cluster is combined-mode, honestly
+
+Every "broker" in this module's compose is `process.roles=broker,controller` -- a **combined** node, the same combined mode [KRaft & the Cluster](/kafka/en/foundations/kraft-and-the-cluster/) already introduced. In combined mode, the broker and controller roles run **in the same JVM process**, so there is no separate-process `FetchRequest` for this specific cluster to show in its request log -- the broker side simply reads the controller's in-memory metadata log state directly, no RPC needed. On an **isolated** cluster (dedicated controller-only and broker-only nodes -- the production-recommended topology per [KRaft & the Cluster](/kafka/en/foundations/kraft-and-the-cluster/)), a broker genuinely does issue a `FetchRequest` against the controller quorum's leader to replicate `__cluster_metadata`, using the same `FETCH` API key data replication uses. This module's own 3-broker *combined* cluster ([Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)) still showed something adjacent and real: `raft-client-2`/`raft-client-3` issuing `FETCH` requests with `clientId` naming the Raft client explicitly and `replicaState.replicaId` matching the controller ID -- proof that the underlying replication mechanism for `__cluster_metadata` is the same `FetchRequest`/`FetchResponse` pair as topic data replication, just addressed to the controller quorum's Raft leader instead of a partition leader:
+
+```text
+"requestHeader":{"requestApiKey":1,"clientId":"raft-client-3","requestApiKeyName":"FETCH"},
+"request":{"clusterId":"5L6g3nShT-eMCtK--X86sw","replicaState":{"replicaId":3,"replicaEpoch":-1},
+  "topics":[{"topicId":"AAAAAAAAAAAAAAAAAAAAAQ","partitions":[{"partition":0,"fetchOffset":55,...,"highWatermark":55}]}]},
+"response":{...,"currentLeader":{"leaderId":1,"leaderEpoch":1},...}}
+```
+
+`"topicId":"AAAAAAAAAAAAAAAAAAAAAQ"` here is `__cluster_metadata`'s own fixed topic ID (base64 of a well-known UUID, not a randomly generated one like a normal topic gets) -- this is the metadata log being fetched through the identical mechanism as any other partition.
+
+## `kafka-metadata-quorum.sh describe --replication`: the real fields
+
+```bash
+# scripts/kraft-metadata-log/quorum-replication.sh
+/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server $BOOTSTRAP describe --replication
+```
+
+Real output on this module's own single combined node:
+
+```text
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status
+1     	AAAAAAAAAAAAAAAAAAAAAA	1227        	0  	1790650194864     	1790650194864        	Leader
+```
+
+On [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)'s real 3-node quorum, the same command right after broker 1 was stopped shows exactly what a lagging/unreachable voter looks like from the quorum leader's own point of view:
+
+```text
+NodeId	DirectoryId           	LogEndOffset	Lag	LastFetchTimestamp	LastCaughtUpTimestamp	Status
+2     	AAAAAAAAAAAAAAAAAAAAAA	342         	0  	1790650466818     	1790650466818        	Leader
+1     	AAAAAAAAAAAAAAAAAAAAAA	-1          	343	-1                	-1                   	Follower
+3     	AAAAAAAAAAAAAAAAAAAAAA	342         	0  	1790650466611     	1790650466611        	Follower
+```
+
+`LogEndOffset:-1` and `LastFetchTimestamp:-1` for broker 1 (real sentinel values, not zero) mean "this voter has not fetched at all since it became unreachable" -- distinct from `Lag:343`, which is how far behind the *new* leader's own end offset broker 1's last-known position is. `Status: Leader`/`Follower` here describes each node's role in the **metadata quorum specifically** -- a node can simultaneously be a data-partition follower and the metadata quorum's leader; the two Raft-like elections (per-partition leader, controller-quorum leader) are independent.
+
+## Controller failover, in full
+
+[Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) already proved the headline number -- a new controller leader elected and serving within about 4.2 seconds of stopping the old one, `LeaderEpoch` incrementing `1` → `2`. The metadata-log-level view of that same event: the moment broker 2 becomes the new quorum leader, it writes a fresh `LeaderChange` control record (the same record type opening this lesson) into `__cluster_metadata` at its new leader epoch, exactly like the very first record this cluster ever wrote at startup. Every other controller (and, in an isolated topology, every broker) learns of the new leader by replicating that one record, via the same `FetchRequest` mechanism shown above -- there is no separate "leader announcement" protocol distinct from the metadata log itself.
+
+## Mental Model
+
+`__cluster_metadata` is Kafka replicating Kafka: the same append-only log, the same `FetchRequest`-driven replication, the same `kafka-dump-log.sh` tool, applied one level up to the data that describes every other topic instead of application data. A **snapshot** is this log's equivalent of compaction's tombstone-collapsing -- a point-in-time summary that lets a new or recovering member skip replaying history it doesn't need. Every fact a broker or client ever learns about cluster state -- which broker leads which partition, what the ISR is, what features are finalized -- ultimately traces back to one specific record at one specific offset in this one log, provable with the same decoder used throughout this lesson.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Combined mode (this module's cluster) | Simpler to run -- one process per node, proven throughout this course's `running-kafka-locally` setup | No separate broker→controller `FetchRequest` to observe (proven above); production topologies favor isolated mode for this and other reasons |
+| Isolated mode (dedicated controllers) | Controller quorum isolated from data-plane load; the `FetchRequest` this lesson describes is real and observable | More processes/nodes to run and monitor |
+| Low `metadata.log.max.record.bytes.between.snapshots` | Faster catch-up for a new/recovering node (less log to replay) | More frequent snapshot-writing overhead |
+| High `metadata.log.max.snapshot.interval.ms` | Less snapshot overhead on a quiet cluster | A recovering node with an old snapshot replays more of the log to catch up |
+
+## Common Misconceptions
+
+- **"The controller keeps cluster state in a database, separate from Kafka's own log mechanism."** Proven above: it is `__cluster_metadata`, an ordinary Kafka-style log, decoded with the same `kafka-dump-log.sh` used on any topic.
+- **"`kafka-metadata.sh` is the tool for inspecting the metadata quorum."** Corrected above: that binary doesn't exist on 4.3.1; the real tools are `kafka-metadata-quorum.sh` (used throughout this lesson) and `kafka-metadata-shell.sh`.
+- **"A snapshot is a special, separate backup mechanism operators must configure."** Proven above: it's config-driven (`metadata.log.max.record.bytes.between.snapshots`/`...interval.ms`) and automatic -- this lesson is upfront that it did not observe one directly simply because this cluster's short lifetime never crossed either threshold.
+- **"A broker fetching metadata uses a different protocol from normal replication."** Proven above with a real request-log line: the Raft client's `FETCH` request is the identical `FETCH` API key, just addressed to `__cluster_metadata`'s fixed topic ID instead of a data topic's.
+
+## Reading AI-generated code
+
+<SpotTheBug lang="bash" code={`# AI-suggested "faster recovery" runbook step
+# "Delete __cluster_metadata's snapshot files to force a clean resync
+# from the beginning of the log -- guarantees consistency."
+rm /tmp/kraft-combined-logs/__cluster_metadata-0/*.checkpoint`}>
+Two real problems, both provable from this lesson. First, the path is wrong for this image's actual default `log.dirs` (`/tmp/kafka-logs`, proven throughout this course and this module -- not `/tmp/kraft-combined-logs`, a path from older Kafka example configs this image doesn't use unless `log.dirs` is explicitly set otherwise). Second, and more seriously: a snapshot is an optimization, not a source of truth -- deleting it does not "force a clean resync," it just means the next restart replays more of the log (or, if the log itself has already been trimmed relying on that snapshot existing, replays from a point that may no longer have full history). The actual, safe way to force a from-scratch broker rejoin is documented broker decommission/rejoin procedure, not manual file deletion inside `log.dirs`.
+</SpotTheBug>
+
+export const quizKraftMetadataLog = [
+  {
+    q: 'Proven above by dumping __cluster_metadata with kafka-dump-log.sh --cluster-metadata-decoder, what is the very first record ever written to this log at cluster startup?',
+    options: [
+      'A TOPIC_RECORD for the first user topic',
+      'A control record, LeaderChange -- Raft\'s own leader-election proof for the metadata log itself',
+      'A CONFIG_RECORD with the cluster\'s default settings',
+      'An empty NO_OP_RECORD placeholder',
+    ],
+    answer: 1,
+    explain: 'The real dump above shows offset 0 as isControl:true with a LeaderChange payload -- the metadata log records its own Raft leadership the same way it records everything else, because it is replicated by the same mechanism.',
+  },
+  {
+    q: 'This lesson\'s brief named a tool "kafka-metadata.sh". Proven above by actually checking /opt/kafka/bin, what is real?',
+    options: [
+      'kafka-metadata.sh exists and works as expected',
+      'That binary does not exist on apache/kafka:4.3.1 -- the real tools are kafka-metadata-quorum.sh and kafka-metadata-shell.sh',
+      'kafka-metadata.sh was renamed to kafka-dump-log.sh',
+      'It only exists in isolated-controller mode',
+    ],
+    answer: 1,
+    explain: 'A real `ls /opt/kafka/bin | grep metadata` returned only kafka-metadata-quorum.sh and kafka-metadata-shell.sh -- this lesson corrects the plan\'s assumed tool name against the actual image instead of assuming it.',
+  },
+  {
+    q: 'Proven above (this lesson was honest about not observing one), why did this module\'s own cluster never produce a __cluster_metadata snapshot (.checkpoint) file?',
+    options: [
+      'Snapshots are disabled by default and must be manually enabled',
+      'Neither snapshot trigger (20 MiB of new records via metadata.log.max.record.bytes.between.snapshots, or the 1-hour metadata.log.max.snapshot.interval.ms) was crossed during this short-lived proof session',
+      'Snapshots only exist in isolated-controller mode',
+      'The broker crashed before it could write one',
+    ],
+    answer: 1,
+    explain: 'kafka-configs.sh --describe showed the real, unmodified thresholds (20971520 bytes / 3600000ms) -- this cluster\'s metadata log never grew that large or lived that long, and this lesson states that honestly rather than fabricating a snapshot example.',
+  },
+  {
+    q: 'Proven above with a real 3-node quorum describe --replication right after stopping one voter, what do LogEndOffset:-1 and LastFetchTimestamp:-1 for that voter actually mean?',
+    options: [
+      'The voter has zero data replicated, ever',
+      'Real sentinel values meaning this voter has not fetched at all since becoming unreachable -- distinct from Lag, which measures how far behind the new leader\'s end offset its last-known position was',
+      'A formatting error in the CLI output',
+      'The voter was removed from the cluster permanently',
+    ],
+    answer: 1,
+    explain: 'Proven directly from the real describe --replication output: -1 is a sentinel for "no recent fetch," not zero or an error -- and it appears alongside a real, non-trivial Lag value (343) for the same stopped voter.',
+  },
+  {
+    q: 'Proven above by contrasting this module\'s combined-mode cluster with the request log from the 3-broker cluster, what is the real relationship between metadata replication and normal partition data replication?',
+    options: [
+      'They are completely unrelated, separate protocols',
+      'They use the identical FETCH API key and FetchRequest/FetchResponse mechanism -- metadata replication just addresses __cluster_metadata\'s fixed topic ID instead of a data topic',
+      'Metadata replication uses a special METADATA_FETCH API key not used for data',
+      'Metadata is replicated via a completely separate gRPC service',
+    ],
+    answer: 1,
+    explain: 'The real raft-client-3 FETCH request above uses requestApiKey:1 (the same FETCH key data replication uses), just against topicId AAAAAAAAAAAAAAAAAAAAAQ -- __cluster_metadata\'s fixed, well-known topic ID rather than a randomly generated one.',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/kraft-metadata-log" questions={quizKraftMetadataLog} />
+
+<ProgressTracker client:visible id="kafka-internals/kraft-metadata-log" />
