@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import TSPlayground from '../../../../components/TSPlayground.astro';
 
 ไม่มี tool ไหนข้างล่างนี้ทับซ้อนกันสมบูรณ์ และไม่มีตัวไหนใกล้ครบด้วยตัวเองเลย — บรรทัด "จับได้ด้วย" ของแต่ละ 21 รายการใน **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** บอกเป๊ะ ๆ ว่า tool ไหนข้างล่างนี้ (ถ้ามี) จะจับมันได้ และส่วนใหญ่ของ 21 รายการนั้นไม่มีตัวไหนจับได้เลย ณ จุดที่ bug ถูกใส่เข้ามา output ทุกอันข้างล่างเป็นของจริง จับใหม่สด ๆ สำหรับโมดูลนี้ กับ `kafka-reading-a` (cluster 3-broker ของโมดูลนี้เอง) หรือ harness broker ที่คอร์สนี้ใช้ร่วมกัน
 
@@ -176,7 +177,46 @@ running .../ai-bug-catalog.mdx:fence #34 ... exit code: 0
 
 **ข้อจำกัด single-broker บอกตรง ๆ:** broker ของ harness เอง (`tools/probe/docker-compose.yml`) เป็น node KRaft แบบ broker+controller รวมเดียวบน host port 19092 — ทุก fence `// @run` ใน catalog นี้ใช้ `replicationFactor: 1` เพราะเหตุนี้เป๊ะ ๆ รายการที่หลักฐานจริงของมันต้องการ broker หลายตัวทำงานแยกกันจริง ๆ (รายการ KIP-579 และ partition-remap ของโมดูลนี้เองใช้ cluster 3-broker แยกชั่วคราวชื่อ `kafka-reading-a` บนพอร์ต 39092–39094 ปิดลงหลังจับ output ข้างบนเสร็จ) รันซ้ำกับ harness broker แบบเดิมไม่ได้ — ส่วน `PROOF` ของมันเป็น output จริงจาก cluster อื่นที่ปิดไปแล้ว ไม่ใช่ fence ที่ harness ตัวนี้จะรันซ้ำได้เลย โหมด `--run` ของ harness พิสูจน์ได้แค่สิ่งที่ broker เดียวพิสูจน์ได้เท่านั้น
 
-{/* TSPlayground slot */}
+`tsc --noEmit` ข้างบนรันจาก command line กับไฟล์ที่เซฟไว้ ส่วนที่นี่รันสด ๆ ในเบราว์เซอร์ของคุณ เทียบกับ type จริงของ KafkaJS ลองอันที่ compile ผ่านของ consumer ก่อน แล้วลองอันที่พังเพื่อดู diagnostic จริงที่เกิดจาก argument ผิด shape
+
+<TSPlayground code={verificationToolsPlaygroundCode} id="reading-kafka-verification-tools" title="A clean consumer.subscribe()/run() call" />
+
+<TSPlayground code={verificationToolsBrokenPlaygroundCode} id="reading-kafka-verification-tools-broken" title="Same call, one bug: topics is a string instead of an array" />
+
+export const verificationToolsPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-consumer', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topics: ['orders'], fromBeginning: false });
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      console.log(\`\${topic}[\${partition}] offset \${message.offset}: \${message.value?.toString()}\`);
+    },
+  });
+}
+
+main();`;
+
+export const verificationToolsBrokenPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-consumer', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+
+async function main() {
+  await consumer.connect();
+  // bug: topics must be an array of strings/RegExp, not a bare string
+  await consumer.subscribe({ topics: 'orders', fromBeginning: false });
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      console.log(\`\${topic}[\${partition}] offset \${message.offset}: \${message.value?.toString()}\`);
+    },
+  });
+}
+
+main();`;
 
 ## Mental Model
 

@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import TSPlayground from '../../../../components/TSPlayground.astro';
 
 None of the tools below overlap perfectly, and none is close to complete on its own — the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s "Caught by" line for each of its 21 entries names exactly which one (if any) of the tools below would have caught it, and most of those 21 name none of them at the point the bug is introduced. Every output below is real, freshly captured for this module against either `kafka-reading-a` (this module's own 3-broker cluster) or this course's shared harness broker.
 
@@ -176,7 +177,46 @@ running .../ai-bug-catalog.mdx:fence #34 ... exit code: 0
 
 **The single-broker limitation, stated honestly:** the harness's own broker (`tools/probe/docker-compose.yml`) is one combined broker+controller KRaft node on host port 19092 — every `// @run` fence in this catalog uses `replicationFactor: 1` for exactly that reason. Entries whose real proof genuinely needs multiple brokers acting independently (this module's own KIP-579 and partition-remap entries used a separate, temporary 3-broker `kafka-reading-a` cluster on ports 39092–39094, torn down after capturing the output above) cannot be re-run against the harness broker as-is — their `PROOF` sections are real output from that other, already-torn-down cluster, not from a fence this harness will ever re-execute. The harness's `--run` mode only ever proves what a single broker can prove.
 
-{/* TSPlayground slot */}
+`tsc --noEmit` above ran from the command line against a saved file; here it runs live, in your browser, against KafkaJS's real types. Check the clean consumer call first, then the broken one for the exact diagnostic a wrong argument shape produces.
+
+<TSPlayground code={verificationToolsPlaygroundCode} id="reading-kafka-verification-tools" title="A clean consumer.subscribe()/run() call" />
+
+<TSPlayground code={verificationToolsBrokenPlaygroundCode} id="reading-kafka-verification-tools-broken" title="Same call, one bug: topics is a string instead of an array" />
+
+export const verificationToolsPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-consumer', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+
+async function main() {
+  await consumer.connect();
+  await consumer.subscribe({ topics: ['orders'], fromBeginning: false });
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      console.log(\`\${topic}[\${partition}] offset \${message.offset}: \${message.value?.toString()}\`);
+    },
+  });
+}
+
+main();`;
+
+export const verificationToolsBrokenPlaygroundCode = `import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'orders-consumer', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'orders-group' });
+
+async function main() {
+  await consumer.connect();
+  // bug: topics must be an array of strings/RegExp, not a bare string
+  await consumer.subscribe({ topics: 'orders', fromBeginning: false });
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      console.log(\`\${topic}[\${partition}] offset \${message.offset}: \${message.value?.toString()}\`);
+    },
+  });
+}
+
+main();`;
 
 ## Mental Model
 

@@ -24,16 +24,33 @@ if (!baseUrl) {
   process.exit(1);
 }
 
+const NOT_ASSIGNABLE_TO_STRING = /not assignable to type 'string'/;
+const NOT_ASSIGNABLE_TO_STRING_ARRAY = /not assignable to type '\(string \| RegExp\)\[\]'/;
+
 const LESSONS = [
   {
     path: '/en/producers/producer-api/',
     cleanId: 'producers-producer-api',
     brokenId: 'producers-producer-api-broken',
+    brokenDiagnostic: NOT_ASSIGNABLE_TO_STRING,
   },
   {
     path: '/th/producers/producer-api/',
     cleanId: 'producers-producer-api',
     brokenId: 'producers-producer-api-broken',
+    brokenDiagnostic: NOT_ASSIGNABLE_TO_STRING,
+  },
+  {
+    path: '/en/reading-kafka/verification-tools/',
+    cleanId: 'reading-kafka-verification-tools',
+    brokenId: 'reading-kafka-verification-tools-broken',
+    brokenDiagnostic: NOT_ASSIGNABLE_TO_STRING_ARRAY,
+  },
+  {
+    path: '/th/reading-kafka/verification-tools/',
+    cleanId: 'reading-kafka-verification-tools',
+    brokenId: 'reading-kafka-verification-tools-broken',
+    brokenDiagnostic: NOT_ASSIGNABLE_TO_STRING_ARRAY,
   },
 ];
 
@@ -52,7 +69,7 @@ async function checkClean(page, id) {
   return text;
 }
 
-async function checkBroken(page, id) {
+async function checkBroken(page, id, expectedDiagnostic) {
   const root = page.locator(`#${id}`);
   const checkBtn = root.locator('.tsp__check').first();
   await checkBtn.waitFor({ state: 'visible', timeout: 15000 });
@@ -61,8 +78,8 @@ async function checkBroken(page, id) {
   const err = root.locator('.tsp__err code').first();
   await err.waitFor({ state: 'visible', timeout: 20000 });
   const text = (await err.textContent()) ?? '';
-  if (!/not assignable to type 'string'/.test(text)) {
-    throw new Error(`#${id}: expected a real TS diagnostic (topic: number → string), got: ${text.slice(0, 300)}`);
+  if (!expectedDiagnostic.test(text)) {
+    throw new Error(`#${id}: expected a real TS diagnostic (${expectedDiagnostic}), got: ${text.slice(0, 300)}`);
   }
   return text;
 }
@@ -79,7 +96,7 @@ async function checkLesson(browser, lesson) {
   await page.goto(url, { waitUntil: 'load' });
 
   const cleanOut = await checkClean(page, lesson.cleanId);
-  const brokenOut = await checkBroken(page, lesson.brokenId);
+  const brokenOut = await checkBroken(page, lesson.brokenId, lesson.brokenDiagnostic);
 
   if (consoleErrors.length) {
     throw new Error(`${lesson.path}: ${consoleErrors.length} console error(s): ${consoleErrors.join(' | ')}`);
