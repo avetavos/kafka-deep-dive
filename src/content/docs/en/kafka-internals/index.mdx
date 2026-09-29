@@ -1,8 +1,145 @@
 ---
-title: 'kafka-internals'
-description: 'placeholder — being written'
+title: 'How Kafka Works Internally'
+description: 'The RPC pipeline, the consumer group protocol (classic and KIP-848), replication and ISR, the KRaft metadata log, and the on-disk segment format -- proven with a real request log, a real 3-broker failover, and real kafka-dump-log.sh output on Kafka 4.3.1.'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## What this module is for
+
+Every earlier module taught you to *use* Kafka: produce, consume, configure topics, tune batching, run transactions. None of it required knowing what actually crosses the wire when `producer.send()` returns, what a "rebalance" really is at the RPC level, what a follower is doing between the moment you produce and the moment `acks=all` returns, what a `__cluster_metadata` record actually looks like, or why a `.log` segment is laid out the way it is. That gap is where confident-sounding explanations of Kafka (human or AI-generated) go wrong in ways `kafka-topics.sh --describe` alone won't catch.
+
+This module answers five internals questions, each proven against a real broker rather than asserted:
+
+1. **What RPCs actually happen between `producer.send()` and a consumer's `commitOffsets`?** ([Produce-to-Fetch Pipeline](/kafka/en/kafka-internals/produce-to-fetch-pipeline/) -- one Mermaid sequence, proven hop-by-hop with real request-log lines)
+2. **What does a consumer group rebalance actually look like on the wire, classic vs. KIP-848?** ([Consumer Group Protocol Internals](/kafka/en/kafka-internals/consumer-group-protocol-internals/) -- real `JoinGroup`/`SyncGroup` from KafkaJS, real `ConsumerGroupHeartbeat` from the confluent client)
+3. **What is a follower actually doing, and what does an ISR shrink really look like from the inside?** ([Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) -- a real 3-broker KRaft cluster, a real controller failover, real `PartitionChangeRecord`s)
+4. **What is cluster metadata, concretely, and how does the controller quorum agree on it?** ([KRaft Metadata Log](/kafka/en/kafka-internals/kraft-metadata-log/) -- real `__cluster_metadata` records decoded by `kafka-dump-log.sh --cluster-metadata-decoder`)
+5. **What do the bytes on disk actually look like, and why is fsync not the durability mechanism?** ([Storage and Segments](/kafka/en/kafka-internals/storage-and-segments/) -- a real `hexdump -C` of a `.log` file, decoded by hand and cross-checked against `kafka-dump-log.sh`)
+
+<Callout title="The one-line takeaway">
+Every one of these five mechanisms is provable from the outside with tools you already have -- `kafka-dump-log.sh`, `kafka-metadata-quorum.sh`, `kafka-consumer-groups.sh --describe`, and the broker's own **request log** (`kafka.request.logger`, turned up from its default `WARN` to `TRACE`/`DEBUG` for this module) -- not something you have to trust from a diagram. This module's job is to show you those tools pointed at a real Kafka 4.3.1 cluster, so that when you read someone else's (or an AI's) claim about "what Kafka does under the hood," you know exactly which command would prove or disprove it.
+</Callout>
+
+## How every proof in this module was made
+
+Every RPC-level claim below is a real, trimmed line from the broker's **request log** -- a separate log stream from `server.log`, off by default (`kafka.request.logger` at `WARN`, which only logs failed/slow requests). This module's own scratch broker turns it up to `TRACE` by mounting a modified `log4j2.yaml` into `/mnt/shared/config/log4j2.yaml` -- the same merge point `apache/kafka:4.3.1`'s own `launch` script already uses (`kafka.docker.KafkaDockerWrapper setup --mounted-configs-dir /mnt/shared/config`) to layer operator overrides onto the image's defaults. There is no `KAFKA_LOG4J_OPTS` environment variable on this image (that name doesn't exist in `apache/kafka:4.3.1`); the bind-mount is the real, verified mechanism. At this log level every completed request is one JSON line naming its `requestApiKeyName`, `correlationId`, `clientId`, and the exact request/response fields (`acks`, `fetchOffset`, `highWatermark`, `memberEpoch`, ...) -- this module quotes those lines directly, unedited except for trimming.
+
+Because turning this on requires a log4j change the shared verification harness's own broker doesn't have, every request-log-derived proof in this module is a `text` transcript of a real run against this module's own scratch broker (KRaft, single combined node, port `29092`), not a live-executed fence. Anything that only needs a normal broker -- `kafka-dump-log.sh`, `kafka-topics.sh --describe`, `kafka-metadata-quorum.sh` -- is a real, harness-executed `bash` fence exactly like the rest of the course. [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) additionally used a temporary 3-broker KRaft compose (torn down immediately after) since ISR/failover behavior does not exist on a single node.
+
+<Mermaid title="The five internals lessons, in the order they build on each other" code={moduleMap} />
+
+export const moduleMap = `flowchart TD
+  p["Produce-to-Fetch Pipeline\\n(the RPC sequence)"] --> g["Consumer Group Protocol Internals\\n(JoinGroup/SyncGroup vs ConsumerGroupHeartbeat)"]
+  p --> r["Replication and ISR Internals\\n(follower fetch, ISR shrink, failover)"]
+  r --> k["KRaft Metadata Log\\n(the log that makes r possible)"]
+  p --> s["Storage and Segments\\n(the bytes p actually appends)"]
+  k --> s`;
+
+## Reading order and what each lesson assumes
+
+| Lesson | Builds on (Phase 3) | Answers |
+|---|---|---|
+| [Produce-to-Fetch Pipeline](/kafka/en/kafka-internals/produce-to-fetch-pipeline/) | [The Log Abstraction](/kafka/en/foundations/the-log-abstraction/), [Acks and Durability](/kafka/en/producers/acks-and-durability/) | What RPCs actually cross the wire from one `producer.send()` to one `commitOffsets()`? |
+| [Consumer Group Protocol Internals](/kafka/en/kafka-internals/consumer-group-protocol-internals/) | [Consumer Groups and Rebalancing](/kafka/en/consumers/consumer-groups-and-rebalancing/), [Consumer API](/kafka/en/consumers/consumer-api/) | What does `JoinGroup`/`SyncGroup` vs. `ConsumerGroupHeartbeat` actually look like, RPC by RPC? |
+| [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) | [Replication and ISR](/kafka/en/topics-and-partitions/replication-and-isr/) | What is a follower's `FetchRequest` carrying, and what really happens when the ISR shrinks? |
+| [KRaft Metadata Log](/kafka/en/kafka-internals/kraft-metadata-log/) | [KRaft & the Cluster](/kafka/en/foundations/kraft-and-the-cluster/) | What is an actual `__cluster_metadata` record, and how fast does a real controller failover happen? |
+| [Storage and Segments](/kafka/en/kafka-internals/storage-and-segments/) | [The Log Abstraction](/kafka/en/foundations/the-log-abstraction/) | What do the raw bytes of a `.log`/`.index` file actually encode, and why does fsync not provide durability? |
+
+Each Phase 3 lesson linked above already showed you the *outside* view (an error message, a CLI describe, a client-observable timing). This module shows the mechanism *behind* that view -- it does not re-teach the outside view, it links to it.
+
+## Mental Model
+
+Every lesson in this module is the same idea applied to a different subsystem: **Kafka's behavior is not a black box -- it is a fixed set of RPCs and on-disk records that a request log, a metadata dump, or a hex editor can always show you directly.** A "rebalance" is not a mysterious pause; it is a specific, nameable sequence of RPCs (`JoinGroup`→`SyncGroup`, or one `ConsumerGroupHeartbeat`) that the request log shows in full. An "ISR shrink" is not an opaque cluster event; it is a `PartitionChangeRecord` appended to `__cluster_metadata`, visible with `kafka-dump-log.sh --cluster-metadata-decoder`. A ".log segment" is not an abstraction; it is bytes at fixed offsets that `hexdump -C` and `kafka-dump-log.sh` agree on, byte for byte. Once you know which tool proves which claim, "trust me, that's how Kafka works" stops being necessary.
+
+## Common Misconceptions
+
+- **"`acks=all` means every replica confirmed the write before the producer gets a response."** [Produce-to-Fetch Pipeline](/kafka/en/kafka-internals/produce-to-fetch-pipeline/) proves the real mechanism: the leader appends, then waits for the **ISR** (not necessarily "every replica" -- see [Replication and ISR](/kafka/en/topics-and-partitions/replication-and-isr/)) to advance the high watermark past the new record's offset, via each follower's own `FetchRequest`, not a push from the leader.
+- **"KIP-848's `ConsumerGroupHeartbeat` is just `JoinGroup` renamed."** [Consumer Group Protocol Internals](/kafka/en/kafka-internals/consumer-group-protocol-internals/) proves it is structurally different: classic uses a two-RPC `JoinGroup`→`SyncGroup` pair (each a full group-synchronization barrier); KIP-848 uses one recurring RPC that carries the member's own assignment back in its response, no `SyncGroup` at all.
+- **"ISR shrink and broker fencing are the same mechanism."** [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/) proves, with real controller log lines, that they are two different code paths in the KRaft controller that happen to produce the same visible symptom (a replica leaving the ISR).
+- **"Cluster metadata lives in a database the controller queries."** [KRaft Metadata Log](/kafka/en/kafka-internals/kraft-metadata-log/) proves metadata is itself an ordinary Kafka-style append-only log (`__cluster_metadata`), readable with the exact same `kafka-dump-log.sh` tool used on any other topic.
+- **"fsync is what makes a Kafka write durable."** [Storage and Segments](/kafka/en/kafka-internals/storage-and-segments/) proves the opposite from this cluster's own config: `log.flush.interval.messages` defaults to `Long.MAX_VALUE` (effectively never), because durability comes from replication (the ISR), not from forcing every write to disk before acknowledging it.
+
+## Reading AI-generated code
+
+A preview of the pattern every lesson in this module repeats once: a plausible-looking claim about Kafka internals that a quick RPC- or byte-level check disproves.
+
+<SpotTheBug code={`// A comment an AI assistant added above a producer config
+// "acks: 'all' waits for every replica in the cluster to write the
+// record before returning -- this guarantees zero data loss."
+const producer = kafka.producer();
+await producer.send({
+  topic: 'orders',
+  acks: -1,
+  messages: [{ key: orderId, value: JSON.stringify(order) }],
+});`}>
+Two real, proven-in-this-module problems with the comment. First, [Produce-to-Fetch Pipeline](/kafka/en/kafka-internals/produce-to-fetch-pipeline/) shows `acks=all` (`-1`) waits for the **ISR**, not "every replica in the cluster" -- if the ISR has shrunk to just the leader (proven possible in [Replication and ISR Internals](/kafka/en/kafka-internals/replication-and-isr-internals/)), `acks=all` returns after exactly one broker has the record. Second, "zero data loss" is only true when `min.insync.replicas` is also set high enough that the ISR can't shrink to a dangerously small size without the *producer* getting a real, visible `NotEnoughReplicasException` instead of silently succeeding -- `acks` alone does not enforce a minimum ISR size.
+</SpotTheBug>
+
+export const quizKafkaInternalsIndex = [
+  {
+    q: 'This module turns the broker\'s request log from WARN up to TRACE. What is the real, verified mechanism for doing that on `apache/kafka:4.3.1`?',
+    options: [
+      'Setting a `KAFKA_LOG4J_OPTS` environment variable',
+      'Bind-mounting a modified log4j2.yaml into /mnt/shared/config/log4j2.yaml, which the image\'s own launch script merges into the final config',
+      'Editing /opt/kafka/config/log4j2.yaml directly inside the running container',
+      'Passing --log-level=trace to kafka-server-start.sh',
+    ],
+    answer: 1,
+    explain: 'Verified directly from the image: /etc/kafka/docker/launch runs KafkaDockerWrapper setup with --mounted-configs-dir /mnt/shared/config, which merges any file placed there over the image defaults into /opt/kafka/config -- confirmed by grepping the merged file after mounting. There is no KAFKA_LOG4J_OPTS variable on this image.',
+  },
+  {
+    q: 'Why are the request-log-derived proofs in this module `text` transcripts instead of live bash fences the verification harness re-runs?',
+    options: [
+      'Because bash fences cannot contain JSON',
+      'Because the shared harness broker runs the stock log4j2 config (kafka.request.logger at WARN) and does not have this module\'s TRACE override, so the same command would produce no request-log output there',
+      'Because request logs are binary and cannot be pasted as text',
+      'Because the harness does not support kafka-dump-log.sh',
+    ],
+    answer: 1,
+    explain: 'The verification harness (tools/verify-snippets.mjs) runs its own single-broker stack for --run/--cli, using the stock image config -- it never had this module\'s log4j2 override applied, so a live-executed fence expecting TRACE-level request-log lines would see nothing.',
+  },
+  {
+    q: 'What is the actual on-disk shape of Kafka cluster metadata, proven in this module?',
+    options: [
+      'A relational table the controller queries with SQL',
+      'An ordinary Kafka-style append-only log (the __cluster_metadata topic), decodable with the same kafka-dump-log.sh tool used on any data topic',
+      'A single JSON file per broker, synced by rsync',
+      'An in-memory-only structure with no on-disk representation',
+    ],
+    answer: 1,
+    explain: 'Proven in KRaft Metadata Log: kafka-dump-log.sh --cluster-metadata-decoder on __cluster_metadata-0 returns real, typed records (RegisterBrokerRecord, TopicRecord, PartitionChangeRecord, ...) -- it is a log, not a database.',
+  },
+  {
+    q: 'What does this module prove is actually different between classic rebalancing and KIP-848?',
+    options: [
+      'KIP-848 is purely a client-side change with no new broker RPC',
+      'KIP-848 replaces the two-RPC JoinGroup/SyncGroup barrier with one recurring ConsumerGroupHeartbeat RPC whose response already carries the member\'s assignment',
+      'KIP-848 removes consumer groups entirely in favor of share groups',
+      'KIP-848 only changes the default partition assignor',
+    ],
+    answer: 1,
+    explain: 'Proven in Consumer Group Protocol Internals with a real request-log capture: group.protocol=consumer produces zero JoinGroup/SyncGroup RPCs, only ConsumerGroupHeartbeat, whose response field `assignment` carries the member\'s partitions directly.',
+  },
+  {
+    q: 'According to this cluster\'s own real config (proven in Storage and Segments), what actually provides durability for an acknowledged write?',
+    options: [
+      'log.flush.interval.messages, which forces an fsync after every message by default',
+      'Replication to the ISR -- log.flush.interval.messages defaults to Long.MAX_VALUE (effectively never forcing an fsync) on this real, unmodified broker',
+      'The operating system\'s disk write cache alone, with no fsync ever',
+      'A background checksum thread that repairs corrupted segments',
+    ],
+    answer: 1,
+    explain: 'kafka-configs.sh --describe on this module\'s own broker showed log.flush.interval.messages=9223372036854775807 (Long.MAX_VALUE) -- fsync is not the load-bearing durability mechanism; replication (the ISR) is.',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/index" questions={quizKafkaInternalsIndex} />
+
+<ProgressTracker client:visible id="kafka-internals/index" />

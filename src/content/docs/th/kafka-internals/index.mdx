@@ -1,8 +1,145 @@
 ---
-title: 'kafka-internals'
-description: 'placeholder — being written'
+title: 'Kafka ทำงานอย่างไรข้างใน'
+description: 'RPC pipeline, consumer group protocol (classic และ KIP-848), replication กับ ISR, KRaft metadata log, และรูปแบบ segment บนดิสก์ -- พิสูจน์ด้วย request log จริง, การ failover 3-broker จริง, และ kafka-dump-log.sh จริงบน Kafka 4.3.1.'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## โมดูลนี้มีไว้ทำอะไร
+
+โมดูลก่อน ๆ สอนให้คุณ *ใช้* Kafka: produce, consume, ตั้งค่า topic, จูน batching, รัน transaction แต่ไม่มีบทไหนอธิบายว่าจริง ๆ แล้วมีอะไรวิ่งผ่านสายตอน `producer.send()` คืนค่า, `rebalance` คืออะไรในระดับ RPC จริง ๆ, follower ทำอะไรอยู่ระหว่างที่คุณ produce จนถึงตอนที่ `acks=all` คืนค่า, `__cluster_metadata` record หน้าตาเป็นยังไงจริง ๆ, หรือทำไม `.log` segment ถึงถูกจัดวางแบบที่เป็นอยู่ ช่องว่างนี้เองที่ทำให้คำอธิบาย Kafka ที่ฟังดูมั่นใจ (จากคนหรือจาก AI) ผิดพลาดได้ในแบบที่ `kafka-topics.sh --describe` เพียงอย่างเดียวจับไม่ได้
+
+โมดูลนี้ตอบคำถามภายใน 5 ข้อ แต่ละข้อพิสูจน์กับ broker จริง ไม่ใช่แค่กล่าวอ้าง:
+
+1. **RPC อะไรเกิดขึ้นจริงระหว่าง `producer.send()` กับ `commitOffsets` ของ consumer?** ([Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) -- Mermaid sequence เดียว พิสูจน์ทีละ hop ด้วยบรรทัด request log จริง)
+2. **consumer group rebalance หน้าตาเป็นยังไงจริง ๆ บนสาย ระหว่าง classic กับ KIP-848?** ([Consumer Group Protocol Internals](/kafka/th/kafka-internals/consumer-group-protocol-internals/) -- `JoinGroup`/`SyncGroup` จริงจาก KafkaJS, `ConsumerGroupHeartbeat` จริงจาก confluent client)
+3. **follower ทำอะไรอยู่จริง ๆ และ ISR shrink หน้าตาข้างในเป็นยังไง?** ([Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) -- คลัสเตอร์ KRaft 3-broker จริง, controller failover จริง, `PartitionChangeRecord` จริง)
+4. **cluster metadata คืออะไรจริง ๆ และ controller quorum ตกลงกันยังไง?** ([KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/) -- `__cluster_metadata` record จริงที่ decode ด้วย `kafka-dump-log.sh --cluster-metadata-decoder`)
+5. **ไบต์บนดิสก์หน้าตาเป็นยังไงจริง ๆ และทำไม fsync ไม่ใช่กลไก durability?** ([Storage and Segments](/kafka/th/kafka-internals/storage-and-segments/) -- `hexdump -C` จริงของไฟล์ `.log` decode ด้วยมือแล้ว cross-check กับ `kafka-dump-log.sh`)
+
+<Callout title="สรุปในหนึ่งบรรทัด">
+กลไกทั้ง 5 ข้อนี้พิสูจน์ได้จากนอกด้วยเครื่องมือที่คุณมีอยู่แล้ว -- `kafka-dump-log.sh`, `kafka-metadata-quorum.sh`, `kafka-consumer-groups.sh --describe`, และ **request log** ของ broker เอง (`kafka.request.logger` ที่เปิดจาก `WARN` เดิมขึ้นเป็น `TRACE`/`DEBUG` สำหรับโมดูลนี้) -- ไม่ใช่สิ่งที่ต้องเชื่อจาก diagram เฉย ๆ หน้าที่ของโมดูลนี้คือแสดงเครื่องมือเหล่านั้นชี้ไปที่คลัสเตอร์ Kafka 4.3.1 จริง เพื่อให้เมื่อคุณอ่านคำกล่าวอ้างของคนอื่น (หรือ AI) เกี่ยวกับ "Kafka ทำงานยังไงข้างใน" คุณจะรู้ทันทีว่าคำสั่งไหนพิสูจน์หรือหักล้างมันได้
+</Callout>
+
+## ทุก proof ในโมดูลนี้ทำมายังไง
+
+ทุกคำกล่าวอ้างระดับ RPC ด้านล่างคือบรรทัดจริง ตัดมาสั้น ๆ จาก **request log** ของ broker -- log stream คนละตัวจาก `server.log` ปิดอยู่โดย default (`kafka.request.logger` ที่ `WARN` ซึ่ง log แค่ request ที่พังหรือช้า) broker scratch ของโมดูลนี้เปิดขึ้นเป็น `TRACE` โดย mount `log4j2.yaml` ที่แก้แล้วเข้าไปที่ `/mnt/shared/config/log4j2.yaml` -- จุด merge เดียวกันที่สคริปต์ `launch` ของ image `apache/kafka:4.3.1` เองใช้อยู่แล้ว (`kafka.docker.KafkaDockerWrapper setup --mounted-configs-dir /mnt/shared/config`) เพื่อซ้อน override ของผู้ดูแลระบบทับค่า default ของ image ไม่มี environment variable ชื่อ `KAFKA_LOG4J_OPTS` บน image นี้ (ชื่อนี้ไม่มีจริงใน `apache/kafka:4.3.1`) -- bind-mount คือกลไกจริงที่ตรวจสอบแล้ว ที่ log level นี้ ทุก request ที่เสร็จแล้วคือ JSON หนึ่งบรรทัดที่บอก `requestApiKeyName`, `correlationId`, `clientId`, และ field ของ request/response ตรง ๆ (`acks`, `fetchOffset`, `highWatermark`, `memberEpoch`, ...) -- โมดูลนี้ยกบรรทัดเหล่านั้นมาตรง ๆ ไม่แก้ไขนอกจากตัดให้สั้น
+
+เพราะการเปิดสิ่งนี้ต้องแก้ log4j ที่ harness verification กลางไม่มี proof ที่มาจาก request log ทุกอันในโมดูลนี้จึงเป็น `text` transcript จากการรันจริงบน broker scratch ของโมดูลนี้เอง (KRaft, single combined node, พอร์ต `29092`) ไม่ใช่ fence ที่ harness รันจริง ส่วนอะไรที่ต้องการแค่ broker ปกติ -- `kafka-dump-log.sh`, `kafka-topics.sh --describe`, `kafka-metadata-quorum.sh` -- จะเป็น `bash` fence ที่ harness รันจริง เหมือนบทอื่นในคอร์ส [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) ใช้ compose KRaft 3-broker ชั่วคราวเพิ่ม (ปิดทันทีหลังใช้) เพราะพฤติกรรม ISR/failover ไม่มีทางเกิดบน node เดียว
+
+<Mermaid title="5 บท internals เรียงตามลำดับที่ต่อกัน" code={moduleMap} />
+
+export const moduleMap = `flowchart TD
+  p["Produce-to-Fetch Pipeline\\n(ลำดับ RPC)"] --> g["Consumer Group Protocol Internals\\n(JoinGroup/SyncGroup vs ConsumerGroupHeartbeat)"]
+  p --> r["Replication and ISR Internals\\n(follower fetch, ISR shrink, failover)"]
+  r --> k["KRaft Metadata Log\\n(log ที่ทำให้ r เป็นไปได้)"]
+  p --> s["Storage and Segments\\n(ไบต์ที่ p append จริง)"]
+  k --> s`;
+
+## ลำดับการอ่านและสิ่งที่แต่ละบทสมมติไว้แล้ว
+
+| บท | ต่อจาก (Phase 3) | ตอบคำถาม |
+|---|---|---|
+| [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) | [The Log Abstraction](/kafka/th/foundations/the-log-abstraction/), [Acks and Durability](/kafka/th/producers/acks-and-durability/) | RPC อะไรวิ่งผ่านสายจริงจากหนึ่ง `producer.send()` ถึงหนึ่ง `commitOffsets()`? |
+| [Consumer Group Protocol Internals](/kafka/th/kafka-internals/consumer-group-protocol-internals/) | [Consumer Groups and Rebalancing](/kafka/th/consumers/consumer-groups-and-rebalancing/), [Consumer API](/kafka/th/consumers/consumer-api/) | `JoinGroup`/`SyncGroup` เทียบกับ `ConsumerGroupHeartbeat` หน้าตาเป็นยังไงจริง ๆ ทีละ RPC? |
+| [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) | [Replication and ISR](/kafka/th/topics-and-partitions/replication-and-isr/) | `FetchRequest` ของ follower มีอะไรอยู่ข้างใน และ ISR shrink เกิดอะไรขึ้นจริง? |
+| [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/) | [KRaft & the Cluster](/kafka/th/foundations/kraft-and-the-cluster/) | `__cluster_metadata` record จริงหน้าตาเป็นยังไง และ controller failover จริงเร็วแค่ไหน? |
+| [Storage and Segments](/kafka/th/kafka-internals/storage-and-segments/) | [The Log Abstraction](/kafka/th/foundations/the-log-abstraction/) | ไบต์ดิบของไฟล์ `.log`/`.index` เก็บอะไรจริง ๆ และทำไม fsync ไม่ได้ให้ durability? |
+
+บท Phase 3 ที่ลิงก์ไว้ข้างบนแสดงมุมมอง *ข้างนอก* ให้คุณแล้ว (error message, CLI describe, timing ที่ client มองเห็น) โมดูลนี้แสดงกลไก *ข้างใน* ที่อยู่หลังมุมมองนั้น -- ไม่สอนมุมมองข้างนอกซ้ำ แค่ลิงก์ไปหา
+
+## Mental Model
+
+ทุกบทในโมดูลนี้คือไอเดียเดียวกันที่เอาไปใช้กับ subsystem ต่างกัน: **พฤติกรรมของ Kafka ไม่ใช่ black box -- มันคือ RPC และ on-disk record ชุดตายตัวที่ request log, metadata dump, หรือ hex editor แสดงให้คุณเห็นตรง ๆ ได้เสมอ** "rebalance" ไม่ใช่การหยุดชะงักปริศนา มันคือลำดับ RPC ที่เรียกชื่อได้ชัดเจน (`JoinGroup`→`SyncGroup` หรือ `ConsumerGroupHeartbeat` หนึ่งตัว) ที่ request log แสดงให้เห็นทั้งหมด "ISR shrink" ไม่ใช่เหตุการณ์คลัสเตอร์ที่มองไม่เห็น มันคือ `PartitionChangeRecord` ที่ถูก append เข้า `__cluster_metadata` ดูได้ด้วย `kafka-dump-log.sh --cluster-metadata-decoder` ".log segment" ไม่ใช่ abstraction มันคือไบต์ที่ offset ตายตัวที่ `hexdump -C` กับ `kafka-dump-log.sh` เห็นตรงกันไบต์ต่อไบต์ พอรู้ว่าเครื่องมือไหนพิสูจน์คำกล่าวอ้างไหน คำว่า "เชื่อผมเถอะ Kafka ทำงานแบบนี้" ก็ไม่จำเป็นอีกต่อไป
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`acks=all` แปลว่า replica ทุกตัวยืนยันการเขียนก่อน producer จะได้ response"** [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) พิสูจน์กลไกจริง: leader append แล้วรอให้ **ISR** (ไม่ใช่ "ทุก replica" แน่นอน -- ดู [Replication and ISR](/kafka/th/topics-and-partitions/replication-and-isr/)) เลื่อน high watermark ผ่าน offset ของ record ใหม่ ผ่าน `FetchRequest` ของ follower เอง ไม่ใช่ leader push
+- **"`ConsumerGroupHeartbeat` ของ KIP-848 ก็แค่ `JoinGroup` เปลี่ยนชื่อ"** [Consumer Group Protocol Internals](/kafka/th/kafka-internals/consumer-group-protocol-internals/) พิสูจน์ว่ามันต่างกันโดยโครงสร้าง: classic ใช้คู่ RPC สองตัว `JoinGroup`→`SyncGroup` (แต่ละตัวคือ barrier synchronize ทั้งกลุ่ม); KIP-848 ใช้ RPC เดียวที่วนซ้ำ พร้อม assignment ของ member เองอยู่ใน response เลย ไม่มี `SyncGroup` เลย
+- **"ISR shrink กับ broker fencing เป็นกลไกเดียวกัน"** [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/) พิสูจน์ด้วย controller log จริงว่าทั้งสองเป็นโค้ดพาธคนละเส้นใน KRaft controller ที่บังเอิญให้อาการที่เห็นเหมือนกัน (replica หลุดจาก ISR)
+- **"cluster metadata อยู่ในฐานข้อมูลที่ controller query"** [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/) พิสูจน์ว่า metadata คือ log แบบ append-only สไตล์ Kafka ปกติ (topic `__cluster_metadata`) อ่านได้ด้วยเครื่องมือ `kafka-dump-log.sh` ตัวเดียวกันที่ใช้กับ topic ข้อมูลทั่วไป
+- **"fsync คือสิ่งที่ทำให้การเขียนของ Kafka durable"** [Storage and Segments](/kafka/th/kafka-internals/storage-and-segments/) พิสูจน์ตรงกันข้ามจาก config จริงของคลัสเตอร์นี้: `log.flush.interval.messages` default เป็น `Long.MAX_VALUE` (คือไม่เกิดขึ้นเลย) เพราะ durability มาจาก replication (ISR) ไม่ใช่การบังคับ flush ทุกครั้งก่อน ack
+
+## อ่านโค้ดที่ AI เขียน
+
+ตัวอย่างของแพทเทิร์นที่ทุกบทในโมดูลนี้ทำซ้ำอย่างละครั้ง: คำกล่าวอ้างเกี่ยวกับ Kafka internals ที่ฟังดูสมเหตุสมผล แต่การตรวจสอบระดับ RPC หรือไบต์หักล้างได้
+
+<SpotTheBug code={`// A comment an AI assistant added above a producer config
+// "acks: 'all' waits for every replica in the cluster to write the
+// record before returning -- this guarantees zero data loss."
+const producer = kafka.producer();
+await producer.send({
+  topic: 'orders',
+  acks: -1,
+  messages: [{ key: orderId, value: JSON.stringify(order) }],
+});`}>
+คอมเมนต์นี้มีปัญหาจริง 2 อย่างที่พิสูจน์แล้วในโมดูลนี้ ข้อแรก [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) แสดงว่า `acks=all` (`-1`) รอ **ISR** ไม่ใช่ "replica ทุกตัวในคลัสเตอร์" -- ถ้า ISR shrink ลงเหลือแค่ leader (เป็นไปได้จริง พิสูจน์ใน [Replication and ISR Internals](/kafka/th/kafka-internals/replication-and-isr-internals/)) `acks=all` จะคืนค่าหลังจาก broker เดียวมี record เท่านั้น ข้อสอง "zero data loss" จะจริงก็ต่อเมื่อตั้ง `min.insync.replicas` สูงพอที่ ISR จะ shrink ลงเล็กเกินไปไม่ได้โดยที่ *producer* จะได้ `NotEnoughReplicasException` จริงที่มองเห็นได้ แทนที่จะสำเร็จแบบเงียบ ๆ -- `acks` เพียงอย่างเดียวไม่ได้บังคับขนาดขั้นต่ำของ ISR
+</SpotTheBug>
+
+export const quizKafkaInternalsIndex = [
+  {
+    q: 'โมดูลนี้เปิด request log ของ broker จาก WARN ขึ้นเป็น TRACE กลไกจริงที่ตรวจสอบแล้วบน `apache/kafka:4.3.1` คือข้อไหน?',
+    options: [
+      'ตั้ง environment variable ชื่อ `KAFKA_LOG4J_OPTS`',
+      'Bind-mount log4j2.yaml ที่แก้แล้วเข้าไปที่ /mnt/shared/config/log4j2.yaml ซึ่ง launch script ของ image เอง merge เข้ากับ config สุดท้าย',
+      'แก้ /opt/kafka/config/log4j2.yaml ตรง ๆ ในคอนเทนเนอร์ที่รันอยู่',
+      'ส่ง --log-level=trace ให้ kafka-server-start.sh',
+    ],
+    answer: 1,
+    explain: 'ตรวจสอบตรงจาก image: /etc/kafka/docker/launch รัน KafkaDockerWrapper setup ด้วย --mounted-configs-dir /mnt/shared/config ซึ่ง merge ไฟล์ที่วางไว้ที่นั่นทับ default ของ image เข้าไปที่ /opt/kafka/config -- ยืนยันแล้วด้วยการ grep ไฟล์ที่ merge แล้วหลัง mount ไม่มี KAFKA_LOG4J_OPTS บน image นี้',
+  },
+  {
+    q: 'ทำไม proof ที่มาจาก request log ในโมดูลนี้เป็น `text` transcript แทนที่จะเป็น bash fence ที่ harness verification รันจริงซ้ำ?',
+    options: [
+      'เพราะ bash fence ใส่ JSON ไม่ได้',
+      'เพราะ harness broker กลางรัน log4j2 config เดิม (kafka.request.logger ที่ WARN) ไม่มี override เป็น TRACE ของโมดูลนี้ คำสั่งเดียวกันจะไม่มี output จาก request log เลยที่นั่น',
+      'เพราะ request log เป็น binary paste เป็น text ไม่ได้',
+      'เพราะ harness ไม่รองรับ kafka-dump-log.sh',
+    ],
+    answer: 1,
+    explain: 'harness verification (tools/verify-snippets.mjs) รัน stack ของตัวเองสำหรับ --run/--cli ด้วย config เดิมของ image -- ไม่เคยมี log4j2 override ของโมดูลนี้ fence ที่รันจริงคาดหวังบรรทัด request log ระดับ TRACE จะไม่เห็นอะไรเลยที่นั่น',
+  },
+  {
+    q: 'รูปร่างจริงบนดิสก์ของ cluster metadata ของ Kafka ที่พิสูจน์ในโมดูลนี้คือข้อไหน?',
+    options: [
+      'ตารางเชิงสัมพันธ์ที่ controller query ด้วย SQL',
+      'log แบบ append-only สไตล์ Kafka ปกติ (topic __cluster_metadata) ที่ decode ได้ด้วยเครื่องมือ kafka-dump-log.sh ตัวเดียวกับที่ใช้กับ topic ข้อมูลทั่วไป',
+      'ไฟล์ JSON ไฟล์เดียวต่อ broker ที่ sync ด้วย rsync',
+      'โครงสร้างในหน่วยความจำเท่านั้น ไม่มีตัวแทนบนดิสก์',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ใน KRaft Metadata Log: kafka-dump-log.sh --cluster-metadata-decoder บน __cluster_metadata-0 คืน record จริงที่มี type ชัดเจน (RegisterBrokerRecord, TopicRecord, PartitionChangeRecord, ...) -- มันคือ log ไม่ใช่ database',
+  },
+  {
+    q: 'โมดูลนี้พิสูจน์ว่าอะไรต่างกันจริงระหว่าง classic rebalancing กับ KIP-848?',
+    options: [
+      'KIP-848 เป็นการเปลี่ยนแค่ฝั่ง client ไม่มี broker RPC ใหม่',
+      'KIP-848 แทนที่ barrier สอง RPC JoinGroup/SyncGroup ด้วย ConsumerGroupHeartbeat RPC เดียวที่วนซ้ำ ซึ่ง response พก assignment ของ member มาด้วยแล้ว',
+      'KIP-848 เอา consumer group ออกทั้งหมดแล้วใช้ share group แทน',
+      'KIP-848 เปลี่ยนแค่ partition assignor default',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ใน Consumer Group Protocol Internals ด้วย request log capture จริง: group.protocol=consumer ไม่มี JoinGroup/SyncGroup RPC เลย มีแค่ ConsumerGroupHeartbeat ที่ field `assignment` ใน response พก partition ของ member มาตรง ๆ',
+  },
+  {
+    q: 'ตาม config จริงของคลัสเตอร์นี้เอง (พิสูจน์ใน Storage and Segments) อะไรคือสิ่งที่ให้ durability จริงกับการเขียนที่ ack แล้ว?',
+    options: [
+      'log.flush.interval.messages ที่บังคับ fsync ทุกข้อความโดย default',
+      'Replication ไปที่ ISR -- log.flush.interval.messages default เป็น Long.MAX_VALUE (คือไม่บังคับ fsync เลย) บน broker จริงที่ไม่ได้แก้ไขตัวนี้',
+      'disk write cache ของ OS เพียงอย่างเดียว ไม่มี fsync เลย',
+      'thread ตรวจ checksum พื้นหลังที่ซ่อม segment ที่เสีย',
+    ],
+    answer: 1,
+    explain: 'kafka-configs.sh --describe บน broker ของโมดูลนี้แสดง log.flush.interval.messages=9223372036854775807 (Long.MAX_VALUE) -- fsync ไม่ใช่กลไก durability หลัก replication (ISR) คือกลไกนั้น',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/index" questions={quizKafkaInternalsIndex} />
+
+<ProgressTracker client:visible id="kafka-internals/index" />
