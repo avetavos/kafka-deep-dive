@@ -1,6 +1,6 @@
 ---
 title: 'Security & Production'
-description: 'Securing Kafka for production — TLS encryption in transit, SASL authentication, ACL authorization with kafka-acls.sh, and a readiness checklist for durable, safe clusters.'
+description: 'ACLs proven for real — SecurityDisabledException with no authorizer, then a real denied produce (TopicAuthorizationException) fixed with kafka-acls.sh; SASL/SCRAM in KRaft with a real KafkaJS client and two real Docker-image gotchas found along the way; TLS config keys from the docs.'
 sidebar:
   order: 4
 ---
@@ -8,115 +8,310 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Securing Kafka is three layers stacked together — **encryption in transit** with TLS, **authentication** with SASL or mTLS to prove who a client is, and **authorization** with ACLs to control what that client may do — all sitting on top of a durably configured cluster.
+Kafka security is three real, separately-provable layers — **authorization** (ACLs, which do nothing at all until you turn on an authorizer), **authentication** (SASL or mTLS, which decides who a principal even is), and **encryption** (TLS) — and skipping the first step, as a lot of tutorials do, produces a command that looks like it should work and instead throws immediately.
 
-## Encryption and authentication
+## Proof: `kafka-acls.sh` with no authorizer configured
 
-By default a Kafka listener speaks plaintext. For production you enable **TLS/SSL** so traffic between clients and brokers, and between brokers themselves, is encrypted in transit. On top of that you add **authentication** so the broker knows who is connecting. Kafka supports several SASL mechanisms plus mutual TLS:
+Kafka ships with **no authorizer by default**. Running the exact command a lot of tutorials open with, against a broker that has not enabled one:
 
-- **SASL/SCRAM** — salted challenge-response with credentials stored in the cluster; a common, self-contained choice.
-- **SASL/PLAIN** — username and password, only safe **over TLS**.
-- **SASL/OAUTHBEARER** — OAuth 2.0 bearer tokens, for integrating with an identity provider.
-- **mTLS** — the client's TLS certificate itself is the identity, so no separate password is needed.
+```text
+$ kafka-acls.sh --bootstrap-server localhost:9092 --list
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+```
+
+This is not a permissions error — it is `kafka-acls.sh` telling you, correctly, that there is no ACL system running at all to query. The fix is a broker config, set before the broker starts:
 
 ```properties
-# Broker listener using TLS for encryption + SASL/SCRAM for authentication
-listeners=SASL_SSL://:9093
-security.inter.broker.protocol=SASL_SSL
-sasl.enabled.mechanisms=SCRAM-SHA-256
-ssl.keystore.location=/etc/kafka/broker.keystore.jks
-ssl.truststore.location=/etc/kafka/broker.truststore.jks
+# config/security-and-production/authorizer.properties
+# section: broker
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
 ```
 
-## Authorization with ACLs
+`StandardAuthorizer` is the KRaft-native authorizer (the ZooKeeper-era `AclAuthorizer` is gone along with ZooKeeper). Pair it with `super.users` (documented under Kafka's authorization/ACL configuration, not the general broker-configs table above) — a comma-separated `principalType:name` list that bypasses every ACL check. Every real cluster needs at least one super user, or a locked-down authorizer can lock out its own admins:
 
-Authentication proves identity; **authorization** decides what that identity may do. Kafka's authorizer checks **ACLs** — rules like "user `analytics` may Read topic `orders`." You manage them with `kafka-acls.sh`, always against `--bootstrap-server`:
+```text
+super.users=User:ANONYMOUS
+```
+
+<Callout title="A real gotcha this lesson hit setting super.users">
+This lesson's own broker used `PLAINTEXT` for its internal/admin listener, which has no authentication at all — every connection over it gets the principal `User:ANONYMOUS`. Listing `User:ANONYMOUS` in `super.users` is a deliberate teaching shortcut so the admin commands below (running over that same `PLAINTEXT` listener) keep working once the authorizer is on. A real production cluster should never leave an unauthenticated listener as a super user permanently — it means anyone who can reach that listener is a full admin.
+</Callout>
+
+## Proof: authorizer on, no ACL yet — a real denied produce
+
+With the authorizer enabled and a SASL/SCRAM listener added (full setup below), a client authenticated as `order-service` — a real principal, **not** a super user — tries to produce to a topic it has never been granted access to:
+
+```text
+$ kafka-console-producer.sh --bootstrap-server localhost:39094 --topic secure-orders \
+    --command-config order-service-client.properties
+[...] WARN [Producer clientId=console-producer] The metadata response from the cluster reported a recoverable issue with correlation id 1 : {secure-orders=TOPIC_AUTHORIZATION_FAILED} (org.apache.kafka.clients.NetworkClient)
+[...] ERROR [Producer clientId=console-producer] Topic authorization failed for topics [secure-orders] (org.apache.kafka.clients.Metadata)
+org.apache.kafka.common.errors.TopicAuthorizationException: Not authorized to access topics: [secure-orders]
+```
+
+Real, verbatim `TopicAuthorizationException` — authentication succeeded (SCRAM verified the password, proven further down), but authorization did not. `kafka-acls.sh --add` is the fix:
+
+```text
+$ kafka-acls.sh --bootstrap-server localhost:9092 \
+    --add --allow-principal User:order-service \
+    --operation Write --topic secure-orders
+Adding ACLs for resource `ResourcePattern(resourceType=TOPIC, name=secure-orders, patternType=LITERAL)`:
+ 	(principal=User:order-service, host=*, operation=WRITE, permissionType=ALLOW)
+
+$ kafka-console-producer.sh --bootstrap-server localhost:39094 --topic secure-orders \
+    --command-config order-service-client.properties
+(exits 0, no output -- the record went through)
+```
+
+<Mermaid title="Authorization proven wrong, then right, with the same principal" code={authzFlow} />
+
+export const authzFlow = `sequenceDiagram
+  participant C as order-service (authenticated, not super)
+  participant B as Broker
+  C->>B: Produce to secure-orders (no ACL granted)
+  B-->>C: TOPIC_AUTHORIZATION_FAILED -> real TopicAuthorizationException
+  Note over B: kafka-acls.sh --add --allow-principal User:order-service --operation Write --topic secure-orders
+  C->>B: Produce to secure-orders (retry, same credentials)
+  B-->>C: accepted -- exit 0`;
+
+## Two real Docker-image bugs found setting this up
+
+Building this lesson's own SASL/SCRAM broker hit two genuine, undocumented-until-you-hit-them failures in the official image — both worth knowing, since either one produces a startup crash that has nothing to do with your Kafka config being wrong.
+
+<Callout title="Bug 1: enabling any SASL_* listener silently requires KAFKA_OPTS">
+The image's own `/etc/kafka/docker/configure` script has a branch that runs whenever `KAFKA_ADVERTISED_LISTENERS` matches a `SASL_*` protocol — and that branch calls `ensure KAFKA_OPTS`, which requires `KAFKA_OPTS` to be **set to something**, for reasons unrelated to SASL/SCRAM actually working. Leave it unset and the container crashes at the shell-script layer, before the JVM even starts, with a raw bash error instead of a Kafka one: `/etc/kafka/docker/configure: line 18: !1: unbound variable`. The fix is any non-empty `KAFKA_OPTS` value, e.g. `KAFKA_OPTS=-Dkafka.docker.compose=security-lesson`.
+</Callout>
+
+<Callout title="Bug 2: a per-listener SASL JAAS env var needs doubled/tripled underscores">
+The image's `KAFKA_*` env-var-to-property converter treats a single underscore as a dot separator. A per-listener, per-mechanism JAAS override targets the property `listener.name.sasl_plaintext_host.scram-sha-256.sasl.jaas.config` — and both the listener name's own underscores (`sasl_plaintext_host`) and the mechanism's dashes (`scram-sha-256`) are literal characters inside that property, not separators. Get this wrong (a naive `KAFKA_LISTENER_NAME_SASL_PLAINTEXT_HOST_SCRAM_SHA_256_SASL_JAAS_CONFIG` with single underscores throughout) and the broker crashes with a real `IllegalArgumentException: Could not find a 'KafkaServer' or 'sasl_plaintext_host.KafkaServer' entry in the JAAS configuration`. The real rule: a literal underscore inside one segment doubles (`__`); a literal dash triples (`___`); only a genuinely single underscore means "insert a dot here" — giving `KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_SCRAM___SHA___256_SASL_JAAS_CONFIG`, which started cleanly.
+</Callout>
+
+## SASL/SCRAM in KRaft, end to end
+
+Two ways to provision SCRAM credentials in KRaft (no ZooKeeper, so no separate `--zookeeper` flag exists for this either): at format time, or dynamically against a running cluster. The format-time flag, confirmed against the real tool's own help text:
 
 ```bash
-# Allow user "analytics" to consume from topic "orders"
-kafka-acls.sh --bootstrap-server localhost:9092 \
-  --add --allow-principal User:analytics \
-  --operation Read --topic orders --group analytics-group
-
-# Allow user "order-service" to produce to topic "orders"
-kafka-acls.sh --bootstrap-server localhost:9092 \
-  --add --allow-principal User:order-service \
-  --operation Write --topic orders
+# scripts/security-and-production/storage-format-help.sh
+/opt/kafka/bin/kafka-storage.sh format --help
 ```
 
-<Mermaid title="Three layers of Kafka security" code={secFlow} />
+```text
+  --add-scram ADD_SCRAM, -S ADD_SCRAM
+                         A SCRAM_CREDENTIAL to add to the __cluster_metadata log e.g.
+                         'SCRAM-SHA-256=[name=alice,password=alice-secret]'
+                         'SCRAM-SHA-512=[name=alice,iterations=8192,salt="N3E=",saltedpassword="YCE="]'
+```
 
-export const secFlow = `flowchart LR
-  client["Client"] -->|"TLS: encrypt in transit"| enc["Encryption"]
-  enc -->|"SASL / mTLS: who are you"| authn["Authentication"]
-  authn -->|"ACLs: what may you do"| authz["Authorization"]
-  authz --> broker["Broker serves the request"]`;
+This lesson used the second path — adding a user to an already-running cluster, which is what most real operational workflows actually do (rotating or adding a credential without reformatting anything):
+
+```bash
+# scripts/security-and-production/scram-user-lifecycle.sh
+# Self-contained: creates its own SCRAM user, proves it, then deletes it.
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --alter --entity-type users --entity-name lesson-scram-demo \
+  --add-config 'SCRAM-SHA-256=[password=demo-secret-pw]'
+
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --describe --entity-type users --entity-name lesson-scram-demo
+
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --alter --entity-type users --entity-name lesson-scram-demo \
+  --delete-config 'SCRAM-SHA-256'
+```
+
+```text
+Completed updating config for user lesson-scram-demo.
+SCRAM credential configs for user-principal 'lesson-scram-demo' are SCRAM-SHA-256=iterations=4096
+Completed updating config for user lesson-scram-demo.
+```
+
+The credential itself — never the plaintext password — is what gets stored: `--describe` shows `iterations=4096`, never `demo-secret-pw`. The listener needs to actually offer SCRAM too:
+
+```properties
+# config/security-and-production/sasl-listener.properties
+# section: broker
+sasl.enabled.mechanisms=SCRAM-SHA-256
+security.inter.broker.protocol=PLAINTEXT
+```
+
+## Proof: a real client authenticates — and a real one fails to
+
+A genuine KafkaJS producer, run from the host against the `SASL_PLAINTEXT` listener, with the correct credentials:
+
+```text
+const kafka = new Kafka({
+  clientId: 'security-lesson-probe',
+  brokers: ['localhost:39094'],
+  sasl: { mechanism: 'scram-sha-256', username: 'order-service', password: 'order-secret-pw' },
+});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic: 'secure-orders', messages: [{ value: 'hello from KafkaJS over SASL_PLAINTEXT' }] });
+```
+
+```text
+SASL/SCRAM connect OK as order-service
+send OK
+```
+
+The exact same client, wrong password only:
+
+```text
+{"level":"ERROR", ..., "message":"[SaslAuthenticator-SCRAM-SHA-256] SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256", ...}
+connect FAILED: KafkaJSSASLAuthenticationError - SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256
+```
+
+And the Java-tooling side of the identical mistake, for comparison — same broker, same wrong password, via `kafka-console-producer.sh` instead:
+
+```text
+[...] ERROR [Producer clientId=console-producer] Connection to node -1 (localhost/127.0.0.1:39094) failed authentication due to: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256 (org.apache.kafka.clients.NetworkClient)
+org.apache.kafka.common.errors.SaslAuthenticationException: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256
+```
+
+Both clients hit the identical **broker-side** check and get the identical human-readable reason — only the exception class name differs by client (`KafkaJSSASLAuthenticationError` vs. `SaslAuthenticationException`), because SCRAM's challenge-response happens on the wire, not inside either client library.
+
+## TLS: the shape, and the real config keys
+
+This lesson does not generate certificates end to end — the broker config keys are the load-bearing part, and they are documented, not folklore. Confirmed against the official broker config reference (`kafka.apache.org/43/configuration/`, broker section, fetched for this course):
+
+```properties
+# config/security-and-production/tls-broker.properties
+# section: broker
+listeners=SSL://:9093
+ssl.keystore.location=/etc/kafka/secrets/broker.keystore.jks
+ssl.keystore.password=changeit
+ssl.key.password=changeit
+ssl.truststore.location=/etc/kafka/secrets/broker.truststore.jks
+ssl.truststore.password=changeit
+ssl.client.auth=required
+ssl.endpoint.identification.algorithm=https
+```
+
+Each broker needs **both** a keystore (its own identity — the certificate it presents) and a truststore (who it is willing to trust — normally the CA that signed every broker's and client's certificate, in a private cluster). `ssl.client.auth=required` turns on **mutual** TLS: the broker also demands and verifies a certificate from the client, which is the mTLS authentication mode mentioned below — TLS alone only proves the **broker's** identity to the client, not the other way around. `ssl.endpoint.identification.algorithm=https` enables hostname verification against the certificate's SAN, which prevents a trivial man-in-the-middle even when the attacker has *a* valid certificate, just not one for the hostname being connected to — leaving it unset is a real, common misconfiguration.
 
 ## Production readiness checklist
 
-Security is one column of production readiness; durability and observability are the others. Before a cluster carries real traffic, confirm:
+Security is one column; durability and observability are the others, covered in [Monitoring & Consumer Lag](/kafka/en/operations-and-production/monitoring-and-consumer-lag/) and [Performance & Tuning](/kafka/en/operations-and-production/performance-and-tuning/). Before a cluster carries real traffic:
 
-- **Replication factor >= 3** on important topics, so two brokers can be lost without data loss.
-- **`min.insync.replicas=2`** paired with **`acks=all`** — writes require at least two in-sync replicas, the durable production combo.
-- **TLS everywhere**, **SASL or mTLS authentication**, and **ACLs** locking down each principal to least privilege.
-- **Monitoring and alerting** on consumer lag, under-replicated partitions, and request latency.
-- **Quotas** to stop a single misbehaving client from starving the cluster of bandwidth or requests.
-
-```properties
-# Durable topic-level defaults for production
-default.replication.factor=3
-min.insync.replicas=2
-# and producers set acks=all
-```
+- **`authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer`**, with `super.users` scoped to real admin principals only — proven above to be required before any ACL means anything.
+- **TLS everywhere** (`ssl.client.auth=required` for mTLS, or SASL over `SASL_SSL` for encrypted authenticated access) — plaintext listeners should not be reachable outside a trusted network boundary.
+- **Least-privilege ACLs per principal** — proven above with `order-service` getting exactly `Write` on exactly `secure-orders`, nothing broader.
+- **Replication factor >= 3** on important topics with **`min.insync.replicas=2`** and producers using **`acks=all`** — the durable combination this course's [Acks & Durability](/kafka/en/producers/acks-and-durability/) lesson proves.
+- **Monitoring and alerting** on consumer lag, under-replicated partitions, and request latency — the next lesson's subject.
+- **Quotas** so one client cannot starve the cluster of bandwidth or request capacity.
 
 <Callout title="The one-line takeaway">
-Production Kafka layers **TLS** encryption, **SASL/mTLS** authentication, and **ACLs** (via **`kafka-acls.sh`**) for authorization on top of a durable core: **replication factor >= 3**, **`min.insync.replicas=2`**, and **`acks=all`**, with **monitoring**, alerting, and **quotas** in place. Congratulations — you have completed **Kafka — From Zero to Hero**: from logs, brokers, and KRaft, through producers, consumers, delivery semantics, Streams and Connect, to running and securing Kafka in production. Go build something durable.
+`kafka-acls.sh` does nothing until `authorizer.class.name` is set — proven above with a real `SecurityDisabledException`. Once it is set, ACLs are enforced for real: a principal with no grant gets a real `TopicAuthorizationException`, and `kafka-acls.sh --add` is what actually fixes it, proven end to end on the same principal. SASL/SCRAM in KRaft stores real credential metadata (`iterations=4096`, never a plaintext password) via `kafka-configs.sh --alter --entity-type users`, and a wrong password gets an identical broker-side rejection whether the client is KafkaJS or the Java console tools. Two real Docker-image gotchas (a silent `KAFKA_OPTS` requirement, and underscore/dash escaping in per-listener JAAS env vars) cost more debugging time than the actual security config did. TLS needs both a keystore and a truststore per broker, and `ssl.client.auth=required` plus `ssl.endpoint.identification.algorithm=https` are what turn "encrypted" into "mutually authenticated and hostname-verified."
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="bash" code={`#!/usr/bin/env bash
+# AI comment: "Lock down the orders topic to only the order-service producer"
+set -euo pipefail
+
+kafka-topics.sh --bootstrap-server localhost:9092 \\
+  --create --topic orders --partitions 3 --replication-factor 3
+
+kafka-acls.sh --bootstrap-server localhost:9092 \\
+  --add --allow-principal User:order-service \\
+  --operation Write --topic orders
+`}>
+
+This script is a fully plausible "secure the topic" runbook — create it, then grant exactly the one principal that should write to it, nothing broader. It will very likely fail on a real cluster with the same `SecurityDisabledException` proven at the top of this lesson: nothing in this script (or anywhere upstream of it, if this is the *first* security-related command a team runs) ever set `authorizer.class.name`. `kafka-acls.sh --add` against a broker with no authorizer configured does not silently no-op — it errors out immediately, `set -euo pipefail` kills the script right there, and the topic that line 6 just created is left with **zero** ACL enforcement at all, not the locked-down state the comment promises. The fix is not a different `kafka-acls.sh` flag — it's a broker-level `authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer` (plus `super.users` for whoever runs this script) applied and the broker restarted **before** any ACL command is ever expected to do something.
+
+</SpotTheBug>
+
+## Mental Model
+
+Treat Kafka security as three independent yes/no switches, checked in a fixed order for every request: is the connection **encrypted** (TLS, or not — orthogonal to the other two), does the broker know **who is asking** (authentication — SASL, mTLS, or "everyone is `ANONYMOUS`" by default), and is that identity **allowed to do this specific thing** (authorization — ACLs, which this lesson proved do not even exist as a concept until `authorizer.class.name` is set). A production cluster needs all three; a lot of tutorials and AI-generated scripts only ever demonstrate the third, silently assuming the first two are handled — which is exactly the gap this lesson's `SpotTheBug` walks into.
+
+## Trade-offs
+
+- **`User:ANONYMOUS` as a super user on an internal listener** — convenient for admin scripting on a listener nothing untrusted can reach (proven as this lesson's own pattern), and a real security hole the moment that listener is reachable from anywhere it shouldn't be.
+- **SASL/SCRAM vs. mTLS** — SCRAM is self-contained (credentials live in the cluster's own metadata log, proven above, no external CA needed) and easy to rotate per-user; mTLS ties identity to a certificate, which centralizes trust in a CA but avoids shipping passwords anywhere, including into JAAS config strings.
+- **Dynamic SCRAM user provisioning (`kafka-configs.sh --alter`) vs. format-time (`kafka-storage.sh format --add-scram`)** — dynamic is what real operations use (add/rotate a user without touching every broker's storage), proven above end to end; format-time is really only for bootstrapping the very first admin credential before any broker has ever started.
+- **`ssl.endpoint.identification.algorithm=https` on vs. off** — on (the safer default) rejects a certificate that is valid but for the wrong hostname; off accepts it, which is occasionally needed for internal service-mesh setups with non-standard naming but reopens exactly the man-in-the-middle gap hostname verification exists to close.
+
+## Common Misconceptions
+
+- **"`kafka-acls.sh --add` works on any broker; you only need an authorizer if you want ACLs to be *enforced*."** No — proven above: without `authorizer.class.name` set, `kafka-acls.sh` cannot even **list** ACLs, real `SecurityDisabledException`, not a soft no-op.
+- **"A `TopicAuthorizationException` means the client's credentials are wrong."** No — proven above: `order-service` authenticated successfully (SCRAM verified) and was still denied, because authentication and authorization are two separate checks; the wrong-password case, also proven above, produces a completely different exception (`SaslAuthenticationException` / `KafkaJSSASLAuthenticationError`) at a different point in the connection.
+- **"SASL/SCRAM needs ZooKeeper or a separate credential store."** No — proven above: `kafka-configs.sh --alter --entity-type users` writes the credential straight into the KRaft `__cluster_metadata` log on a running cluster, no ZooKeeper, no external store.
+- **"TLS and authentication are the same thing — enabling `SSL://` means clients are authenticated."** No — proven in the config above: plain `SSL://` only proves the *broker's* identity to the client; a client presents no identity at all unless `ssl.client.auth=required` (mTLS) or a SASL mechanism is layered on top via `SASL_SSL`.
 
 export const quizSecurity = [
   {
-    q: 'What are the three layers of Kafka security?',
+    q: 'Proven above, what does kafka-acls.sh --list actually do against a broker with no authorizer.class.name configured?',
     options: [
-      'Encryption in transit (TLS), authentication (SASL/mTLS), and authorization (ACLs)',
-      'Backups, snapshots, and replication',
-      'Batching, compression, and acks',
-      'ZooKeeper, KRaft, and JMX',
-    ],
-    answer: 0,
-  },
-  {
-    q: 'Which tool manages Kafka authorization rules?',
-    options: [
-      '`kafka-storage.sh`',
-      '`kafka-acls.sh --bootstrap-server ...`',
-      '`kafka-console-producer.sh`',
-      '`kafka-topics.sh --acl`',
+      'It silently returns an empty ACL list',
+      'It throws a real SecurityDisabledException: "No Authorizer is configured on the broker" -- there is no ACL system to query at all',
+      'It automatically enables the default authorizer',
+      'It succeeds but ignores all future --add calls',
     ],
     answer: 1,
+    explain: 'Real, verbatim output captured above: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker.',
   },
   {
-    q: 'What is the durable production combination for writes?',
+    q: 'Proven above, what happened when a principal (order-service) authenticated successfully via SASL/SCRAM but had no ACL granted on the topic it tried to produce to?',
     options: [
-      'replication factor 1 and acks=0',
-      'replication factor >= 3, min.insync.replicas=2, and acks=all',
-      'A single broker with no replicas',
-      'acks=1 with no minimum ISR',
+      'The produce succeeded because authentication was enough',
+      'A real TopicAuthorizationException: "Not authorized to access topics: [secure-orders]" -- authentication and authorization are separate checks, and this one failed the second',
+      'The broker crashed',
+      'The client was disconnected before authentication completed',
     ],
     answer: 1,
+    explain: 'Real transcript above showed TOPIC_AUTHORIZATION_FAILED in the metadata response followed by a genuine TopicAuthorizationException; kafka-acls.sh --add --allow-principal User:order-service --operation Write --topic secure-orders fixed it, proven with a clean exit 0 retry.',
   },
   {
-    q: 'Why set quotas on a production cluster?',
+    q: 'What two real, undocumented-until-you-hit-them bugs did this lesson find while enabling a SASL_PLAINTEXT listener on the official apache/kafka image?',
     options: [
-      'To encrypt traffic between brokers',
-      'To stop a single misbehaving client from starving the cluster of bandwidth or requests',
-      'To increase the replication factor automatically',
-      'To disable ACLs',
+      'A missing Java dependency and a broken port mapping',
+      "A shell-script `ensure KAFKA_OPTS` check that crashes the container with 'line 18: !1: unbound variable' unless KAFKA_OPTS is set to something, and a KAFKA_* env-var-to-property converter that needs literal underscores doubled and literal dashes tripled inside a per-listener JAAS config var name",
+      'The image does not support SASL_PLAINTEXT at all',
+      'A TLS certificate expiry bug',
     ],
     answer: 1,
+    explain: 'Both proven live: the first crash was a raw bash "unbound variable" error before the JVM even started; the second was a real IllegalArgumentException: Could not find a \'KafkaServer\' or \'sasl_plaintext_host.KafkaServer\' entry in the JAAS configuration, fixed by renaming the env var to KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_SCRAM___SHA___256_SASL_JAAS_CONFIG.',
+  },
+  {
+    q: 'Proven above with kafka-configs.sh --describe --entity-type users, what does Kafka actually store for a SCRAM credential?',
+    options: [
+      'The plaintext password, for troubleshooting purposes',
+      'Only credential metadata like iterations=4096 -- the plaintext password itself is never stored or shown back',
+      'Nothing is stored until the user authenticates for the first time',
+      'A bcrypt hash of the password',
+    ],
+    answer: 1,
+    explain: "Real output: \"SCRAM credential configs for user-principal 'lesson-scram-demo' are SCRAM-SHA-256=iterations=4096\" -- the password used to create it (demo-secret-pw) never appears.",
+  },
+  {
+    q: 'Proven above, what was the real error text when a KafkaJS producer connected with the correct username but the wrong SCRAM password?',
+    options: [
+      'A generic "connection refused"',
+      "KafkaJSSASLAuthenticationError: \"SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256\" -- and the Java console producer with the identical wrong password got the same broker-side reason, just wrapped in SaslAuthenticationException instead",
+      'The connection silently hung with no error',
+      'KafkaJS retried indefinitely without ever failing',
+    ],
+    answer: 1,
+    explain: "Both real error transcripts captured above show the identical broker-side rejection text (\"Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256\"), proving the check happens once on the wire, not separately in each client.",
+  },
+  {
+    q: 'What does ssl.client.auth=required actually change, compared to a plain SSL:// listener without it?',
+    options: [
+      'Nothing -- it is a deprecated no-op',
+      'It turns on mutual TLS: the broker also demands and verifies a certificate FROM the client, whereas plain SSL:// only proves the broker\'s identity to the client',
+      'It disables encryption and falls back to plaintext',
+      'It is only relevant for SASL_SSL listeners, never plain SSL',
+    ],
+    answer: 1,
+    explain: 'Cited from the real broker config reference (kafka.apache.org/43/configuration/, broker section): without ssl.client.auth=required, TLS alone authenticates only the broker to the client, not the client to the broker.',
   },
 ];
 

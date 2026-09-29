@@ -1,6 +1,6 @@
 ---
 title: 'Security & Production'
-description: 'ทำ Kafka ให้ปลอดภัยสำหรับ production TLS encryption in transit, SASL authentication, ACL authorization ด้วย kafka-acls.sh และ checklist ความพร้อมสำหรับ cluster ที่ durable และปลอดภัย'
+description: 'พิสูจน์ ACL จริง — SecurityDisabledException ตอนไม่มี authorizer จากนั้น produce ที่ถูกปฏิเสธจริง (TopicAuthorizationException) แล้วแก้ด้วย kafka-acls.sh; SASL/SCRAM ใน KRaft ด้วย KafkaJS client จริง พร้อม bug จริงของ Docker image สองตัวที่เจอระหว่างทาง; config key ของ TLS จากเอกสารจริง'
 sidebar:
   order: 4
 ---
@@ -8,115 +8,310 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-การทำ Kafka ให้ปลอดภัยคือสามชั้นซ้อนกัน **encryption in transit** ด้วย TLS, **authentication** ด้วย SASL หรือ mTLS เพื่อพิสูจน์ว่า client เป็นใคร และ **authorization** ด้วย ACL เพื่อคุมว่า client นั้นทำอะไรได้ ทั้งหมดวางอยู่บน cluster ที่ตั้งค่าให้ durable
+security ของ Kafka คือสามชั้นที่พิสูจน์แยกกันได้จริง — **authorization** (ACL ซึ่งไม่ทำอะไรเลยจนกว่าจะเปิด authorizer), **authentication** (SASL หรือ mTLS ซึ่งตัดสินว่า principal คือใครกันแน่), และ **encryption** (TLS) — การข้ามขั้นตอนแรกไป อย่างที่ tutorial จำนวนมากทำ จะได้คำสั่งที่ดูเหมือนควรทำงานได้แต่กลับ error ทันที
 
-## encryption และ authentication
+## พิสูจน์: `kafka-acls.sh` ตอนไม่มี authorizer
 
-โดย default listener ของ Kafka พูด plaintext สำหรับ production คุณเปิด **TLS/SSL** เพื่อให้ traffic ระหว่าง client กับ broker และระหว่าง broker ด้วยกันเอง ถูก encrypt ระหว่างส่ง เหนือขึ้นไปคุณเพิ่ม **authentication** เพื่อให้ broker รู้ว่าใครกำลังเชื่อมต่อ Kafka รองรับ SASL mechanism หลายแบบบวกกับ mutual TLS
+Kafka มาโดย**ไม่มี authorizer ติดมา by default** รันคำสั่งเดียวกับที่ tutorial จำนวนมากเปิดด้วย บน broker ที่ยังไม่เปิด authorizer
 
-- **SASL/SCRAM** salted challenge-response โดยเก็บ credential ไว้ใน cluster เป็นตัวเลือกที่นิยมและ self-contained
-- **SASL/PLAIN** username กับ password ปลอดภัยเฉพาะ **บน TLS**
-- **SASL/OAUTHBEARER** OAuth 2.0 bearer token สำหรับ integrate กับ identity provider
-- **mTLS** TLS certificate ของ client เองคือ identity จึงไม่ต้องมี password แยก
-
-```properties
-# Broker listener using TLS for encryption + SASL/SCRAM for authentication
-listeners=SASL_SSL://:9093
-security.inter.broker.protocol=SASL_SSL
-sasl.enabled.mechanisms=SCRAM-SHA-256
-ssl.keystore.location=/etc/kafka/broker.keystore.jks
-ssl.truststore.location=/etc/kafka/broker.truststore.jks
+```text
+$ kafka-acls.sh --bootstrap-server localhost:9092 --list
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+java.util.concurrent.ExecutionException: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
 ```
 
-## authorization ด้วย ACL
+นี่ไม่ใช่ permission error — เป็น `kafka-acls.sh` ที่บอกคุณอย่างถูกต้องว่าไม่มีระบบ ACL ใด ๆ รันอยู่เลยให้ query วิธีแก้คือ broker config ที่ต้องตั้งก่อน broker สตาร์ท
 
-authentication พิสูจน์ identity ส่วน **authorization** ตัดสินว่า identity นั้นทำอะไรได้ authorizer ของ Kafka เช็ค **ACL** กฎอย่าง "user `analytics` Read topic `orders` ได้" คุณจัดการ ACL ด้วย `kafka-acls.sh` โดยใช้ `--bootstrap-server` เสมอ
+```properties
+# config/security-and-production/authorizer.properties
+# section: broker
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+```
+
+`StandardAuthorizer` คือ authorizer แบบ KRaft-native (`AclAuthorizer` ยุค ZooKeeper หายไปพร้อมกับ ZooKeeper แล้ว) จับคู่กับ `super.users` (มีเอกสารอยู่ใต้ configuration ของ authorization/ACL ของ Kafka ไม่ใช่ตาราง broker-configs ทั่วไปด้านบน) — list แบบ `principalType:name` คั่นด้วย comma ที่ข้ามการเช็ก ACL ทุกอัน cluster จริงทุกอันต้องมี super user อย่างน้อยหนึ่งตัว ไม่งั้น authorizer ที่ล็อกแน่นอาจล็อก admin ของตัวเองออกได้
+
+```text
+super.users=User:ANONYMOUS
+```
+
+<Callout title="gotcha จริงที่บทนี้เจอตอนตั้ง super.users">
+broker ของบทนี้เองใช้ `PLAINTEXT` สำหรับ listener ภายใน/admin ซึ่งไม่มี authentication เลย — ทุก connection ผ่านมันจะได้ principal `User:ANONYMOUS` การใส่ `User:ANONYMOUS` เข้า `super.users` เป็นทางลัดเพื่อการสอนโดยตั้งใจ เพื่อให้คำสั่ง admin ด้านล่าง (รันผ่าน `PLAINTEXT` listener เดียวกัน) ยังทำงานได้หลังเปิด authorizer แล้ว cluster production จริงไม่ควรปล่อยให้ listener ที่ไม่มี authentication เป็น super user ตลอดไป — มันแปลว่าใครก็ตามที่เข้าถึง listener นั้นได้คือ admin เต็มรูปแบบ
+</Callout>
+
+## พิสูจน์: เปิด authorizer แล้ว แต่ยังไม่มี ACL — produce ที่ถูกปฏิเสธจริง
+
+หลังเปิด authorizer และเพิ่ม SASL/SCRAM listener (setup เต็มด้านล่าง) client ที่ authenticate เป็น `order-service` — principal จริง **ไม่ใช่** super user — พยายาม produce เข้า topic ที่ไม่เคยได้รับสิทธิ์เลย
+
+```text
+$ kafka-console-producer.sh --bootstrap-server localhost:39094 --topic secure-orders \
+    --command-config order-service-client.properties
+[...] WARN [Producer clientId=console-producer] The metadata response from the cluster reported a recoverable issue with correlation id 1 : {secure-orders=TOPIC_AUTHORIZATION_FAILED} (org.apache.kafka.clients.NetworkClient)
+[...] ERROR [Producer clientId=console-producer] Topic authorization failed for topics [secure-orders] (org.apache.kafka.clients.Metadata)
+org.apache.kafka.common.errors.TopicAuthorizationException: Not authorized to access topics: [secure-orders]
+```
+
+`TopicAuthorizationException` จริงแบบ verbatim — authentication ผ่าน (SCRAM ตรวจ password ผ่านแล้ว พิสูจน์ต่อด้านล่าง) แต่ authorization ไม่ผ่าน `kafka-acls.sh --add` คือวิธีแก้
+
+```text
+$ kafka-acls.sh --bootstrap-server localhost:9092 \
+    --add --allow-principal User:order-service \
+    --operation Write --topic secure-orders
+Adding ACLs for resource `ResourcePattern(resourceType=TOPIC, name=secure-orders, patternType=LITERAL)`:
+ 	(principal=User:order-service, host=*, operation=WRITE, permissionType=ALLOW)
+
+$ kafka-console-producer.sh --bootstrap-server localhost:39094 --topic secure-orders \
+    --command-config order-service-client.properties
+(exits 0, no output -- the record went through)
+```
+
+<Mermaid title="Authorization พิสูจน์ว่าผิดก่อน แล้วถูก ด้วย principal เดียวกัน" code={authzFlow} />
+
+export const authzFlow = `sequenceDiagram
+  participant C as order-service (authenticated, not super)
+  participant B as Broker
+  C->>B: Produce to secure-orders (no ACL granted)
+  B-->>C: TOPIC_AUTHORIZATION_FAILED -> real TopicAuthorizationException
+  Note over B: kafka-acls.sh --add --allow-principal User:order-service --operation Write --topic secure-orders
+  C->>B: Produce to secure-orders (retry, same credentials)
+  B-->>C: accepted -- exit 0`;
+
+## bug จริงของ Docker image สองตัวที่เจอตอนตั้งค่า
+
+การสร้าง broker SASL/SCRAM ของบทนี้เองเจอ failure จริงสองตัวที่ไม่มีเอกสารบอกจนกว่าจะเจอเอง ใน official image ทั้งคู่ — คุ้มค่าที่จะรู้ไว้ เพราะทั้งคู่ทำให้ container crash ตอนสตาร์ทโดยไม่เกี่ยวอะไรกับ Kafka config ที่ผิดเลย
+
+<Callout title="Bug 1: การเปิด listener SASL_* ตัวไหนก็ตามต้องการ KAFKA_OPTS แบบเงียบ ๆ">
+script `/etc/kafka/docker/configure` ของ image เองมี branch ที่รันเมื่อ `KAFKA_ADVERTISED_LISTENERS` ตรงกับ protocol `SASL_*` — และ branch นั้นเรียก `ensure KAFKA_OPTS` ซึ่งต้องการให้ `KAFKA_OPTS` **ถูกตั้งค่าอะไรสักอย่าง** ด้วยเหตุผลที่ไม่เกี่ยวกับว่า SASL/SCRAM ทำงานได้จริงหรือไม่เลย ถ้าไม่ตั้งไว้ container จะ crash ที่ชั้น shell script ก่อนที่ JVM จะสตาร์ทด้วยซ้ำ ด้วย bash error ดิบ ๆ แทนที่จะเป็น error ของ Kafka: `/etc/kafka/docker/configure: line 18: !1: unbound variable` วิธีแก้คือใส่ค่า `KAFKA_OPTS` อะไรก็ได้ที่ไม่ว่าง เช่น `KAFKA_OPTS=-Dkafka.docker.compose=security-lesson`
+</Callout>
+
+<Callout title="Bug 2: env var ของ JAAS แบบต่อ listener ต้องขีดล่างซ้อนสอง/สามตัว">
+ตัวแปลง `KAFKA_*` env-var เป็น property ของ image ถือว่าขีดล่างตัวเดียวคือตัวแบ่ง dot property ที่ต้องการ override JAAS แบบต่อ listener ต่อ mechanism คือ `listener.name.sasl_plaintext_host.scram-sha-256.sasl.jaas.config` — และทั้งขีดล่างของชื่อ listener เอง (`sasl_plaintext_host`) และขีดกลางของ mechanism (`scram-sha-256`) เป็นตัวอักษรจริงในตัว property นั้น ไม่ใช่ตัวแบ่ง ถ้าตั้งผิด (`KAFKA_LISTENER_NAME_SASL_PLAINTEXT_HOST_SCRAM_SHA_256_SASL_JAAS_CONFIG` แบบขีดล่างเดี่ยวล้วน) broker จะ crash ด้วย `IllegalArgumentException: Could not find a 'KafkaServer' or 'sasl_plaintext_host.KafkaServer' entry in the JAAS configuration` จริง กฎจริงคือ: ขีดล่างจริงในหนึ่ง segment ต้องซ้อนสองตัว (`__`); ขีดกลางจริงต้องซ้อนสามตัว (`___`); มีแค่ขีดล่างเดี่ยวจริง ๆ เท่านั้นที่แปลว่า "ใส่ dot ตรงนี้" — ได้เป็น `KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_SCRAM___SHA___256_SASL_JAAS_CONFIG` ซึ่งสตาร์ทสะอาดทันที
+</Callout>
+
+## SASL/SCRAM ใน KRaft ครบวงจร
+
+มีสองทางในการตั้ง SCRAM credential ใน KRaft (ไม่มี ZooKeeper เลยไม่มี flag `--zookeeper` แยกสำหรับเรื่องนี้ด้วย): ตอน format หรือแบบ dynamic กับ cluster ที่รันอยู่ flag ตอน format ยืนยันจาก help text จริงของ tool เอง
 
 ```bash
-# Allow user "analytics" to consume from topic "orders"
-kafka-acls.sh --bootstrap-server localhost:9092 \
-  --add --allow-principal User:analytics \
-  --operation Read --topic orders --group analytics-group
-
-# Allow user "order-service" to produce to topic "orders"
-kafka-acls.sh --bootstrap-server localhost:9092 \
-  --add --allow-principal User:order-service \
-  --operation Write --topic orders
+# scripts/security-and-production/storage-format-help.sh
+/opt/kafka/bin/kafka-storage.sh format --help
 ```
 
-<Mermaid title="สามชั้นของ security ใน Kafka" code={secFlow} />
+```text
+  --add-scram ADD_SCRAM, -S ADD_SCRAM
+                         A SCRAM_CREDENTIAL to add to the __cluster_metadata log e.g.
+                         'SCRAM-SHA-256=[name=alice,password=alice-secret]'
+                         'SCRAM-SHA-512=[name=alice,iterations=8192,salt="N3E=",saltedpassword="YCE="]'
+```
 
-export const secFlow = `flowchart LR
-  client["Client"] -->|"TLS: encrypt in transit"| enc["Encryption"]
-  enc -->|"SASL / mTLS: who are you"| authn["Authentication"]
-  authn -->|"ACLs: what may you do"| authz["Authorization"]
-  authz --> broker["Broker serves the request"]`;
+บทนี้ใช้ทางที่สอง — เพิ่ม user เข้า cluster ที่รันอยู่แล้ว ซึ่งเป็นสิ่งที่ workflow ปฏิบัติงานจริงส่วนใหญ่ทำ (เพิ่ม/หมุนเวียน credential โดยไม่ต้อง reformat อะไรเลย)
 
-## checklist ความพร้อม production
+```bash
+# scripts/security-and-production/scram-user-lifecycle.sh
+# Self-contained: creates its own SCRAM user, proves it, then deletes it.
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --alter --entity-type users --entity-name lesson-scram-demo \
+  --add-config 'SCRAM-SHA-256=[password=demo-secret-pw]'
 
-security เป็นเพียงคอลัมน์หนึ่งของความพร้อม production durability กับ observability คือคอลัมน์ที่เหลือ ก่อน cluster รับ traffic จริง ยืนยันว่า
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --describe --entity-type users --entity-name lesson-scram-demo
 
-- **replication factor >= 3** บน topic สำคัญ เพื่อให้เสีย broker ได้สองตัวโดยไม่สูญข้อมูล
-- **`min.insync.replicas=2`** คู่กับ **`acks=all`** การเขียนต้องการ in-sync replica อย่างน้อยสองตัว คือคอมโบ production ที่ durable
-- **TLS ทุกที่**, **SASL หรือ mTLS authentication** และ **ACL** ล็อกแต่ละ principal ให้ least privilege
-- **monitoring และ alerting** บน consumer lag, under-replicated partition และ request latency
-- **quota** เพื่อกัน client ตัวเดียวที่ทำตัวไม่ดีไม่ให้แย่ง bandwidth หรือ request ของทั้ง cluster
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOTSTRAP" \
+  --alter --entity-type users --entity-name lesson-scram-demo \
+  --delete-config 'SCRAM-SHA-256'
+```
+
+```text
+Completed updating config for user lesson-scram-demo.
+SCRAM credential configs for user-principal 'lesson-scram-demo' are SCRAM-SHA-256=iterations=4096
+Completed updating config for user lesson-scram-demo.
+```
+
+ตัว credential เอง — ไม่ใช่ plaintext password — คือสิ่งที่ถูกเก็บ: `--describe` แสดง `iterations=4096` ไม่เคยแสดง `demo-secret-pw` listener ต้องเปิดใช้ SCRAM จริงด้วย
 
 ```properties
-# Durable topic-level defaults for production
-default.replication.factor=3
-min.insync.replicas=2
-# and producers set acks=all
+# config/security-and-production/sasl-listener.properties
+# section: broker
+sasl.enabled.mechanisms=SCRAM-SHA-256
+security.inter.broker.protocol=PLAINTEXT
 ```
 
-<Callout title="สรุปหนึ่งบรรทัด">
-Kafka บน production ซ้อน **TLS** encryption, **SASL/mTLS** authentication และ **ACL** (ผ่าน **`kafka-acls.sh`**) สำหรับ authorization บนแกนที่ durable ทั้ง **replication factor >= 3**, **`min.insync.replicas=2`** และ **`acks=all`** พร้อม **monitoring**, alerting และ **quota** ครบ ยินดีด้วย คุณจบ **Kafka — From Zero to Hero** แล้ว จาก log, broker และ KRaft ผ่าน producer, consumer, delivery semantics, Streams และ Connect ไปจนถึงการรันและทำ Kafka ให้ปลอดภัยบน production ไปสร้างอะไรที่ durable กันเถอะ
+## พิสูจน์: client จริงที่ authenticate ผ่าน — และ client จริงที่ล้มเหลว
+
+KafkaJS producer จริง รันจาก host เข้า `SASL_PLAINTEXT` listener ด้วย credential ที่ถูกต้อง
+
+```text
+const kafka = new Kafka({
+  clientId: 'security-lesson-probe',
+  brokers: ['localhost:39094'],
+  sasl: { mechanism: 'scram-sha-256', username: 'order-service', password: 'order-secret-pw' },
+});
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic: 'secure-orders', messages: [{ value: 'hello from KafkaJS over SASL_PLAINTEXT' }] });
+```
+
+```text
+SASL/SCRAM connect OK as order-service
+send OK
+```
+
+client ตัวเดียวกันเป๊ะ ใส่ password ผิดอย่างเดียว
+
+```text
+{"level":"ERROR", ..., "message":"[SaslAuthenticator-SCRAM-SHA-256] SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256", ...}
+connect FAILED: KafkaJSSASLAuthenticationError - SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256
+```
+
+และฝั่ง Java tooling ของความผิดพลาดเดียวกันเป๊ะ เพื่อเทียบกัน — broker เดียวกัน password ผิดเหมือนกัน ผ่าน `kafka-console-producer.sh` แทน
+
+```text
+[...] ERROR [Producer clientId=console-producer] Connection to node -1 (localhost/127.0.0.1:39094) failed authentication due to: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256 (org.apache.kafka.clients.NetworkClient)
+org.apache.kafka.common.errors.SaslAuthenticationException: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256
+```
+
+client ทั้งคู่โดนเช็กฝั่ง **broker** อันเดียวกันเป๊ะ ได้เหตุผลที่มนุษย์อ่านได้เหมือนกันเป๊ะ — ต่างกันแค่ชื่อ exception class ตาม client (`KafkaJSSASLAuthenticationError` เทียบ `SaslAuthenticationException`) เพราะ challenge-response ของ SCRAM เกิดขึ้นบน wire ไม่ใช่ข้างในของ client library ตัวไหนเลย
+
+## TLS: รูปร่างของมัน และ config key จริง
+
+บทนี้ไม่ได้ generate certificate ครบวงจร — config key ฝั่ง broker คือส่วนที่สำคัญ และมีเอกสารรองรับ ไม่ใช่ตำนาน ยืนยันกับ broker config reference ทางการ (`kafka.apache.org/43/configuration/` ส่วน broker ที่ดึงมาสำหรับคอร์สนี้)
+
+```properties
+# config/security-and-production/tls-broker.properties
+# section: broker
+listeners=SSL://:9093
+ssl.keystore.location=/etc/kafka/secrets/broker.keystore.jks
+ssl.keystore.password=changeit
+ssl.key.password=changeit
+ssl.truststore.location=/etc/kafka/secrets/broker.truststore.jks
+ssl.truststore.password=changeit
+ssl.client.auth=required
+ssl.endpoint.identification.algorithm=https
+```
+
+แต่ละ broker ต้องมี**ทั้ง**สอง keystore (identity ของตัวเอง — certificate ที่มันนำเสนอ) และ truststore (ใครที่มันยอมเชื่อถือ — ปกติคือ CA ที่ sign certificate ของทุก broker และ client ใน private cluster) `ssl.client.auth=required` เปิด TLS แบบ **mutual**: broker เรียกร้องและตรวจ certificate จาก client ด้วย ซึ่งเป็นโหมด mTLS authentication ที่กล่าวถึงด้านล่าง — TLS อย่างเดียวพิสูจน์แค่ identity ของ **broker** ให้ client เห็น ไม่ใช่ในทางกลับกัน `ssl.endpoint.identification.algorithm=https` เปิด hostname verification กับ SAN ของ certificate ซึ่งป้องกัน man-in-the-middle แบบง่าย ๆ แม้ attacker จะมี certificate ที่ valid จริง แต่ไม่ใช่สำหรับ hostname ที่กำลังเชื่อมต่อ — การไม่ตั้งค่านี้คือ misconfiguration จริงที่พบบ่อย
+
+## checklist ความพร้อมสำหรับ production
+
+security เป็นคอลัมน์เดียว durability กับ observability เป็นคอลัมน์อื่นที่ครอบคลุมใน [Monitoring & Consumer Lag](/kafka/th/operations-and-production/monitoring-and-consumer-lag/) และ [Performance & Tuning](/kafka/th/operations-and-production/performance-and-tuning/) ก่อน cluster จะรับ traffic จริง
+
+- **`authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer`** พร้อม `super.users` ที่จำกัดเฉพาะ principal ของ admin จริง ๆ — พิสูจน์ด้านบนว่าต้องมีก่อน ACL จะมีความหมายอะไรเลย
+- **TLS ทุกที่** (`ssl.client.auth=required` สำหรับ mTLS หรือ SASL ผ่าน `SASL_SSL` สำหรับ access ที่ authenticated และ encrypted) — listener แบบ plaintext ไม่ควรเข้าถึงได้จากนอก trusted network boundary
+- **ACL แบบ least-privilege ต่อ principal** — พิสูจน์ด้านบนด้วย `order-service` ที่ได้แค่ `Write` บน `secure-orders` เท่านั้น ไม่กว้างกว่านั้น
+- **Replication factor >= 3** บน topic สำคัญพร้อม **`min.insync.replicas=2`** และ producer ใช้ **`acks=all`** — combination ที่ durable ซึ่งบท [Acks & Durability](/kafka/th/producers/acks-and-durability/) ของคอร์สนี้พิสูจน์ไว้
+- **Monitoring และ alerting** บน consumer lag, under-replicated partition, และ request latency — หัวข้อของบทถัดไป
+- **Quota** เพื่อไม่ให้ client ตัวเดียวแย่ง bandwidth หรือ request capacity ของ cluster ทั้งหมด
+
+<Callout title="สรุปในหนึ่งบรรทัด">
+`kafka-acls.sh` ไม่ทำอะไรเลยจนกว่า `authorizer.class.name` จะถูกตั้ง — พิสูจน์ด้านบนด้วย `SecurityDisabledException` จริง พอตั้งแล้ว ACL ถูกบังคับใช้จริง: principal ที่ไม่มีสิทธิ์ได้ `TopicAuthorizationException` จริง และ `kafka-acls.sh --add` คือสิ่งที่แก้ได้จริง พิสูจน์ครบวงจรบน principal เดียวกัน SASL/SCRAM ใน KRaft เก็บ credential metadata จริง (`iterations=4096` ไม่เคยเป็น plaintext password) ผ่าน `kafka-configs.sh --alter --entity-type users` และ password ผิดได้การปฏิเสธฝั่ง broker เหมือนกันไม่ว่า client จะเป็น KafkaJS หรือ Java console tools bug จริงของ Docker image สองตัว (ความต้องการ `KAFKA_OPTS` แบบเงียบ ๆ และการ escape ขีดล่าง/ขีดกลางใน JAAS env var แบบต่อ listener) กินเวลา debug มากกว่า security config จริงเสียอีก TLS ต้องมีทั้ง keystore และ truststore ต่อ broker และ `ssl.client.auth=required` บวก `ssl.endpoint.identification.algorithm=https` คือสิ่งที่เปลี่ยน "encrypted" ให้กลายเป็น "authenticated ร่วมกันและ verify hostname แล้ว"
 </Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="bash" code={`#!/usr/bin/env bash
+# AI comment: "Lock down the orders topic to only the order-service producer"
+set -euo pipefail
+
+kafka-topics.sh --bootstrap-server localhost:9092 \\
+  --create --topic orders --partitions 3 --replication-factor 3
+
+kafka-acls.sh --bootstrap-server localhost:9092 \\
+  --add --allow-principal User:order-service \\
+  --operation Write --topic orders
+`}>
+
+script นี้คือ runbook "ล็อก topic" ที่ดูสมเหตุสมผลเต็มที่ — สร้างมันขึ้นมา แล้วให้สิทธิ์เฉพาะ principal เดียวที่ควรเขียนเข้าไปได้ ไม่กว้างกว่านั้น มันมีแนวโน้มสูงมากที่จะพังบน cluster จริงด้วย `SecurityDisabledException` เดียวกับที่พิสูจน์ไว้ต้นบทนี้: ไม่มีอะไรใน script นี้ (หรือที่ไหนก่อนหน้านี้ ถ้านี่คือคำสั่งแรกที่เกี่ยวกับ security ที่ทีมรัน) เคยตั้ง `authorizer.class.name` เลย `kafka-acls.sh --add` บน broker ที่ไม่มี authorizer จะไม่ no-op เงียบ ๆ — มัน error ออกมาทันที `set -euo pipefail` ฆ่า script ตรงนั้นเลย และ topic ที่บรรทัด 6 เพิ่งสร้างถูกทิ้งไว้โดย**ไม่มี** ACL enforcement เลย ไม่ใช่สถานะที่ล็อกแน่นแบบที่ comment สัญญาไว้ วิธีแก้ไม่ใช่ flag อื่นของ `kafka-acls.sh` — แต่คือ `authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer` ระดับ broker (บวก `super.users` สำหรับใครก็ตามที่รัน script นี้) ที่ใส่แล้ว restart broker **ก่อน** ที่จะคาดหวังให้คำสั่ง ACL ใด ๆ ทำอะไรได้จริง
+
+</SpotTheBug>
+
+## Mental Model
+
+มอง security ของ Kafka เป็นสวิตช์ yes/no อิสระสามตัว เช็กตามลำดับคงที่สำหรับทุก request: connection **encrypted** หรือไม่ (TLS หรือไม่ก็ได้ — เป็นอิสระจากอีกสองตัว), broker รู้ **ว่าใครกำลังถาม** หรือไม่ (authentication — SASL, mTLS, หรือ "ทุกคนคือ `ANONYMOUS`" by default), และ identity นั้น**ได้รับอนุญาตให้ทำสิ่งนี้เฉพาะเจาะจงหรือไม่** (authorization — ACL ซึ่งบทนี้พิสูจน์แล้วว่าไม่มีอยู่จริงในฐานะ concept เลยจนกว่า `authorizer.class.name` จะถูกตั้ง) cluster production ต้องการทั้งสามตัว tutorial และ script ที่ AI เขียนจำนวนมากแสดงแค่ตัวที่สาม โดยสมมติเงียบ ๆ ว่าสองตัวแรกถูกจัดการแล้ว — ซึ่งเป็นช่องว่างเดียวกันเป๊ะกับที่ `SpotTheBug` ของบทนี้เดินเข้าไป
+
+## Trade-offs
+
+- **`User:ANONYMOUS` เป็น super user บน listener ภายใน** — สะดวกสำหรับ admin scripting บน listener ที่ไม่มีอะไรที่ไม่น่าเชื่อถือเข้าถึงได้ (พิสูจน์เป็น pattern ของบทนี้เอง) และเป็นช่องโหว่ security จริงทันทีที่ listener นั้นเข้าถึงได้จากที่ที่ไม่ควร
+- **SASL/SCRAM เทียบกับ mTLS** — SCRAM เป็นแบบ self-contained (credential อยู่ใน metadata log ของ cluster เอง พิสูจน์ด้านบน ไม่ต้องมี CA ภายนอก) และหมุนเวียนต่อ user ได้ง่าย; mTLS ผูก identity เข้ากับ certificate ซึ่งรวมศูนย์ trust ไว้ที่ CA แต่หลีกเลี่ยงการส่ง password ไปที่ไหนเลย รวมถึงเข้าไปใน JAAS config string
+- **การตั้ง SCRAM user แบบ dynamic (`kafka-configs.sh --alter`) เทียบกับตอน format (`kafka-storage.sh format --add-scram`)** — dynamic คือสิ่งที่ operation จริงใช้ (เพิ่ม/หมุนเวียน user โดยไม่ต้องแตะ storage ของทุก broker) พิสูจน์ครบวงจรด้านบน; format-time เหมาะสำหรับ bootstrap credential ของ admin ตัวแรกสุดก่อนที่ broker ไหนจะเคยสตาร์ทเท่านั้นจริง ๆ
+- **`ssl.endpoint.identification.algorithm=https` เปิดเทียบกับปิด** — เปิด (default ที่ปลอดภัยกว่า) ปฏิเสธ certificate ที่ valid แต่ผิด hostname; ปิดยอมรับมัน ซึ่งบางครั้งจำเป็นสำหรับ setup แบบ service-mesh ภายในที่ naming ไม่มาตรฐาน แต่เปิดช่องว่าง man-in-the-middle ที่ hostname verification มีไว้เพื่อปิดกลับมาอีกครั้ง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`kafka-acls.sh --add` ทำงานได้บน broker ไหนก็ได้ คุณต้องมี authorizer ก็ต่อเมื่อต้องการให้ ACL ถูก *enforce* จริงเท่านั้น"** ไม่ — พิสูจน์ด้านบน: ถ้าไม่ตั้ง `authorizer.class.name` `kafka-acls.sh` จะ**แม้แต่ list** ACL ก็ไม่ได้เลย `SecurityDisabledException` จริง ไม่ใช่ no-op แบบนุ่มนวล
+- **"`TopicAuthorizationException` แปลว่า credential ของ client ผิด"** ไม่ — พิสูจน์ด้านบน: `order-service` authenticate สำเร็จ (SCRAM ตรวจผ่าน) แต่ยังถูกปฏิเสธอยู่ดี เพราะ authentication กับ authorization เป็นการเช็กสองอย่างแยกกัน; กรณี password ผิดที่พิสูจน์ด้านบนด้วยเช่นกัน ให้ exception คนละตัวเลย (`SaslAuthenticationException` / `KafkaJSSASLAuthenticationError`) ที่จุดต่างกันของ connection
+- **"SASL/SCRAM ต้องการ ZooKeeper หรือ credential store แยกต่างหาก"** ไม่ — พิสูจน์ด้านบน: `kafka-configs.sh --alter --entity-type users` เขียน credential ตรงเข้า `__cluster_metadata` log ของ KRaft บน cluster ที่รันอยู่ ไม่มี ZooKeeper ไม่มี store ภายนอก
+- **"TLS กับ authentication คือสิ่งเดียวกัน — เปิด `SSL://` แปลว่า client ถูก authenticate แล้ว"** ไม่ — พิสูจน์ใน config ด้านบน: `SSL://` เปล่า ๆ พิสูจน์แค่ identity ของ *broker* ให้ client เห็นเท่านั้น client ไม่นำเสนอ identity อะไรเลยเว้นแต่ `ssl.client.auth=required` (mTLS) หรือ SASL mechanism ถูกวางซ้อนผ่าน `SASL_SSL`
 
 export const quizSecurity = [
   {
-    q: 'สามชั้นของ security ใน Kafka คืออะไร',
+    q: 'พิสูจน์ด้านบน kafka-acls.sh --list ทำอะไรจริง ๆ บน broker ที่ไม่ได้ตั้ง authorizer.class.name?',
     options: [
-      'encryption in transit (TLS), authentication (SASL/mTLS) และ authorization (ACL)',
-      'backup, snapshot และ replication',
-      'batching, compression และ acks',
-      'ZooKeeper, KRaft และ JMX',
-    ],
-    answer: 0,
-  },
-  {
-    q: 'tool ไหนจัดการกฎ authorization ของ Kafka',
-    options: [
-      '`kafka-storage.sh`',
-      '`kafka-acls.sh --bootstrap-server ...`',
-      '`kafka-console-producer.sh`',
-      '`kafka-topics.sh --acl`',
+      'คืน ACL list ว่างเปล่าเงียบ ๆ',
+      'โยน SecurityDisabledException จริง: "No Authorizer is configured on the broker" -- ไม่มีระบบ ACL ให้ query เลย',
+      'เปิด authorizer default ให้อัตโนมัติ',
+      'สำเร็จแต่เพิกเฉยต่อ --add call ในอนาคตทั้งหมด',
     ],
     answer: 1,
+    explain: 'output จริงแบบ verbatim ที่จับไว้ด้านบน: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker',
   },
   {
-    q: 'คอมโบ production ที่ durable สำหรับการเขียนคืออะไร',
+    q: 'พิสูจน์ด้านบน เกิดอะไรขึ้นตอน principal (order-service) authenticate ผ่าน SASL/SCRAM สำเร็จ แต่ไม่มี ACL ให้บน topic ที่พยายาม produce เข้าไป?',
     options: [
-      'replication factor 1 และ acks=0',
-      'replication factor >= 3, min.insync.replicas=2 และ acks=all',
-      'broker ตัวเดียวไม่มี replica',
-      'acks=1 โดยไม่มี ISR ขั้นต่ำ',
+      'produce สำเร็จเพราะ authentication เพียงพอแล้ว',
+      'TopicAuthorizationException จริง: "Not authorized to access topics: [secure-orders]" -- authentication กับ authorization เป็นการเช็กแยกกัน และตัวนี้พังที่ตัวที่สอง',
+      'broker crash',
+      'client ถูกตัด connection ก่อน authentication จะเสร็จ',
     ],
     answer: 1,
+    explain: 'transcript จริงด้านบนแสดง TOPIC_AUTHORIZATION_FAILED ใน metadata response ตามด้วย TopicAuthorizationException จริง; kafka-acls.sh --add --allow-principal User:order-service --operation Write --topic secure-orders แก้ได้ พิสูจน์ด้วย retry ที่ exit 0 สะอาด',
   },
   {
-    q: 'ทำไมต้องตั้ง quota บน production cluster',
+    q: 'บทนี้เจอ bug จริงที่ไม่มีเอกสารบอกสองตัวอะไรบ้างตอนเปิด SASL_PLAINTEXT listener บน official apache/kafka image?',
     options: [
-      'เพื่อ encrypt traffic ระหว่าง broker',
-      'เพื่อกัน client ตัวเดียวที่ทำตัวไม่ดีไม่ให้แย่ง bandwidth หรือ request ของทั้ง cluster',
-      'เพื่อเพิ่ม replication factor อัตโนมัติ',
-      'เพื่อปิด ACL',
+      'Java dependency หายและ port mapping พัง',
+      "shell-script `ensure KAFKA_OPTS` check ที่ทำให้ container crash ด้วย 'line 18: !1: unbound variable' เว้นแต่จะตั้ง KAFKA_OPTS เป็นอะไรสักอย่าง และตัวแปลง KAFKA_* env-var เป็น property ที่ต้องการขีดล่างซ้อนสองและขีดกลางซ้อนสามในชื่อ env var ของ JAAS แบบต่อ listener",
+      'image ไม่รองรับ SASL_PLAINTEXT เลย',
+      'bug certificate TLS หมดอายุ',
     ],
     answer: 1,
+    explain: 'พิสูจน์สดทั้งคู่: อันแรก crash ด้วย bash "unbound variable" error ดิบ ๆ ก่อน JVM จะสตาร์ทด้วยซ้ำ; อันที่สองคือ IllegalArgumentException จริง: Could not find a \'KafkaServer\' or \'sasl_plaintext_host.KafkaServer\' entry in the JAAS configuration แก้ได้ด้วยการเปลี่ยนชื่อ env var เป็น KAFKA_LISTENER_NAME_SASL__PLAINTEXT__HOST_SCRAM___SHA___256_SASL_JAAS_CONFIG',
+  },
+  {
+    q: 'พิสูจน์ด้านบนด้วย kafka-configs.sh --describe --entity-type users Kafka เก็บอะไรจริง ๆ สำหรับ SCRAM credential?',
+    options: [
+      'plaintext password เพื่อการ troubleshoot',
+      'มีแค่ credential metadata อย่าง iterations=4096 -- plaintext password เองไม่เคยถูกเก็บหรือแสดงกลับมาเลย',
+      'ไม่มีอะไรถูกเก็บจนกว่า user จะ authenticate ครั้งแรก',
+      'bcrypt hash ของ password',
+    ],
+    answer: 1,
+    explain: "output จริง: \"SCRAM credential configs for user-principal 'lesson-scram-demo' are SCRAM-SHA-256=iterations=4096\" -- password ที่ใช้สร้างมัน (demo-secret-pw) ไม่เคยปรากฏเลย",
+  },
+  {
+    q: 'พิสูจน์ด้านบน error text จริงคืออะไรตอน KafkaJS producer เชื่อมต่อด้วย username ถูกแต่ SCRAM password ผิด?',
+    options: [
+      '"connection refused" แบบทั่วไป',
+      "KafkaJSSASLAuthenticationError: \"SASL SCRAM SHA256 authentication failed: Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256\" -- และ Java console producer ที่ password ผิดเหมือนกันได้เหตุผลฝั่ง broker เดียวกัน แค่ห่อด้วย SaslAuthenticationException แทน",
+      'connection ค้างเงียบ ๆ ไม่มี error เลย',
+      'KafkaJS retry ไม่รู้จบโดยไม่เคยพัง',
+    ],
+    answer: 1,
+    explain: 'transcript error จริงทั้งคู่ที่จับไว้ด้านบนแสดงข้อความปฏิเสธฝั่ง broker เดียวกันเป๊ะ ("Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256") พิสูจน์ว่าการเช็กเกิดครั้งเดียวบน wire ไม่ใช่แยกกันใน client แต่ละตัว',
+  },
+  {
+    q: 'ssl.client.auth=required เปลี่ยนอะไรจริง ๆ เทียบกับ listener SSL:// เปล่า ๆ ที่ไม่มีมัน?',
+    options: [
+      'ไม่มีอะไรเลย -- เป็น no-op ที่เลิกใช้แล้ว',
+      'มันเปิด mutual TLS: broker เรียกร้องและตรวจ certificate จาก client ด้วย ในขณะที่ SSL:// เปล่า ๆ พิสูจน์แค่ identity ของ broker ให้ client เห็นเท่านั้น',
+      'มันปิด encryption แล้ว fallback ไปเป็น plaintext',
+      'เกี่ยวข้องแค่กับ listener SASL_SSL เท่านั้น ไม่เกี่ยวกับ SSL เปล่า ๆ',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงจาก broker config reference จริง (kafka.apache.org/43/configuration/ ส่วน broker): ถ้าไม่มี ssl.client.auth=required TLS อย่างเดียวจะ authenticate แค่ broker ให้ client เห็น ไม่ใช่ client ให้ broker เห็น',
   },
 ];
 
