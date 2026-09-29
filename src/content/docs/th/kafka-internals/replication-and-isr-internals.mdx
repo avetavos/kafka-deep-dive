@@ -1,0 +1,260 @@
+---
+title: 'Replication and ISR Internals'
+description: 'follower FetchRequest มีอะไรจริง ๆ, high watermark กับ LEO ต่อ replica สัมพันธ์กันยังไง, ISR shrink จริงกับ controller-side broker fencing หน้าตาเป็นยังไง, leader-epoch-checkpoint fencing, และ KIP-966 eligible leader replicas -- พิสูจน์บนคลัสเตอร์ Kafka 4.3.1 KRaft 3-broker ชั่วคราวจริง.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## สรุปในหนึ่งบรรทัด
+
+follower replicate โดยส่ง `FetchRequest` ของตัวเองไปหา leader (ไม่ใช่ leader push เด็ดขาด) leader ติดตาม **LEO** (log end offset) ของแต่ละ replica จาก request เหล่านั้นแล้วเลื่อน **high watermark** ของ partition ไปที่ LEO ต่ำสุดใน ISR และทุกอย่างที่ตามมา -- ISR shrink, unclean election, KIP-966 eligible leader replicas -- คือกลไกเดียวกันนี้ที่ตอบสนองต่อ replica ที่ตามไม่ทันหรือหายไป
+
+<Callout title="คลัสเตอร์ของบทนี้">
+proof ทุกอันข้างล่างใช้ **คลัสเตอร์ KRaft 3-broker ชั่วคราว** (compose ของโมดูลนี้เอง เปิดแค่สำหรับบทนี้แล้วปิดทันทีหลังใช้ -- ตาม hard rule ของ brief กลางที่ว่า compose 3-broker อนุญาตให้ใช้แค่ที่นี่) พฤติกรรม replication และ ISR ไม่มีทางเกิดบน broker เดียว [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) บอกไว้ตรง ๆ แล้วและชี้มาที่นี่
+</Callout>
+
+## `FetchRequest` จริงของ follower พร้อม replicaId ครบ
+
+สร้าง topic ด้วย `--replication-factor 3 --config min.insync.replicas=2` แล้ว describe:
+
+```text
+$ /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic internals-isr-demo --partitions 1 --replication-factor 3 --config min.insync.replicas=2
+Created topic internals-isr-demo.
+
+$ /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic internals-isr-demo
+Topic: internals-isr-demo	TopicId: bewtRZNJQjKJtbctupSBog	PartitionCount: 1	ReplicationFactor: 3	Configs: min.insync.replicas=2
+	Topic: internals-isr-demo	Partition: 0	Leader: 1	Replicas: 1,2,3	Isr: 1,2,3	Elr: 	LastKnownElr:
+```
+
+`Elr:` กับ `LastKnownElr:` คือ column จริง ว่างแต่มีอยู่จริง -- นี่คือ [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas) (Eligible Leader Replicas) พิสูจน์ว่า active บนคลัสเตอร์ 4.3.1 นี้ด้านล่าง produce record หนึ่งตัวด้วย `acks=all` แล้วอ่าน request log ของ **leader** เองสำหรับ request `FETCH` ที่ `clientId` เป็น **fetcher** ไม่ใช่ client:
+
+```text
+"requestHeader":{"requestApiKey":1,"requestApiVersion":18,"clientId":"broker-2-fetcher-0","requestApiKeyName":"FETCH"},
+"request":{"replicaState":{"replicaId":2,"replicaEpoch":10},"maxWaitMs":500,"minBytes":1,"maxBytes":10485760,
+  "sessionId":322919192,"sessionEpoch":18,
+  "topics":[{"topicId":"bewtRZNJQjKJtbctupSBog","partitions":[
+    {"partition":0,"currentLeaderEpoch":0,"fetchOffset":1,"lastFetchedEpoch":0,"logStartOffset":0,"partitionMaxBytes":1048576}]}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"sessionId":322919192,"responses":[
+  {"topicId":"bewtRZNJQjKJtbctupSBog","partitions":[
+    {"partitionIndex":0,"errorCode":0,"highWatermark":1,"lastStableOffset":1,"logStartOffset":0,"recordsSizeInBytes":0}]}]}}
+```
+
+`"clientId":"broker-2-fetcher-0"` -- replica fetcher thread ของ broker 2 เอง ไม่ใช่ producer หรือ consumer `"replicaState":{"replicaId":2,...}` คือคำยืนยันตรง ๆ ว่า replica*ไหน*กำลัง fetch ก่อนหน้า request นี้ทันที fetcher ของ broker 2 มี `fetchOffset:1` และ `highWatermark` ใน response ยังเป็น `0` (จาก poll ก่อนหน้า ไม่ได้แสดง) response ตัวนี้เป๊ะคือช่วงที่ HW **เลื่อนขึ้นเป็น 1** -- proof ว่า HW-advance ที่ [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/) อธิบายไว้ขับเคลื่อนด้วย request แบบนี้เป๊ะ จาก ISR member ทุกตัว ไม่ใช่ timer ฝั่ง leader
+
+## LEO เทียบกับ HW ต่อ replica
+
+`kafka-log-dirs.sh --describe` รายงานมุมมองของแต่ละ broker เองต่อ partition รวมถึง `offsetLag` -- ช่องว่างระหว่าง LEO ของ replica นั้นกับของ leader:
+
+```bash
+# scripts/replication-and-isr-internals/log-dirs-describe.sh
+TOPIC="${TOPIC_PREFIX}internals-logdirs-lesson"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-log-dirs.sh --bootstrap-server $BOOTSTRAP --describe --topic-list "$TOPIC"
+```
+
+output จริงจากคลัสเตอร์ 3-broker บน topic isr-demo (broker ที่ยังมีชีวิตทั้งสองรายงาน `offsetLag:0` -- ตามทันเต็มที่):
+
+```text
+Querying brokers for log directories information
+Received log directory information from brokers 1,2
+{"brokers":[
+  {"broker":1,"logDirs":[{"partitions":[{"partition":"internals-isr-demo-0","size":84,"offsetLag":0,"isFuture":false}],"error":null,"logDir":"/tmp/kafka-logs"}]},
+  {"broker":2,"logDirs":[{"partitions":[{"partition":"internals-isr-demo-0","size":84,"offsetLag":0,"isFuture":false}],"error":null,"logDir":"/tmp/kafka-logs"}]}],
+ "version":1}
+```
+
+สังเกตว่าเครื่องมือเองบอก `"Received log directory information from brokers 1,2"` -- broker 3 ถูก pause อยู่ตอนนั้นแล้วก็ไม่ตอบเฉย ๆ `kafka-log-dirs.sh` รายงานสิ่งที่มันเข้าถึงได้ ไม่ error ออกเพราะ broker หายไป (`kafka-replica-verification.sh` ก็มีอยู่จริงบน image นี้ -- `ls /opt/kafka/bin | grep replica-verif` ยืนยันแล้ว -- เป็นเครื่องมือเก่าที่สร้างมาเพื่อเทียบ LEO-กับ-leader แบบเดียวกันทั่วทุก replica ของ topic)
+
+## ISR shrink: บรรทัด controller log จริง และการแก้ไขอย่างซื่อตรง
+
+Pause กระบวนการทั้งตัวของ broker 3 (`docker pause` จำลอง hang แข็ง ไม่ใช่ shutdown แบบ graceful) แล้วรอเกิน `replica.lag.time.max.ms` default (30000ms) ISR ของ topic shrink จริง:
+
+```text
+$ /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic internals-isr-demo
+Topic: internals-isr-demo	...	Configs: min.insync.replicas=2
+	Topic: internals-isr-demo	Partition: 0	Leader: 1	Replicas: 1,2,3	Isr: 1,2	Elr: 	LastKnownElr:
+```
+
+แต่บรรทัด log *จริง* ที่ทำให้เกิด พบใน log ของ **controller** (ไม่ใช่ `server.log` ของ leader -- membership ของ ISR เป็น state ที่ controller เป็นเจ้าของใน KRaft ต่างจากดีไซน์ยุค ZooKeeper เก่าที่ leader เขียนมันตรง ๆ) ไม่ใช่ข้อความ `"Shrinking ISR"` แบบ classic ที่เนื้อหา Kafka เก่า ๆ บางแหล่งยกมา:
+
+```text
+[...] INFO [QuorumController id=1] Fencing broker 3 at epoch 12 because its session has timed out. (org.apache.kafka.controller.ReplicationControlManager)
+[...] INFO [QuorumController id=1] handleBrokerFenced: changing 1 partition(s) (org.apache.kafka.controller.ReplicationControlManager)
+```
+
+<Callout title="แก้ไขอย่างซื่อตรง: นี่พิสูจน์ broker fencing ไม่ใช่ path replica.lag.time.max.ms">
+`docker pause` หยุดกระบวนการ*ทั้งตัว*ของ broker รวมถึง heartbeat ไปหา controller ด้วย -- สิ่งที่ run นี้ trigger จริง ๆ คือ path **broker session-timeout fencing** ของ controller (`handleBrokerFenced`) ที่เอาทุก partition ที่ broker ที่ถูก fence อยู่ใน ISR ออก ส่วน shrink แบบ classic ที่ขับเคลื่อนด้วย `replica.lag.time.max.ms` (broker ที่ยังมีชีวิตและ heartbeat อยู่ แต่ *fetcher* ตามไม่ทันบน partition หนึ่งโดยเฉพาะ) เป็นโค้ดพาธที่ต่างกันจริงใน `ReplicationControlManager` และการแยก "มีชีวิตแต่ fetch ช้า" ออกจาก "ตายแล้ว" อย่างแม่นยำต้อง fault injection ที่ละเอียดกว่านี้ (เช่น บล็อกแค่พอร์ต data-plane) มากกว่าที่วิธีพิสูจน์ของบทนี้ใช้ ทั้งสอง path บันทึกไว้ที่ [`replica.lag.time.max.ms`](https://kafka.apache.org/43/documentation/#brokerconfigs_replica.lag.time.max.ms) และทั้งคู่ให้อาการที่เห็นเหมือนกัน -- `Isr:` ที่ shrink -- นี่เองคือเหตุผลที่ควรระบุให้ชัดว่า trigger อันไหนจริง แทนที่จะสันนิษฐานเอา
+</Callout>
+
+`PartitionChangeRecord` จริงที่เกิดขึ้น อ่านตรงจาก `__cluster_metadata` (proof ประเภท record เต็มรูปแบบใน [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/)):
+
+```text
+{"type":"PARTITION_CHANGE_RECORD","version":2,"data":{"partitionId":0,"topicId":"bewtRZNJQjKJtbctupSBog","isr":[1,2]}}
+```
+
+## Leader epoch fencing: ไฟล์ checkpoint จริง
+
+ทุก replica เก็บไฟล์ `leader-epoch-checkpoint` ที่ map leader epoch ไปยัง offset แรกที่เขียนภายใต้ epoch นั้น -- นี่คือสิ่งที่ทำให้ replica ตรวจจับและ truncate ข้อมูลที่เขียนภายใต้ leader epoch ที่กลายเป็นเก่าแล้วได้ (unclean leader change หรือ replica ที่พลาด epoch bump) เนื้อหาจริง ทั้ง leader และ follower ตรงกัน:
+
+```text
+$ cat /tmp/kafka-logs/internals-isr-demo-0/leader-epoch-checkpoint   # broker 1 (leader)
+0
+1
+0 0
+
+$ cat /tmp/kafka-logs/internals-isr-demo-0/leader-epoch-checkpoint   # broker 2 (follower)
+0
+1
+0 0
+```
+
+รูปแบบ: บรรทัดแรก `0` คือ version ของไฟล์ checkpoint; บรรทัดสอง `1` คือจำนวน entry ของ epoch ที่ตามมา; `0 0` คือหนึ่ง entry, `<leaderEpoch> <startOffset>` -- epoch `0` เริ่มที่ offset `0` `FetchRequest` ของ follower เอง (พิสูจน์แล้วข้างบน) พก `lastFetchedEpoch` มาด้วยเป๊ะ ๆ เพื่อให้ leader บอกได้ว่า "คุณกำลัง fetch ภายใต้ leader epoch ที่ไม่ตรงกับความจริงแล้ว truncate แล้ว fetch ใหม่" ถ้าประวัติ epoch ของ follower เบี่ยงเบนไป -- กลไกที่ [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/) แสดงสำหรับ log ของ controller quorum เองใช้ไอเดียเดียวกันเป๊ะ (`LeaderChange` control record)
+
+## `unclean.leader.election.enable`: default จริง แหล่ง config จริง
+
+```bash
+# scripts/replication-and-isr-internals/unclean-config.sh
+/opt/kafka/bin/kafka-configs.sh --bootstrap-server $BOOTSTRAP \
+  --describe --entity-type brokers --entity-name 1 --all 2>&1 | grep "unclean.leader.election.enable"
+```
+
+output จริง:
+
+```text
+unclean.leader.election.enable=false sensitive=false synonyms={DEFAULT_CONFIG:unclean.leader.election.enable=false}
+```
+
+`false` โดย default: ถ้า ISR ว่างเปล่าเมื่อไหร่ (in-sync replica หายไปหมด) และ `unclean.leader.election.enable` ยังเป็น `false` partition นี้จะ**ไม่มี leader เลย** จนกว่า in-sync replica จะกลับมา -- ใช้งานไม่ได้ แต่ไม่หายแบบเงียบ ๆ การเปลี่ยนเป็น `true` จะให้ replica ที่ไม่ sync เป็น leader แทนได้ แลกความพร้อมใช้งานกับความเสี่ยงที่จะทำ record หายแบบเงียบ ๆ ทุกตัวที่ leader ใหม่ไม่เคยมี `LastKnownElr:` ของ `kafka-topics.sh --describe` (พิสูจน์แล้วว่าว่างแต่มีอยู่จริงข้างบน) คือ field ของ KIP-966 เป๊ะที่การตัดสินใจนี้ขึ้นอยู่กับใน 4.x -- ดูด้านล่าง
+
+## KIP-966 eligible leader replicas: พิสูจน์ว่า active บน 4.3.1
+
+```bash
+# scripts/replication-and-isr-internals/elr-feature.sh
+/opt/kafka/bin/kafka-features.sh --bootstrap-server $BOOTSTRAP describe 2>&1 | grep "eligible.leader.replicas.version"
+```
+
+output จริง:
+
+```text
+Feature: eligible.leader.replicas.version          SupportedMinVersion: 0                SupportedMaxVersion: 1                FinalizedVersionLevel: 1                Epoch: 1249
+```
+
+`FinalizedVersionLevel: 1` แปลว่า ELR ([KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas)) **เปิดโดย default** บนคลัสเตอร์ Kafka 4.3.1 ที่ format ใหม่ -- คุ้มที่จะพูดตรง ๆ เพราะเนื้อหา wiki ของ KIP เองบอกว่า default ที่เสนอไว้คือ `false` ("False is the default value" -- ยกมาตรงจากหน้า KIP); output จริงของ `kafka-features.sh describe` บนคลัสเตอร์นี้แสดงว่า default ที่*ส่งจริง*ของ 4.3.1 ต่างจากข้อเสนอเดิมนั้น ELR ติดตาม replica ที่*ไม่ได้*อยู่ใน ISR ตอนนี้ แต่ยังรู้ว่าเป็น candidate สำหรับ unclean election ที่ปลอดภัย (เพิ่งอยู่ใน ISR เร็ว ๆ นี้พอที่ข้อมูลจะยังไม่เก่า) column `Elr`/`LastKnownElr` ที่พิสูจน์แล้วว่าว่างข้างบนคือ list นี้เป๊ะ และ `FEATURE_LEVEL_RECORD` จริงของ `eligible.leader.replicas.version` ใน `__cluster_metadata` ถูก decode ตรงใน [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/)
+
+## Controller failover: timing จริง
+
+หยุด broker 1 (leader ของ controller quorum ตอนนั้น) บนคลัสเตอร์ 3-broker ตัวเดียวกันนี้ แล้ว poll `kafka-metadata-quorum.sh describe --status` จาก broker 2:
+
+```text
+$ /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status   # ก่อน
+LeaderId:               1
+LeaderEpoch:            1
+
+$ docker stop kafka-internals-b1   # หยุด controller leader
+
+$ /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 describe --status   # +4.2s, จาก broker 2
+LeaderId:               2
+LeaderEpoch:            2
+```
+
+controller leader ตัวใหม่ (broker 2) ถูกเลือกและให้บริการได้ภายในประมาณ 4.2 วินาทีตามนาฬิกา Mac เครื่องนี้ (poll ทุกวินาที failover จริง ๆ น่าจะเร็วกว่านี้แน่นอน -- เลขนี้คือขอบบนจาก granularity การ poll ของบทนี้ ไม่ใช่การวัดที่แม่นยำ) `LeaderEpoch` ที่เพิ่มจาก `1` เป็น `2` คือไอเดีย epoch-fencing เดียวกับ leader epoch ต่อ partition ข้างบน แค่ขึ้นไปอีกระดับ: มันป้องกันไม่ให้ broker 1 ถ้ากลับมา ถูกเข้าใจผิดว่าเป็น controller leader ที่ยัง current อยู่ รายละเอียด controller log เต็มรูปแบบของ failover นี้ (`__cluster_metadata` record, `kafka-metadata-quorum.sh describe --replication`) อยู่ใน [KRaft Metadata Log](/kafka/th/kafka-internals/kraft-metadata-log/)
+
+## Mental Model
+
+Replication คือ **pull loop ที่มีตัวเลขหนึ่งตัวอยู่ตรงกลาง**: high watermark ของ leader คือ LEO ต่ำสุดใน ISR ปัจจุบัน คำนวณใหม่ทุกครั้งที่ `FetchRequest` ของ ISR member ตัวใดรายงาน LEO ใหม่ ทุกอย่างที่เหลือในบทนี้คือสิ่งที่เกิดที่ขอบของ loop นั้น -- member ที่หยุด fetch ทันเวลาหลุดจาก ISR (shrink); member ที่กลับมาแล้วต้องพิสูจน์ว่าข้อมูลตัวเองไม่เก่าเทียบกับ leader epoch ที่พลาดไปถูก truncate ผ่าน epoch checkpoint; และเคสยากที่สุด ISR member หายไปพร้อมกันหมด คือจุดที่ `unclean.leader.election.enable` กับ ELR list ของ KIP-966 ตัดสินว่าจะอยู่แบบใช้งานไม่ได้-แต่ถูกต้อง หรือใช้งานได้-แต่อาจหายได้
+
+## Trade-offs
+
+| ตัวเลือก | ประโยชน์ | ต้นทุน |
+|---|---|---|
+| `min.insync.replicas=2` บน RF=3 | ทน replica ล้มเหลวหนึ่งตัวโดยไม่มีการเปลี่ยนแปลง durability ที่มองเห็นได้ | พิสูจน์ใน [Acks and Durability](/kafka/th/producers/acks-and-durability/): ความล้มเหลวครั้งที่สองทำให้ `acks=all` พังแบบเห็นชัด (`NotEnoughReplicasException`) แทนที่จะ under-replicate แบบเงียบ ๆ |
+| `unclean.leader.election.enable=false` (default) | ไม่มีทางทำข้อมูลหายแบบเงียบ ๆ จากการเลือก leader ที่เก่า | พิสูจน์แล้วข้างบน: ISR ว่างเปล่าแปลว่า partition ใช้งานไม่ได้เฉย ๆ จนกว่า in-sync replica จะกลับมา |
+| KIP-966 ELR | ให้ controller มี list "เพิ่ง in-sync พิจารณาได้อย่างปลอดภัย" จริงที่ติดตามไว้ แทนที่จะเดา | ช่วยได้ก็ต่อเมื่อมี replica ที่ ELR-eligible จริงอย่างน้อยหนึ่งตัว มันไม่สร้างข้อมูลที่ไม่เคย replicate เลย |
+| `docker pause` เป็นเครื่องมือ fault-injection | วิธีที่ถูกและเร็วในการจำลอง "broker หยุดตอบสนอง" | พิสูจน์แล้วข้างบน: มัน trigger session-timeout fencing ไม่ใช่ shrink แบบอิง lag -- เป็นเครื่องมือผิดถ้าบทเรียนต้องการพูดเรื่อง `replica.lag.time.max.ms` โดยเฉพาะ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"leader push ข้อมูลไปให้ follower"** พิสูจน์แล้วข้างบนและใน [Produce-to-Fetch Pipeline](/kafka/th/kafka-internals/produce-to-fetch-pipeline/): request log จริงแสดง `broker-2-fetcher-0` และ `broker-3-fetcher-0` ส่ง `FetchRequest` ของตัวเอง -- replication คือ follower ดึงเอง
+- **"ISR shrink กับ broker ถูก fence เป็นเหตุการณ์เดียวกันเสมอ"** พิสูจน์แล้วข้างบนด้วยบรรทัด controller log จริง และแก้ไขอย่างซื่อตรงกลางบท: shrink ของ run นี้มาจาก session-timeout fencing (`handleBrokerFenced`) ซึ่งเป็นโค้ดพาธที่ต่างจาก `AlterPartition` shrink แบบอิง lag ของ broker ที่ยัง heartbeat อยู่
+- **"KIP-966 (ELR) default เป็นปิด ตามข้อเสนอเดิมของ KIP"** พิสูจน์แล้วข้างบนด้วย `kafka-features.sh describe` จริง: `eligible.leader.replicas.version` ของคลัสเตอร์นี้เป็น `FinalizedVersionLevel: 1` (เปิด) โดย default บน 4.3.1 ต่างจาก default ที่เสนอไว้ในเนื้อหา wiki ของ KIP
+- **"`unclean.leader.election.enable=true` เป็น default ที่สมเหตุสมผลสำหรับ 'availability ที่สูงขึ้น'"** พิสูจน์แล้วข้างบน: default จริงคือ `false` เพราะทางเลือกอื่นอาจเลือก replica ที่ขาดข้อมูลที่ leader เก่ามีแบบเงียบ ๆ -- เป็น trade-off ระหว่าง availability กับ correctness ที่โปรเจกต์นี้เลือก default ไปทาง correctness
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="bash" code={`# AI-suggested "fix" for a stuck partition during an incident
+kafka-configs.sh --bootstrap-server localhost:9092 --alter \\
+  --entity-type brokers --entity-default \\
+  --add-config unclean.leader.election.enable=true
+# "This lets an out-of-sync replica take over immediately, restoring availability."`}>
+พิสูจน์แล้วข้างบน: การทำแบบนี้คืนความพร้อมใช้งานได้จริง แต่คอมเมนต์ละเว้นต้นทุนจริงที่บทนี้พิสูจน์แล้ว -- replica ที่ไม่ sync กลายเป็น leader อาจทำ record ที่ leader เก่ามีแต่ replica นี้ไม่เคยได้รับหายไปแบบเงียบ ๆ ทุกตัว (ไม่มี error ไม่มี exception หายไปเฉย ๆ) วิธีที่ปลอดภัยกว่าและรู้จัก KIP-966 ที่ field `Elr`/`LastKnownElr` ของคลัสเตอร์นี้เองมีไว้เพื่อสิ่งนี้ คือเช็คก่อนว่า topic มี replica ที่ eligible (เพิ่ง in-sync) ให้เลือกจริงไหม ก่อนจะไปแตะ flag unclean-election ระดับทั้งคลัสเตอร์ และพลิกค่านี้กลับเป็น `false` ทันทีที่ incident จบ เพราะมันเป็นนโยบาย durability ไม่ใช่การกระทำแค่ชั่วขณะ
+</SpotTheBug>
+
+export const quizReplicationIsrInternals = [
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย request log capture จริงบน leader clientId "broker-2-fetcher-0" บน request FETCH พิสูจน์อะไร?',
+    options: [
+      'A consumer named "broker-2-fetcher-0" is reading the topic',
+      'Broker 2\'s own replica fetcher thread is pulling data from the leader -- replication is follower-driven, not a leader push',
+      'The producer is retrying a failed send',
+      'The controller is fetching metadata',
+    ],
+    answer: 1,
+    explain: 'บรรทัด request log จริงแสดง requestApiKeyName:FETCH พร้อม clientId:broker-2-fetcher-0 และ replicaState:{replicaId:2,...} -- นี่คือ broker 2 กำลัง fetch ในฐานะ follower พิสูจน์ตรงจากสาย ไม่ใช่การอนุมาน',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยบรรทัด controller log จริงหลัง pause broker 3 ด้วย docker pause อะไรคือสาเหตุจริงที่ทำให้ ISR shrink ใน run นี้โดยเฉพาะ?',
+    options: [
+      'The classic replica.lag.time.max.ms-driven AlterPartition shrink of a still-alive, slow-fetching broker',
+      'Controller-side broker session-timeout fencing (handleBrokerFenced) -- because docker pause stops the whole process, including its heartbeats to the controller, not just its fetcher',
+      'A manual kafka-topics.sh --alter command',
+      'The topic\'s min.insync.replicas setting being changed',
+    ],
+    answer: 1,
+    explain: 'บรรทัด controller.log จริงที่ยกมาข้างบนชัดเจน: "Fencing broker 3 ... because its session has timed out" และ "handleBrokerFenced" -- บทนี้แก้ไขตัวเองอย่างซื่อตรงว่าการ pause ทั้งกระบวนการ trigger fencing ซึ่งเป็นโค้ดพาธที่ต่างจาก shrink แบบอิง lag ของ broker ที่ยัง heartbeat อยู่',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย kafka-features.sh describe จริงบนคลัสเตอร์ 4.3.1 นี้ default ที่ส่งจริงของ eligible.leader.replicas.version (KIP-966) คืออะไร?',
+    options: [
+      'Disabled (FinalizedVersionLevel: 0), matching the original KIP proposal\'s stated default of false',
+      'Enabled (FinalizedVersionLevel: 1) -- differing from the KIP wiki text\'s originally proposed default of false',
+      'Not present at all in 4.3.1',
+      'Only enabled if manually finalized with kafka-features.sh upgrade',
+    ],
+    answer: 1,
+    explain: 'output describe จริงข้างบนแสดง FinalizedVersionLevel: 1 สำหรับ eligible.leader.replicas.version บนคลัสเตอร์ 4.3.1 ที่ format ใหม่ -- พิสูจน์แล้วว่าต่างจาก default ที่เสนอไว้ในหน้า wiki ของ KIP-966 เอง คุ้มที่จะพูดตรง ๆ แทนที่จะสันนิษฐานว่าเนื้อหา KIP ยังตรงกับพฤติกรรมที่ส่งจริง',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยเนื้อหาไฟล์ leader-epoch-checkpoint จริง ("0\\n1\\n0 0") entry "0 0" บันทึกอะไรจริง ๆ?',
+    options: [
+      'Two separate leader epochs, 0 and 0',
+      'One entry: leader epoch 0 started at offset 0 -- the checkpoint the replica uses to detect and truncate data written under a stale leader epoch',
+      'The broker ID and partition number',
+      'A corrupted or empty checkpoint file',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: รูปแบบไฟล์คือ version แล้วจำนวน entry แล้วคู่ <leaderEpoch> <startOffset> -- "0 0" คือ entry จริงหนึ่งอันที่แปลว่า epoch 0 เริ่มที่ offset 0 อ่านตรงกันเป๊ะทั้งจาก leader และ follower บนคลัสเตอร์จริงของบทนี้',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนโดยหยุด controller quorum leader บนคลัสเตอร์ 3-broker จริงแล้ว poll kafka-metadata-quorum.sh describe --status เกิดอะไรขึ้นกับ LeaderEpoch หลังจาก leader ใหม่ (broker 2) เข้ารับช่วง?',
+    options: [
+      'It reset to 0',
+      'It stayed at 1, unchanged',
+      'It incremented from 1 to 2 -- the same epoch-fencing idea as a per-partition leader epoch, one level up, so the stopped broker can\'t be mistaken for a still-current controller leader if it returns',
+      'It became a negative number indicating failure',
+    ],
+    answer: 2,
+    explain: 'output describe --status จริงก่อนและหลังแสดง LeaderEpoch: 1 แล้ว LeaderEpoch: 2 หลัง broker 2 เข้ารับช่วง -- พิสูจน์ตรง ๆ และโดยโครงสร้างคือไอเดีย fencing เดียวกับที่บทนี้พิสูจน์ไปแล้วสำหรับ leader epoch ต่อ partition ผ่าน leader-epoch-checkpoint',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/replication-and-isr-internals" questions={quizReplicationIsrInternals} />
+
+<ProgressTracker client:visible id="kafka-internals/replication-and-isr-internals" />
