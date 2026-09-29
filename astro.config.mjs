@@ -38,6 +38,9 @@ export default defineConfig({
         { label: 'Delivery Semantics & Transactions', items: [{ autogenerate: { directory: 'delivery-and-transactions' } }] },
         { label: 'Streams, Connect & Schema Registry', items: [{ autogenerate: { directory: 'streams-connect-schema' } }] },
         { label: 'Operations & Production', items: [{ autogenerate: { directory: 'operations-and-production' } }] },
+        { label: 'How Kafka Works', translations: { th: 'Kafka ทำงานอย่างไรข้างใน' }, items: [{ autogenerate: { directory: 'kafka-internals' } }] },
+        { label: 'Reading AI-generated Kafka', translations: { th: 'อ่านโค้ด Kafka ที่ AI เขียน' }, items: [{ autogenerate: { directory: 'reading-kafka' } }] },
+        { label: 'Glossary', translations: { th: 'อภิธานศัพท์' }, link: 'glossary' },
       ],
       }), preact()],
 });
