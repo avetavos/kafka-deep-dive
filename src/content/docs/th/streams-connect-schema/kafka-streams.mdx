@@ -1,6 +1,6 @@
 ---
 title: 'Kafka Streams'
-description: 'Kafka Streams library ภาษา Java สำหรับ stream processing — KStream กับ KTable, stream-table duality, operation แบบ stateless กับ stateful, state store ที่หนุนด้วย changelog topic และการประมวลผลแบบ exactly-once'
+description: 'Java library สำหรับ stream processing — KStream vs KTable, stream-table duality, stateless vs stateful operations, การรัน TopologyTestDriver จริง, KIP-1071 group.protocol=streams, co-partitioning และ exactly-once processing'
 sidebar:
   order: 3
 ---
@@ -8,116 +8,275 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในหนึ่งประโยค
 
-**Kafka Streams** คือ library ภาษา Java — ไม่ใช่ cluster แยกต่างหาก — ที่คุณฝังไว้ในแอปของตัวเองเพื่อ transform, aggregate และ join topic ของ Kafka แบบ stream ต่อเนื่อง โดยที่เรื่อง state และการรับประกัน exactly-once ถูกจัดการให้เรียบร้อย
+**Kafka Streams** คือ Java library — ไม่ใช่คลัสเตอร์แยก — ที่ฝังเข้าไปในแอปของคุณเองเพื่อแปลง, รวม, และ join topic ของ Kafka ในฐานะ stream ต่อเนื่อง โดยมี state และ exactly-once guarantee ให้จัดการเอง
 
 ## KStream, KTable และ duality
 
-Kafka Streams ให้มุมมองต่อ topic สองแบบ:
+Kafka Streams ให้มุมมองของ topic สองแบบ:
 
-- **`KStream`** — ลำดับ **event** ที่อิสระต่อกันและไม่มีจุดสิ้นสุด ทุก record คือ fact ใหม่ ("ผู้ใช้คลิก") ไม่มีอะไรถูกเขียนทับ
-- **`KTable`** — **changelog** ที่ตีความว่าเป็นค่าล่าสุด **ต่อ key** แต่ละ record อัปเดต row ของ key นั้น เหมือนทำ `UPSERT` ลง table
+- **`KStream`** — ลำดับ **event** ที่ไม่มีขอบเขตและเป็นอิสระต่อกัน ทุก record คือข้อเท็จจริงใหม่ ("user คลิก") ไม่มีอะไรถูกเขียนทับ
+- **`KTable`** — **changelog** ที่ตีความเป็นค่าล่าสุด **ต่อ key** แต่ละ record อัปเดตแถวของ key นั้น เหมือน `UPSERT` เข้าตาราง
 
-นี่คือ **stream-table duality**: table คือ snapshot ที่ได้จากการเล่นซ้ำ stream ของ update ส่วน stream คือลำดับของการเปลี่ยนแปลงที่ได้จากการเฝ้าดู table topic เดียวกันอ่านได้ทั้งสองแบบขึ้นกับสิ่งที่คุณต้องการ — feed ของ event ที่ไหลอยู่ หรือ state ปัจจุบันต่อ key
+นี่คือ **stream-table duality**: ตารางคือ snapshot ที่ได้จากการ replay stream ของการอัปเดต และ stream คือลำดับของการเปลี่ยนแปลงที่ได้จากการดูตาราง topic เดียวกันอ่านได้สองแบบขึ้นอยู่กับสิ่งที่ต้องการ — feed ของ event ที่วิ่งอยู่ หรือ state ปัจจุบันต่อ key
 
-<Mermaid title="A stream of updates folds into a table; a table emits a stream of changes" code={dualityDiagram} />
+<Mermaid title="Stream ของการอัปเดตพับเข้าเป็นตาราง; ตารางปล่อย stream ของการเปลี่ยนแปลงออกมา" code={dualityDiagram} />
 
 export const dualityDiagram = `flowchart LR
   s["KStream (events)"] -->|"aggregate / reduce"| t["KTable (latest per key)"]
   t -->|"toStream()"| s2["KStream (changes)"]`;
 
-## operation แบบ stateless กับ stateful
+## Stateless vs stateful operations
 
-operation แบ่งเป็นสองตระกูล:
+Operation แบ่งเป็นสองตระกูล:
 
-- **stateless** — จัดการแต่ละ record แยกกัน: `map`, `filter`, `flatMap`, `branch` ไม่ต้องจำ record ก่อนหน้า
-- **stateful** — ผลลัพธ์ขึ้นกับ record ที่เห็นมาแล้ว: `aggregate`, `count`, `reduce`, `join` และ **windowing** (จัดกลุ่ม record เป็นถังตามเวลา) พวกนี้ต้องมีที่เก็บผลลัพธ์ที่กำลังสะสม
+- **Stateless** — แต่ละ record จัดการตัวเอง: `map`, `filter`, `flatMap`, `branch` ไม่ต้องจำ record ก่อนหน้า
+- **Stateful** — ผลลัพธ์ขึ้นกับ record ที่เห็นมาก่อนหน้า: `aggregate`, `count`, `reduce`, `join`, และ **windowing** (จัดกลุ่ม record เป็นช่วงเวลา) ต้องมีที่เก็บผลลัพธ์ที่กำลังสะสม
 
-ที่เก็บนั้นคือ **state store** — key-value store แบบ local (default คือ RocksDB) ที่อยู่ใน instance แอปของคุณ เพื่อให้รอดจากการ crash ทุก state store ถูกหนุนด้วย **changelog topic** ใน Kafka: ทุก update ถูกเขียนลง changelog ด้วย ดังนั้นถ้า instance restart ที่อื่น Streams จะสร้าง store ขึ้นใหม่ด้วยการเล่นซ้ำ changelog นั้น state ใน local ของคุณจึงทนทานโดยที่คุณไม่ต้องดูแล database เอง
+"ที่เก็บ" นั้นคือ **state store** — key-value store ในเครื่อง (RocksDB เป็นค่าเริ่มต้น) ที่อยู่ใน instance ของแอปตัวเอง เพื่อรอดจากการ crash ทุก state store ถูก back ด้วย **changelog topic** ใน Kafka: ทุกการอัปเดตถูกเขียนไปที่ changelog ด้วย ดังนั้นถ้า instance รีสตาร์ทที่อื่น Streams จะสร้าง store ขึ้นใหม่โดย replay changelog นั้น state ในเครื่องจึงคงทนโดยไม่ต้องจัดการฐานข้อมูลเอง
 
-## topology นับคำ
+## Topology นับคำ พิสูจน์ด้วยการรัน `TopologyTestDriver` จริง
 
-นี่คือตัวอย่างคลาสสิก — นับว่าแต่ละคำปรากฏบ่อยแค่ไหนใน input topic:
+นี่คือตัวอย่างคลาสสิก — นับว่าแต่ละคำปรากฏกี่ครั้งใน input topic นี่ไม่ใช่สมมติฐาน: compile ด้วย `javac` ธรรมดาและ **รัน** ด้วย `java` กับ `kafka-streams-4.3.1.jar` / `kafka-streams-test-utils-4.3.1.jar` จริง (บวก `rocksdbjni`, `jackson-databind` และเพื่อน ๆ) ที่ดึงมาจาก Maven Central โดยตรงด้วย URL — ไม่มี gradle ไม่มี maven ตามข้อจำกัด toolchain ของคอร์สนี้
 
 ```java
-StreamsBuilder builder = new StreamsBuilder();
+// src/main/java/streams/WordCountTopologyTest.java
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.TestInputTopic;
+import org.apache.kafka.streams.TestOutputTopic;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.TopologyTestDriver;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.test.TestRecord;
 
-// Read the input topic as a stream of (key, line) events
-KStream<String, String> lines = builder.stream("text-input");
+import java.util.Arrays;
+import java.util.List;
+import java.util.Properties;
 
-KTable<String, Long> counts = lines
-    .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
-    .groupBy((key, word) -> word)     // re-key by the word itself
-    .count();                         // stateful: running total per word -> a KTable
+public class WordCountTopologyTest {
+    public static void main(String[] args) {
+        StreamsBuilder builder = new StreamsBuilder();
 
-// Write the changelog of counts out to an output topic
-counts.toStream().to("word-counts");
+        // Read the input topic as a stream of (key, line) events
+        KStream<String, String> lines = builder.stream("text-input");
 
-KafkaStreams streams = new KafkaStreams(builder.build(), props);
-streams.start();
+        KTable<String, Long> counts = lines
+            .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
+            .groupBy((key, word) -> word)     // re-key by the word itself
+            .count();                         // stateful: running total per word -> a KTable
+
+        counts.toStream().to("word-counts");  // write the changelog of counts out
+
+        Topology topology = builder.build();
+        System.out.println(topology.describe());
+
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "wordcount-test");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+
+        // TopologyTestDriver: an in-memory harness -- no broker needed to unit-test a topology
+        try (TopologyTestDriver driver = new TopologyTestDriver(topology, props)) {
+            TestInputTopic<String, String> input = driver.createInputTopic(
+                "text-input", Serdes.String().serializer(), Serdes.String().serializer());
+            TestOutputTopic<String, Long> output = driver.createOutputTopic(
+                "word-counts", Serdes.String().deserializer(), Serdes.Long().deserializer());
+
+            input.pipeInput(null, "the quick brown fox");
+            input.pipeInput(null, "the lazy fox sleeps");
+
+            List<TestRecord<String, Long>> results = output.readRecordsToList();
+            for (TestRecord<String, Long> r : results) {
+                System.out.println("word-counts: " + r.key() + " = " + r.value());
+            }
+            System.out.println("TOTAL RECORDS: " + results.size());
+        }
+    }
+}
 ```
 
-`count()` สร้าง `KTable` ที่หนุนด้วย state store และ changelog ของตัวเอง ส่วน `toStream().to(...)` ส่งค่านับที่อัปเดตแล้วทุกครั้งต่อไปยัง downstream
+Output จริง (ตัดให้สั้น) จาก `javac -cp <jars> WordCountTopologyTest.java && java -cp <jars>:. WordCountTopologyTest` บน Mac เครื่องนี้:
 
-## exactly-once และ streams protocol
+```text
+Topologies:
+   Sub-topology: 0
+    Source: KSTREAM-SOURCE-0000000000 (topics: [text-input])
+      --> KSTREAM-FLATMAPVALUES-0000000001
+    Processor: KSTREAM-FLATMAPVALUES-0000000001 (stores: [])
+      --> KSTREAM-KEY-SELECT-0000000002
+      ...
+    Sink: KSTREAM-SINK-0000000005 (topic: KSTREAM-AGGREGATE-STATE-STORE-0000000003-repartition)
+  Sub-topology: 1
+    Source: KSTREAM-SOURCE-0000000007 (topics: [KSTREAM-AGGREGATE-STATE-STORE-0000000003-repartition])
+    Processor: KSTREAM-AGGREGATE-0000000004 (stores: [KSTREAM-AGGREGATE-STATE-STORE-0000000003])
+    Sink: KSTREAM-SINK-0000000009 (topic: word-counts)
 
-stream processing ที่อ่าน อัปเดต state แล้วเขียน เป็นเรื่องที่ทำ *ผิด* ได้ง่ายเมื่อเกิด failure — คุณอาจนับซ้ำ Kafka Streams ย่อเรื่องนี้ให้เหลือแค่การตั้งค่าบรรทัดเดียว เมื่อตั้ง `processing.guarantee` เป็น `exactly_once_v2` Streams จะห่อรอบ read-process-write แต่ละรอบ (รวมถึง changelog ของ state store และ consumer offset) ไว้ใน transaction เดียวของ Kafka การ retry จึงไม่ apply update ซ้ำสองครั้ง:
+word-counts: the = 1
+word-counts: quick = 1
+word-counts: brown = 1
+word-counts: fox = 1
+word-counts: the = 2
+word-counts: lazy = 1
+word-counts: fox = 2
+word-counts: sleeps = 1
+TOTAL RECORDS: 8
+```
+
+สิ่งจริงสองอย่างที่พิสูจน์ได้: (1) `count()` compile ออกมาเป็น **สอง sub-topology** เชื่อมกันด้วย **repartition topic** ภายใน (`...-repartition`) — `groupBy` เปลี่ยน key ใหม่เป็นคำ ซึ่งไม่รับประกันว่าจะตกอยู่ partition เดียวกับ input Streams จึงแทรกขั้น repartition ให้อัตโนมัติ; (2) `the` และ `fox` ปล่อยออกมา **สองครั้ง** (ครั้งละหนึ่งครั้งต่อบรรทัด input ที่อัปเดต count ของมัน) เพราะ changelog ของ `KTable` ปล่อยทุก **การอัปเดต** ไม่ใช่แค่ยอดรวมสุดท้าย — 8 record output จาก 2 บรรทัด input ไม่ใช่ "ยอดสุดท้าย" 6 คำที่ไม่ซ้ำกัน ตรงกับ stream-table duality ในหัวข้อก่อนหน้าแบบจับต้องได้
+
+<Callout title="TopologyTestDriver ต้องการ default serde ไม่งั้น throw ทันที">
+ความพยายามครั้งแรกในการรันนี้ โดยไม่ตั้ง `DEFAULT_KEY_SERDE_CLASS_CONFIG`/`DEFAULT_VALUE_SERDE_CLASS_CONFIG` ล้มเหลวทันทีด้วย `org.apache.kafka.common.config.ConfigException: Please specify a key serde or set one through StreamsConfig#DEFAULT_KEY_SERDE_CLASS_CONFIG` จริง — state store ภายในของ `count()` ต้องการ serde และไม่ได้ถูก infer อัตโนมัติแค่จาก `Serdes.String()` ที่ส่งให้ `createInputTopic` การตั้ง `DEFAULT_KEY_SERDE_CLASS_CONFIG`/`DEFAULT_VALUE_SERDE_CLASS_CONFIG` ทั้งคู่ใน `props` แก้ปัญหาได้
+</Callout>
+
+## KIP-1071: `group.protocol=streams` ใหม่ — GA พร้อม feature set ที่จำกัด ยืนยันแล้ว
 
 ```java
 // Turn on end-to-end exactly-once for the whole topology
 props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
 
-// Modern Kafka: use the dedicated broker-side rebalance protocol for Streams groups
+// The new broker-side rebalance protocol for Streams groups (KIP-1071)
 props.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, "streams");
 ```
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Kafka Streams** คือ **library ภาษา Java แบบฝัง** สำหรับ stream processing: **`KStream`** คือ feed ของ event **`KTable`** คือค่าล่าสุดต่อ key และ **stream-table duality** เชื่อมทั้งสองเข้าด้วยกัน operation แบบ **stateless** ไม่ต้องจำอะไร ส่วน **stateful** (aggregate, join, windowing) ใช้ **state store** ที่หนุนด้วย **changelog topic** และ `processing.guarantee=exactly_once_v2` ทำให้ read-process-write ปลอดภัย
+ยืนยันสดจาก broker นี้: `kafka-configs.sh --entity-type brokers --entity-default --describe --all` แสดง `group.coordinator.rebalance.protocols = [classic, consumer, share, streams]` — `streams` เป็น rebalance protocol จริงที่เปิดใช้งานบน `apache/kafka:4.3.1` ตรงกับ `kafka-features.sh describe` ที่แสดง `Feature: streams.version  FinalizedVersionLevel: 1`
+
+<Callout title="'limited feature set' หมายถึงอะไรจริง ๆ — คำยกมาตรง ๆ">
+[ประกาศ release ของ Kafka 4.2.0](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/) ระบุตรง ๆ ว่า: **"Kafka Streams brings the server-side rebalance protocol to GA with a limited feature set."** [KIP-1071](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1071:+Streams+Rebalance+Protocol) และเนื้อหาติดตามผลขอบเขต GA ระบุข้อจำกัดชัดเจน: โปรโตคอลมาพร้อม **sticky assignment เท่านั้น** — ยังไม่มี warm-up task และ rack-aware placement; **ไม่มี static membership**; **ไม่มีการเปลี่ยน topology แบบ on-the-fly** ขณะ group กำลังรันอยู่; และการย้าย group ระหว่างโปรโตคอล classic กับ streams เป็นแบบ **offline เท่านั้น** — ทุก instance ต้องหยุดและ group ต้องว่างก่อนจะรีสตาร์ทด้วยโปรโตคอลใหม่ การตั้ง `group.protocol=streams` ใน production วันนี้หมายถึงการยอมรับข้อจำกัดเหล่านั้น ไม่ใช่ "GA" แบบไม่มีเงื่อนไขที่คำนี้มักสื่อถึง
 </Callout>
+
+## Co-partitioning: สิ่งที่เอกสารสัญญา กับสิ่งที่การรันจริงหนึ่งครั้งแสดงให้เห็น
+
+**Stream-stream join** (`KStream.join(...)`) ต้องการให้ input topic ทั้งสองเป็น **co-partitioned** — จำนวน partition เท่ากัน, partitioning strategy เดียวกัน — เพื่อให้ partition ที่ *N* ของ topic ซ้ายต้อง join กับ partition ที่ *N* ของ topic ขวาเท่านั้น [Kafka Streams DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/) ระบุชัดเจน: *"The input topics of the join (left side and right side) must have the same number of partitions... During the partition assignment step, i.e. at runtime, Kafka Streams verifies whether the number of partitions for both sides of a join are the same. If they are not, a `TopologyBuilderException` (runtime exception) is being thrown."* class exception ใน jar 4.3.1 ปัจจุบันคือ `org.apache.kafka.streams.errors.TopologyException` ไม่ใช่ชื่อเก่า `TopologyBuilderException` ที่เอกสารยังใช้อยู่ — ยืนยันจากการ decompile `CopartitionedTopicsEnforcer.class` จาก `kafka-streams-4.3.1.jar` จริง ซึ่งมี format string ตรงตัว `"%sTopics not co-partitioned: [%s]"` ที่ throw เป็น `TopologyException`
+
+<Callout title="ผลลัพธ์แบบตรงไปตรงมา: ไม่ throw ในการรันจริงที่ทำซ้ำได้หนึ่งครั้งบน 4.3.1">
+สร้าง topic จริงสองตัวบน broker จริง — `left-stream` (3 partitions) และ `right-stream` (5 partitions) — และ join ด้วย `KStream.join(...)` จริง (แบบ windowed, `StreamJoined.with(...)`) ในแอป `KafkaStreams` จริง (ไม่ใช่ `TopologyTestDriver`) ที่ชี้ไปยัง broker นั้น แอป reach `RUNNING` โดย **ไม่มี exception เลย** log บรรทัด partition-assignment จริงคือ: `Adding newly assigned partitions: [left-stream-0, left-stream-1, left-stream-2, right-stream-0, right-stream-1, right-stream-2, right-stream-3, right-stream-4]` กระจายใน 5 task (`0_0`…`0_4`) — หมายความว่า task `0_3` และ `0_4` ได้รับแค่ partition ของ `right-stream` โดย **ไม่มี partition คู่จาก `left-stream` เลย** ช่องโหว่ความถูกต้องแบบเงียบ (record บน partition เหล่านั้น join กับอะไรไม่ได้เลย) ไม่ใช่ error แบบ fail-fast ที่เอกสารบอกไว้ คอร์สนี้อธิบายไม่ได้ว่า *ทำไม* การบังคับใน `CopartitionedTopicsEnforcer.enforce()` ไม่ทำงานในกรณีนี้ — bytecode แสดงว่า check นี้มีอยู่จริงและควรรันระหว่างการตั้งค่า `RepartitionTopics` — จึงควรมองนี่เป็นความขัดแย้งจริงที่ทำซ้ำได้ระหว่างพฤติกรรมที่เอกสารระบุกับการรันที่สังเกตได้จริง ไม่ใช่การรับประกันไปทางใดทางหนึ่ง **ข้อสรุปเชิงปฏิบัติ: ตรวจจำนวน partition เองก่อน join (`kafka-topics.sh --describe`) — อย่าพึ่งพาว่า Kafka Streams จะ fail fast ให้เสมอ**
+</Callout>
+
+## Exactly-once และ streams protocol
+
+Stream processing ที่อ่าน, อัปเดต state, และเขียน มีโอกาส *ผิดพลาด* ได้ง่ายเมื่อเกิดความล้มเหลว — อาจนับซ้ำได้ Kafka Streams ทำให้เรื่องนี้เป็นแค่ config บรรทัดเดียว เมื่อตั้ง `processing.guarantee` เป็น `exactly_once_v2` Streams จะห่อทุกรอบ read-process-write (รวมถึง changelog ของ state store และ offset ของ consumer) ไว้ใน transaction เดียวของ Kafka ดังนั้นการ retry จะไม่มีทางอัปเดตซ้ำสองครั้ง — กลไก transaction เดียวกันกับที่พิสูจน์แบบ end-to-end ใน [Exactly-Once Processing](/kafka/th/delivery-and-transactions/exactly-once-processing/) เพียงแต่ขับเคลื่อนโดย library Streams แทนการเรียก `txn.sendOffsets()` เอง
+
+## คำตอบของ JS ecosystem: ไม่มีตัวที่ maintain อยู่
+
+Kafka Streams เป็น library เฉพาะ JVM โดยการออกแบบ (state store, การ replicate changelog, และ rebalance protocol ล้วน implement อยู่ใน Java client) npm package ที่ชื่อ `kafka-streams` ตรงตัว — การเขียน KStream/KTable ใหม่ใน JS — มีอยู่จริงแต่ถูกทิ้งร้างไปแล้วโดยพฤตินัย: `npm view kafka-streams time.modified` รายงาน **`2022-06-19`** ซึ่งเก่ากว่าสี่ปีก่อนบทนี้จะถูกเขียน โดยไม่มี flag `deprecated` แต่ก็ไม่มีความเคลื่อนไหวเช่นกัน ไม่มี Node.js เทียบเท่า Kafka Streams ที่ maintain อยู่จริง ตัวเลือกจากโค้ด Node.js คือ plain consumer (ค่าเริ่มต้นของคอร์สนี้), เรียกไปยังเซอร์วิส Streams บน JVM, หรือใช้เครื่องมือของบทถัดไป Kafka Connect เมื่องานเป็นการย้ายข้อมูลแทนการแปลง
+
+<Callout title="สรุปในบรรทัดเดียว">
+**Kafka Streams** เป็น **Java library แบบ embedded**: `KStream` คือ feed ของ event, `KTable` คือค่าล่าสุดต่อ key, และ stream-table duality เชื่อมทั้งสอง — พิสูจน์แล้วด้านบนด้วยการรัน `TopologyTestDriver` จริงที่ `count()` ปล่อย 8 record การอัปเดตจาก 2 บรรทัด input ผ่าน repartition topic ที่แทรกอัตโนมัติ `group.protocol=streams` (KIP-1071) มีจริงและเปิดใช้งานใน 4.3.1 แต่ GA **พร้อมข้อจำกัดที่ระบุชัด** (sticky assignment เท่านั้น, ไม่มี warm-up, ไม่มี static membership, ย้ายโปรโตคอลแบบ offline เท่านั้น) Co-partitioning เป็นข้อกำหนดจริงตามเอกสาร — แต่พิสูจน์แล้วด้านบนว่าการรันจริงบน 4.3.1 ที่มี partition ไม่ตรงกันไม่ fail fast ดังนั้นควรตรวจจำนวน partition เอง `processing.guarantee=exactly_once_v2` ทำให้ read-process-write ปลอดภัย ไม่มี JS เทียบเท่าที่ maintain อยู่ (`kafka-streams` บน npm: publish ล่าสุด 2022)
+</Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// src/kafka-streams/pipeline-notes.ts
+// Design note for the payments pipeline (implementation is the Java Streams app).
+
+// "left-orders" has 3 partitions, "right-payments" has 6 partitions -- Kafka Streams
+// will refuse to start the join and throw immediately if they don't match, so it's
+// safe to just wire the join up and let the framework catch any partition mismatch
+// before it ships to production.
+
+export const joinConfig = {
+  leftTopic: 'left-orders',
+  rightTopic: 'right-payments',
+  windowMs: 5000,
+};
+`}>
+
+คำอ้างเรื่องความปลอดภัยในคอมเมนต์ -- "Kafka Streams will refuse to start ... and throw immediately if they don't match" -- คือสมมติฐานเดียวกับที่บทนี้พิสูจน์แล้วว่าไม่น่าเชื่อถือ [DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/) อธิบายพฤติกรรม fail-fast นั้นจริง แต่การรันจริงบน `apache/kafka:4.3.1` ที่ join สอง topic ที่ partition ไม่ตรงกันจริง (3 กับ 5) reach `RUNNING` โดย **ไม่มี exception** และ assign task แบบเงียบ ๆ ที่ไม่มีทางเห็นทั้งสองฝั่งของ join เลย การพึ่งพา framework ให้จับกรณีนี้ไม่ได้รับการพิสูจน์ว่าปลอดภัยบนเวอร์ชันนี้ ทางแก้ไม่ใช่การเปลี่ยนโค้ด join เอง -- แต่เป็นการแก้ **กระบวนการ**: ตรวจว่า `left-orders` กับ `right-payments` มีจำนวน partition เท่ากันด้วย `kafka-topics.sh --describe` (หรือตรวจด้วย admin client ใน CI) *ก่อน* deploy เพราะการ์ดที่ runtime ที่คอมเมนต์นี้สมมติไว้พึ่งไม่ได้
+
+</SpotTheBug>
+
+## Mental Model
+
+คุณค่าทั้งหมดของ Kafka Streams คือการเปลี่ยนปัญหา distributed systems ที่ยากสามข้อ -- state ในเครื่องที่รอดจาก crash, read-process-write แบบ exactly-once, และการ rebalance instance ของ worker -- ให้กลายเป็นแค่การเรียก library แทนที่จะต้องเขียนโค้ดเอง ทุกการพิสูจน์ในบทนี้แสดงจุดที่ abstraction นี้แข็งแรง (การรัน `TopologyTestDriver` จริงที่ให้ผลตรงกับที่ stream-table duality ทำนายไว้เป๊ะ, `exactly_once_v2` transaction guarantee จริงที่ใช้ร่วมกับโมดูล delivery-and-transactions) และจุดที่มันใหม่กว่าและแคบกว่าที่เห็น (ข้อจำกัดที่ระบุชัดของ KIP-1071 และ safety net ของ co-partitioning ที่ไม่ทำงานในการรันจริงที่ทำซ้ำได้หนึ่งครั้ง) ถือว่า "Kafka Streams จัดการให้" เป็นจริงสำหรับ state และ exactly-once และ verify-เอง สำหรับอะไรก็ตามที่ release notes ระบุว่าเป็น GA "พร้อม feature set ที่จำกัด"
+
+## Trade-offs
+
+- **TopologyTestDriver** -- พิสูจน์แล้วด้านบนว่าเป็นวิธี unit-test output ของ topology ได้แม่นยำโดยไม่ต้องมี broker แลกกับการไม่ทดสอบ partition assignment จริงหรือการบังคับ co-partitioning (ช่องว่างนั้นคือสิ่งที่หัวข้อ co-partitioning ด้านบนเจอพอดีเมื่อทดสอบกับ broker จริงแทน)
+- **`group.protocol=streams` (KIP-1071)** -- task assignment แบบรวมศูนย์ฝั่ง broker และ observability ที่ดีขึ้น แลกกับข้อจำกัดที่ระบุชัดของ 4.2 (ไม่มี warm-up task, ไม่มี rack-aware placement, ไม่มี static membership, ย้ายโปรโตคอลแบบ offline เท่านั้น)
+- **`exactly_once_v2`** -- guarantee จริงที่ใช้งานได้ (กลไกเดียวกับ [Exactly-Once Processing](/kafka/th/delivery-and-transactions/exactly-once-processing/)) แลกกับ overhead ของ transaction coordinator ทุก commit interval
+- **Kafka Streams vs Kafka Connect vs plain consumer** -- Streams เหมาะกับ logic แบบ transform/join/aggregate จริงที่มี state ใช้ Connect (บทถัดไป) เมื่องานเป็นการย้ายข้อมูลล้วน ๆ และใช้ plain consumer เมื่อต้องการภาษาอื่นหรือควบคุมเองเต็มที่
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`count()` บน KTable ปล่อย record เดียวต่อ key พร้อมยอดรวมสุดท้าย"** พิสูจน์แล้วว่าผิดด้านบน: การรันจริงปล่อย 8 record จาก 2 บรรทัด input เพราะ changelog ของ KTable ปล่อยทุกการอัปเดตระหว่างทาง ไม่ใช่แค่ตัวสุดท้าย — consumer ของ `word-counts` เห็นประวัติการอัปเดตทั้งหมด ไม่ใช่ snapshot
+- **"Kafka Streams throw ทันทีเสมอถ้าสอง topic ที่ join กันมี partition ไม่เท่ากัน"** พิสูจน์แล้วว่าผิดด้านบน (SpotTheBug) ด้วยการรันจริงที่ทำซ้ำได้บน 4.3.1 ที่ reach `RUNNING` ทั้งที่ partition ไม่ตรงกันและไม่มี exception — พฤติกรรม fail-fast ตามเอกสารไม่ทำงานในการรันนี้
+- **"`group.protocol=streams` เป็น GA เต็มรูปแบบไม่มีเงื่อนไข เพราะ release notes บอกว่า GA"** คำพูดของ release announcement เองคือ "GA with a limited feature set" -- sticky assignment เท่านั้น, ไม่มี warm-up/rack-aware/static-membership, ย้ายโปรโตคอลแบบ offline เท่านั้น ยืนยันผ่าน KIP-1071 wiki
+- **"มี Node.js Kafka Streams ที่ maintain อยู่จริง"** npm package `kafka-streams` มีอยู่จริงแต่ publish ล่าสุดคือปี 2022 -- ถูกทิ้งร้างไปแล้วโดยพฤตินัย ยืนยันผ่าน `npm view`
 
 export const quizStreams = [
   {
-    q: 'KStream กับ KTable ต่างกันอย่างไร',
+    q: 'ในการรัน TopologyTestDriver จริง ทำไม output word-counts ถึงมี 8 record จาก input แค่ 2 บรรทัด?',
     options: [
-      'KStream คือ database และ KTable คือไฟล์',
-      'KStream คือลำดับ event ที่ไม่มีจุดสิ้นสุด ส่วน KTable คือค่าล่าสุดต่อ key (changelog)',
-      'ทั้งสองเหมือนกันทุกอย่าง',
-      'KTable เก็บได้แค่ record เดียวทั้งหมด',
+      'บั๊กใน topology',
+      'changelog ของ KTable (จาก count()) ปล่อยทุกการ UPDATE ของยอดสะสมของ key ไม่ใช่แค่ snapshot สุดท้าย -- พิสูจน์ด้วย output จริงที่ "the" และ "fox" ปรากฏสองครั้งตามที่ count เพิ่มขึ้น',
+      'TopologyTestDriver จะ duplicate output เสมอ',
+      'input topic มี 8 partition',
     ],
     answer: 1,
+    explain: 'Output จริงแสดง word-counts: the = 1 แล้วภายหลัง the = 2 และ fox = 1 แล้ว fox = 2 -- หนึ่ง record ต่อการอัปเดต count ของ key นั้น ตรงกับ stream-table duality ที่บทนี้อธิบาย',
   },
   {
-    q: 'state store ของ Kafka Streams รอดจากการ crash ของแอปได้อย่างไร',
+    q: 'ความพยายามครั้งแรกของ TopologyTestDriver throw ConfigException จริงอะไร และอะไรที่แก้ได้?',
     options: [
-      'ไม่รอด — state หายไปเมื่อ restart',
-      'ทุก update ถูกเขียนลง changelog topic ด้วย จึงสร้าง store ขึ้นใหม่ได้ด้วยการเล่นซ้ำ',
-      'ถูกก๊อปไปยังทุก consumer ด้วยมือ',
-      'ถูกเก็บไว้ใน JVM heap ตลอดกาลเท่านั้น',
+      'network timeout -- แก้โดยเพิ่ม broker',
+      'Please specify a key serde or set one through StreamsConfig#DEFAULT_KEY_SERDE_CLASS_CONFIG -- แก้โดยตั้ง DEFAULT_KEY_SERDE_CLASS_CONFIG/DEFAULT_VALUE_SERDE_CLASS_CONFIG ใน Properties',
+      'ไม่มี bootstrap.servers -- แก้โดยชี้ไปยัง broker จริง',
+      'Java version ไม่รองรับ',
     ],
     answer: 1,
+    explain: 'stack trace จริงชี้ไปที่ StoreSerdeInitializer ที่ต้องการ default serde สำหรับ state store ภายในที่ count() สร้างขึ้น การตั้ง default serde config ทั้งคู่แก้ปัญหาได้',
   },
   {
-    q: 'ข้อใดเป็น operation แบบ STATEFUL',
+    q: 'ตามประกาศ release ของ Kafka 4.2.0 สถานะจริงของ group.protocol=streams (KIP-1071) คืออะไร?',
     options: [
-      'map',
-      'filter',
-      'aggregate / count / join พร้อม windowing',
-      'flatMap',
+      'GA เต็มรูปแบบไม่มีข้อจำกัด',
+      'GA "with a limited feature set" -- sticky assignment เท่านั้น (ไม่มี warm-up/rack-aware), ไม่มี static membership, ไม่มีการเปลี่ยน topology แบบ on-the-fly, การย้ายระหว่างโปรโตคอลเป็นแบบ offline เท่านั้น',
+      'ยังเป็น experimental/opt-in เท่านั้น',
+      'ถูกลบใน 4.2 หันไปใช้โปรโตคอล classic แทน',
     ],
-    answer: 2,
+    answer: 1,
+    explain: 'ยกมาตรง ๆ จาก release announcement และตรวจสอบไขว้กับขอบเขตของ KIP-1071 wiki สำหรับ release GA',
   },
   {
-    q: 'processing.guarantee=exactly_once_v2 ให้อะไร',
+    q: 'การทดสอบ co-partitioning จริง (left-stream: 3 partitions, right-stream: 5 partitions, join บน broker จริง) แสดงอะไรจริง ๆ บน 4.3.1?',
     options: [
-      'throughput เร็วขึ้นด้วยการทิ้ง acknowledgement',
-      'ห่อ read-process-write (รวมถึง state และ offset) ไว้ใน transaction การ retry จึงไม่ apply update ซ้ำสองครั้ง',
+      'TopologyException ถูก throw ทันที ตรงตามเอกสารเป๊ะ',
+      'แอป reach RUNNING โดยไม่มี exception; task ถูก assign partition จากทั้งสอง topic ไม่เท่ากัน รวมถึง task ที่มีแค่ partition ของ right-stream โดยไม่มีคู่จาก left-stream -- ช่องโหว่แบบเงียบ ไม่ใช่ error แบบ fail-fast ตามเอกสาร',
+      'broker ปฏิเสธการสร้าง topic ที่ไม่ตรงกัน',
+      'Kafka Streams repartition right-stream ลงมาเหลือ 3 partition อัตโนมัติ',
+    ],
+    answer: 1,
+    explain: 'นี่คือความขัดแย้งที่รายงานอย่างตรงไปตรงมาและทำซ้ำได้ ระหว่างพฤติกรรมตามเอกสาร (dsl-api.html) กับการรันจริงหนึ่งครั้งบน image นี้ -- พิสูจน์ด้วยบรรทัด log "Adding newly assigned partitions" จริง',
+  },
+  {
+    q: 'processing.guarantee=exactly_once_v2 ให้อะไร?',
+    options: [
+      'throughput เร็วขึ้นโดยตัด acknowledgement ทิ้ง',
+      'ห่อ read-process-write (รวม state และ offset) ไว้ใน transaction เดียว ดังนั้น retry จะไม่มีทางอัปเดตซ้ำสองครั้ง -- กลไกเดียวกับที่พิสูจน์ใน Exactly-Once Processing',
       'ปิด state store',
-      'เปลี่ยน Kafka Streams ให้เป็น cluster แยกต่างหาก',
+      'เปลี่ยน Kafka Streams ให้กลายเป็นคลัสเตอร์แยก',
     ],
     answer: 1,
+    explain: 'exactly_once_v2 ใช้กลไก producer-transaction + sendOffsets เดียวกับที่พิสูจน์แบบ end-to-end ในโมดูล delivery-and-transactions ที่ library Streams เรียกใช้ให้อัตโนมัติ',
+  },
+  {
+    q: 'มี Node.js เทียบเท่า Kafka Streams ที่ maintain อยู่จริงไหม?',
+    options: [
+      'มี npm package kafka-streams อย่างเป็นทางการ maintain อยู่',
+      'ไม่มี -- npm package kafka-streams publish ล่าสุดคือ 2022-06-19 (ยืนยันผ่าน npm view) ถูกทิ้งร้างไปแล้วโดยพฤตินัย Kafka Streams ยังเป็น JVM-only',
+      'มี KafkaJS มี DSL เทียบเท่าให้',
+      'มี @confluentinc/kafka-javascript มี DSL เทียบเท่าให้',
+    ],
+    answer: 1,
+    explain: 'npm view kafka-streams time.modified คืนค่า 2022-06-19 -- เก่ากว่าสี่ปีเมื่อเทียบกับตอนที่เขียนบทนี้ ไม่มี flag deprecated แต่ก็ไม่มีความเคลื่อนไหวเช่นกัน',
   },
 ];
 

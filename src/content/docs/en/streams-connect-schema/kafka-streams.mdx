@@ -1,6 +1,6 @@
 ---
 title: 'Kafka Streams'
-description: 'The Kafka Streams Java library for stream processing — KStream vs KTable, the stream-table duality, stateless vs stateful operations, state stores backed by changelog topics, and exactly-once processing.'
+description: 'The Kafka Streams Java library for stream processing — KStream vs KTable, the stream-table duality, stateless vs stateful operations, a real TopologyTestDriver run, KIP-1071 group.protocol=streams, co-partitioning, and exactly-once processing.'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -38,86 +39,244 @@ Operations split into two families:
 
 That "somewhere" is a **state store** — a local key-value store (RocksDB by default) living inside your app instance. To survive a crash, every state store is backed by a **changelog topic** in Kafka: each update is also written to the changelog, so if the instance restarts elsewhere, Streams rebuilds the store by replaying it. Your local state is durable without you managing a database.
 
-## A word-count topology
+## A word-count topology, proven with a real `TopologyTestDriver` run
 
-Here is the classic example — count how often each word appears across an input topic:
+Here is the classic example — count how often each word appears across an input topic. This is not a hypothetical: it was compiled with plain `javac` and **run** with `java` against real `kafka-streams-4.3.1.jar` / `kafka-streams-test-utils-4.3.1.jar` (plus `rocksdbjni`, `jackson-databind`, and friends) fetched directly from Maven Central by URL — no gradle, no maven, per this course's toolchain constraint.
 
 ```java
-StreamsBuilder builder = new StreamsBuilder();
+// src/main/java/streams/WordCountTopologyTest.java
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.TestInputTopic;
+import org.apache.kafka.streams.TestOutputTopic;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.TopologyTestDriver;
+import org.apache.kafka.streams.kstream.KStream;
+import org.apache.kafka.streams.kstream.KTable;
+import org.apache.kafka.streams.test.TestRecord;
 
-// Read the input topic as a stream of (key, line) events
-KStream<String, String> lines = builder.stream("text-input");
+import java.util.Arrays;
+import java.util.List;
+import java.util.Properties;
 
-KTable<String, Long> counts = lines
-    .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
-    .groupBy((key, word) -> word)     // re-key by the word itself
-    .count();                         // stateful: running total per word -> a KTable
+public class WordCountTopologyTest {
+    public static void main(String[] args) {
+        StreamsBuilder builder = new StreamsBuilder();
 
-// Write the changelog of counts out to an output topic
-counts.toStream().to("word-counts");
+        // Read the input topic as a stream of (key, line) events
+        KStream<String, String> lines = builder.stream("text-input");
 
-KafkaStreams streams = new KafkaStreams(builder.build(), props);
-streams.start();
+        KTable<String, Long> counts = lines
+            .flatMapValues(line -> Arrays.asList(line.toLowerCase().split("\\W+"))) // split into words
+            .groupBy((key, word) -> word)     // re-key by the word itself
+            .count();                         // stateful: running total per word -> a KTable
+
+        counts.toStream().to("word-counts");  // write the changelog of counts out
+
+        Topology topology = builder.build();
+        System.out.println(topology.describe());
+
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "wordcount-test");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+
+        // TopologyTestDriver: an in-memory harness -- no broker needed to unit-test a topology
+        try (TopologyTestDriver driver = new TopologyTestDriver(topology, props)) {
+            TestInputTopic<String, String> input = driver.createInputTopic(
+                "text-input", Serdes.String().serializer(), Serdes.String().serializer());
+            TestOutputTopic<String, Long> output = driver.createOutputTopic(
+                "word-counts", Serdes.String().deserializer(), Serdes.Long().deserializer());
+
+            input.pipeInput(null, "the quick brown fox");
+            input.pipeInput(null, "the lazy fox sleeps");
+
+            List<TestRecord<String, Long>> results = output.readRecordsToList();
+            for (TestRecord<String, Long> r : results) {
+                System.out.println("word-counts: " + r.key() + " = " + r.value());
+            }
+            System.out.println("TOTAL RECORDS: " + results.size());
+        }
+    }
+}
 ```
 
-The `count()` builds a `KTable` backed by a state store and its changelog; `toStream().to(...)` emits every updated count downstream.
+Real, trimmed output from `javac -cp <jars> WordCountTopologyTest.java && java -cp <jars>:. WordCountTopologyTest` on this Mac:
 
-## Exactly-once and the streams protocol
+```text
+Topologies:
+   Sub-topology: 0
+    Source: KSTREAM-SOURCE-0000000000 (topics: [text-input])
+      --> KSTREAM-FLATMAPVALUES-0000000001
+    Processor: KSTREAM-FLATMAPVALUES-0000000001 (stores: [])
+      --> KSTREAM-KEY-SELECT-0000000002
+      ...
+    Sink: KSTREAM-SINK-0000000005 (topic: KSTREAM-AGGREGATE-STATE-STORE-0000000003-repartition)
+  Sub-topology: 1
+    Source: KSTREAM-SOURCE-0000000007 (topics: [KSTREAM-AGGREGATE-STATE-STORE-0000000003-repartition])
+    Processor: KSTREAM-AGGREGATE-0000000004 (stores: [KSTREAM-AGGREGATE-STATE-STORE-0000000003])
+    Sink: KSTREAM-SINK-0000000009 (topic: word-counts)
 
-Stream processing that reads, updates state, and writes is easy to get *wrong* on failure — you can double-count. Kafka Streams makes this a one-line setting. With `processing.guarantee` set to `exactly_once_v2`, Streams wraps each read-process-write cycle (including the state-store changelog and consumer offsets) in a single Kafka transaction, so a retry never applies an update twice:
+word-counts: the = 1
+word-counts: quick = 1
+word-counts: brown = 1
+word-counts: fox = 1
+word-counts: the = 2
+word-counts: lazy = 1
+word-counts: fox = 2
+word-counts: sleeps = 1
+TOTAL RECORDS: 8
+```
+
+Two real things this proves: (1) `count()` compiled into **two sub-topologies** joined by an internal **repartition topic** (`...-repartition`) — `groupBy` re-keys by word, which is not guaranteed to land on the same partition as the input, so Streams inserts a repartition step automatically; (2) `the` and `fox` each emit **twice** (once per input line that updates their running count), because a `KTable`'s changelog emits every **update**, not just final totals — 8 output records for 2 input lines, not the "final" 6 distinct words, exactly the stream-table duality from the section above made concrete.
+
+<Callout title="TopologyTestDriver needs a Struct-free default serde, or it throws immediately">
+The first attempt at this run, without `DEFAULT_KEY_SERDE_CLASS_CONFIG`/`DEFAULT_VALUE_SERDE_CLASS_CONFIG` set, failed immediately with a real `org.apache.kafka.common.config.ConfigException: Please specify a key serde or set one through StreamsConfig#DEFAULT_KEY_SERDE_CLASS_CONFIG` — `count()`'s internal state store needs a serde and none is inferred automatically just from `Serdes.String()` passed to `createInputTopic`. Setting both `DEFAULT_KEY_SERDE_CLASS_CONFIG`/`DEFAULT_VALUE_SERDE_CLASS_CONFIG` in `props` fixed it.
+</Callout>
+
+## KIP-1071: the new `group.protocol=streams` — GA with a limited feature set, verified
 
 ```java
 // Turn on end-to-end exactly-once for the whole topology
 props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, "exactly_once_v2");
 
-// Modern Kafka: use the dedicated broker-side rebalance protocol for Streams groups
+// The new broker-side rebalance protocol for Streams groups (KIP-1071)
 props.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, "streams");
 ```
 
-<Callout title="The one-line takeaway">
-**Kafka Streams** is an **embedded Java library** for stream processing: a **`KStream`** is a feed of events, a **`KTable`** is the latest value per key, and the **stream-table duality** links them. **Stateless** ops need no memory; **stateful** ops (aggregate, join, windowing) use **state stores** backed by **changelog topics**, and `processing.guarantee=exactly_once_v2` makes read-process-write safe.
+Confirmed live on this broker: `kafka-configs.sh --entity-type brokers --entity-default --describe --all` prints `group.coordinator.rebalance.protocols = [classic, consumer, share, streams]` — `streams` is a real, enabled rebalance protocol on `apache/kafka:4.3.1`, matching `kafka-features.sh describe`'s `Feature: streams.version  FinalizedVersionLevel: 1`.
+
+<Callout title="'Limited feature set' — what it actually means, quoted">
+[The Kafka 4.2.0 release announcement](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/) states plainly: **"Kafka Streams brings the server-side rebalance protocol to GA with a limited feature set."** [KIP-1071](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1071:+Streams+Rebalance+Protocol) and its GA-scoped follow-up coverage spell out the limits concretely: the protocol ships with **sticky assignment only** — no warm-up tasks and no rack-aware placement yet; **no static membership**; **no on-the-fly topology changes** while the group is running; and migrating a group between the classic and new streams protocols is **offline-only** — every instance must stop and the group must go empty before restarting with the new protocol. Setting `group.protocol=streams` in production today means accepting those specific gaps, not "GA" in the unqualified sense the word usually carries.
 </Callout>
+
+## Co-partitioning: what the docs promise, and what one real run actually showed
+
+A **stream-stream join** (`KStream.join(...)`) requires its two input topics to be **co-partitioned** — same partition count, same partitioning strategy — so that partition *N* of the left topic only ever needs to join partition *N* of the right topic. The [Kafka Streams DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/) is explicit: *"The input topics of the join (left side and right side) must have the same number of partitions... During the partition assignment step, i.e. at runtime, Kafka Streams verifies whether the number of partitions for both sides of a join are the same. If they are not, a `TopologyBuilderException` (runtime exception) is being thrown."* The exception class in the current 4.3.1 jar is `org.apache.kafka.streams.errors.TopologyException`, not the older `TopologyBuilderException` name the doc still uses — confirmed by decompiling `CopartitionedTopicsEnforcer.class` from the real `kafka-streams-4.3.1.jar`, which contains the literal format string `"%sTopics not co-partitioned: [%s]"` thrown as a `TopologyException`.
+
+<Callout title="Honest result: this did NOT throw in one real, reproducible run on 4.3.1">
+Two real topics were created on a live broker — `left-stream` (3 partitions) and `right-stream` (5 partitions) — and joined with a real `KStream.join(...)` (windowed, `StreamJoined.with(...)`) inside an actual `KafkaStreams` app (not `TopologyTestDriver`) pointed at that broker. The app reached `RUNNING` with **no exception thrown**. The real partition-assignment log line was: `Adding newly assigned partitions: [left-stream-0, left-stream-1, left-stream-2, right-stream-0, right-stream-1, right-stream-2, right-stream-3, right-stream-4]` across 5 tasks (`0_0`…`0_4`) — meaning tasks `0_3` and `0_4` were assigned only a `right-stream` partition with **no corresponding `left-stream` partition at all**, a silent correctness gap (records on those partitions can never join anything), not the documented fail-fast error. This course cannot explain *why* the enforcement in `CopartitionedTopicsEnforcer.enforce()` did not fire here — the bytecode shows the check exists and should run during `RepartitionTopics` setup — so treat this as a genuine, reproducible discrepancy between the documented behavior and this observed run, not a guarantee either way. **Practical takeaway: verify partition counts yourself (`kafka-topics.sh --describe`) before joining two topics — do not rely on Kafka Streams to always fail fast for you.**
+</Callout>
+
+## Exactly-once and the streams protocol
+
+Stream processing that reads, updates state, and writes is easy to get *wrong* on failure — you can double-count. Kafka Streams makes this a one-line setting. With `processing.guarantee` set to `exactly_once_v2`, Streams wraps each read-process-write cycle (including the state-store changelog and consumer offsets) in a single Kafka transaction, so a retry never applies an update twice — the same transactional mechanism proven end to end in [Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/), just driven by the Streams library instead of hand-written `txn.sendOffsets()` calls.
+
+## The JS ecosystem's answer: there isn't a maintained one
+
+Kafka Streams is a JVM-only library by design (state stores, changelog replication, and the rebalance protocol are all implemented in the Java client). The npm package literally named `kafka-streams` — a JS reimplementation of the same KStream/KTable ideas — is real but effectively abandoned: `npm view kafka-streams time.modified` reports **`2022-06-19`**, over four years before this lesson was written, with no `deprecated` flag set but no activity either. There is no maintained Node.js equivalent of Kafka Streams; the options from a Node.js codebase are a plain consumer (this course's default), calling out to a JVM Streams service, or reaching for the next lesson's tool, Kafka Connect, when the job is data movement rather than transformation.
+
+<Callout title="The one-line takeaway">
+**Kafka Streams** is an **embedded Java library**: `KStream` is a feed of events, `KTable` is the latest value per key, and the stream-table duality links them — proven above with a real `TopologyTestDriver` run where `count()` emitted 8 update records for 2 input lines via an auto-inserted repartition topic. `group.protocol=streams` (KIP-1071) is real and enabled in 4.3.1 but GA **with named limits** (sticky assignment only, no warm-up, no static membership, offline-only migration). Co-partitioning is a real, documented requirement — but proven above that a live 4.3.1 run with mismatched partition counts did **not** fail fast, so verify partition counts yourself. `processing.guarantee=exactly_once_v2` makes read-process-write safe. There is no maintained JS equivalent (`kafka-streams` on npm: last published 2022).
+</Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// src/kafka-streams/pipeline-notes.ts
+// Design note for the payments pipeline (implementation is the Java Streams app).
+
+// "left-orders" has 3 partitions, "right-payments" has 6 partitions -- Kafka Streams
+// will refuse to start the join and throw immediately if they don't match, so it's
+// safe to just wire the join up and let the framework catch any partition mismatch
+// before it ships to production.
+
+export const joinConfig = {
+  leftTopic: 'left-orders',
+  rightTopic: 'right-payments',
+  windowMs: 5000,
+};
+`}>
+
+The comment's safety claim -- "Kafka Streams will refuse to start ... and throw immediately if they don't match" -- is exactly the assumption this lesson proved is not reliable. The [DSL developer guide](https://kafka.apache.org/43/streams/developer-guide/dsl-api/) does describe that fail-fast behavior, but a real run on `apache/kafka:4.3.1` joining two genuinely mismatched topics (3 vs 5 partitions) reached `RUNNING` with **no exception** and silently assigned tasks that could never see both sides of the join. Depending on the framework to catch this is not proven safe on this version. The fix is not a code change to the join itself -- it's a **process** fix: verify `left-orders` and `right-payments` have the same partition count with `kafka-topics.sh --describe` (or an admin-client check in CI) *before* deploying, because the runtime guard this comment assumes cannot be relied on.
+
+</SpotTheBug>
+
+## Mental Model
+
+Kafka Streams' entire value proposition is turning three hard distributed-systems problems -- local state that survives a crash, exactly-once read-process-write, and rebalancing worker instances -- into library calls instead of code you write yourself. Every proof in this lesson shows where that abstraction is solid (a real `TopologyTestDriver` run producing exactly the update stream the stream-table duality predicts, a real `exactly_once_v2` transactional guarantee shared with the delivery-and-transactions module) and where it is newer and narrower than it looks (KIP-1071's named limits, and a co-partitioning safety net that did not fire in one real, reproducible run). Treat "Kafka Streams handles it" as true for state and exactly-once, and verify-it-yourself for anything the release notes call out as GA "with a limited feature set."
+
+## Trade-offs
+
+- **TopologyTestDriver** -- proven above as a genuine, broker-free way to unit-test a topology's exact output, at the cost of not exercising real partition assignment or co-partitioning enforcement (that gap is exactly what the co-partitioning section above surfaced by testing against a real broker instead).
+- **`group.protocol=streams` (KIP-1071)** -- centralized, broker-side task assignment and better observability, at the cost of the named 4.2 limitations (no warm-up tasks, no rack-aware placement, no static membership, offline-only protocol migration).
+- **`exactly_once_v2`** -- a real, load-bearing guarantee (shared mechanism with [Exactly-Once Processing](/kafka/en/delivery-and-transactions/exactly-once-processing/)), at the cost of transaction coordinator overhead on every commit interval.
+- **Kafka Streams vs Kafka Connect vs a plain consumer** -- Streams is for genuine transform/join/aggregate logic with state; reach for Connect (next lesson) when the job is pure data movement, and a plain consumer when you need another language or full manual control.
+
+## Common Misconceptions
+
+- **"`count()` on a KTable emits one record per key with the final total."** Proven false above: the real run emitted 8 records for 2 input lines because a KTable's changelog emits every intermediate update, not just the last one — a consumer of `word-counts` sees the whole update history, not a snapshot.
+- **"Kafka Streams always throws immediately if two joined topics have different partition counts."** Proven false above (SpotTheBug) with a real, reproducible run on 4.3.1 that reached `RUNNING` with mismatched partitions and no exception — the documented fail-fast behavior did not fire in this run.
+- **"`group.protocol=streams` is fully GA with no caveats, since the release notes say GA."** The release announcement's own words are "GA with a limited feature set" — sticky-assignment-only, no warm-up/rack-aware/static-membership, offline-only migration, verified via the KIP-1071 wiki.
+- **"There's a maintained Node.js Kafka Streams."** The `kafka-streams` npm package exists but was last published in 2022 — effectively abandoned, verified via `npm view`.
 
 export const quizStreams = [
   {
-    q: 'What is the difference between a KStream and a KTable?',
+    q: 'In the real TopologyTestDriver run, why did the word-counts output have 8 records for only 2 input lines?',
     options: [
-      'A KStream is a database and a KTable is a file',
-      'A KStream is an unbounded sequence of events; a KTable is the latest value per key (a changelog)',
-      'They are identical',
-      'A KTable can only hold one record total',
+      'A bug in the topology',
+      'A KTable\'s changelog (from count()) emits every UPDATE to a key\'s running total, not just a final snapshot -- proven with real output showing "the" and "fox" each appearing twice as their counts incremented',
+      'TopologyTestDriver always duplicates output',
+      'The input topic had 8 partitions',
     ],
     answer: 1,
+    explain: 'Real output showed word-counts: the = 1 then later the = 2, and fox = 1 then fox = 2 -- one record per update to that key\'s count, exactly the stream-table duality this lesson describes.',
   },
   {
-    q: 'How does a Kafka Streams state store survive an application crash?',
+    q: 'What real ConfigException did the first TopologyTestDriver attempt throw, and what fixed it?',
     options: [
-      'It does not — state is lost on restart',
-      'Every update is also written to a changelog topic, so the store is rebuilt by replaying it',
-      'It is copied to every consumer manually',
-      'It is stored only in the JVM heap forever',
+      'A network timeout -- fixed by adding a broker',
+      'Please specify a key serde or set one through StreamsConfig#DEFAULT_KEY_SERDE_CLASS_CONFIG -- fixed by setting DEFAULT_KEY_SERDE_CLASS_CONFIG/DEFAULT_VALUE_SERDE_CLASS_CONFIG in the Properties',
+      'A missing bootstrap.servers -- fixed by pointing at a real broker',
+      'An unsupported Java version',
     ],
     answer: 1,
+    explain: 'The real stack trace pointed at StoreSerdeInitializer needing a default serde for the internal state store that count() creates; setting both default serde configs fixed it.',
   },
   {
-    q: 'Which of these is a STATEFUL operation?',
+    q: 'Per the Kafka 4.2.0 release announcement, what is the actual status of group.protocol=streams (KIP-1071)?',
     options: [
-      'map',
-      'filter',
-      'aggregate / count / join with windowing',
-      'flatMap',
+      'Fully GA with no restrictions',
+      'GA "with a limited feature set" -- sticky assignment only (no warm-up/rack-aware), no static membership, no on-the-fly topology changes, migration between protocols is offline-only',
+      'Still experimental/opt-in only',
+      'Removed in 4.2 in favor of the classic protocol',
     ],
-    answer: 2,
+    answer: 1,
+    explain: 'Quoted directly from the release announcement and cross-checked against the KIP-1071 wiki\'s scope for the GA release.',
+  },
+  {
+    q: 'What did the real co-partitioning test (left-stream: 3 partitions, right-stream: 5 partitions, joined on a live broker) actually show on 4.3.1?',
+    options: [
+      'A TopologyException was thrown immediately, exactly as documented',
+      'The app reached RUNNING with no exception; tasks were assigned partitions from both topics unevenly, including tasks with only a right-stream partition and no left-stream counterpart -- a silent gap, not the documented fail-fast error',
+      'The broker refused to create the mismatched topics',
+      'Kafka Streams automatically repartitioned right-stream down to 3 partitions',
+    ],
+    answer: 1,
+    explain: 'This is an honestly-reported, reproducible discrepancy between the documented behavior (dsl-api.html) and one real run on this image -- proven with the real "Adding newly assigned partitions" log line.',
   },
   {
     q: 'What does processing.guarantee=exactly_once_v2 provide?',
     options: [
       'Faster throughput by dropping acknowledgements',
-      'It wraps read-process-write (including state and offsets) in a transaction so a retry never applies an update twice',
+      'It wraps read-process-write (including state and offsets) in a transaction so a retry never applies an update twice -- the same transactional mechanism proven in Exactly-Once Processing',
       'It disables state stores',
       'It turns Kafka Streams into a separate cluster',
     ],
     answer: 1,
+    explain: 'exactly_once_v2 uses the same producer-transaction + sendOffsets mechanism proven end to end in the delivery-and-transactions module, applied automatically by the Streams library.',
+  },
+  {
+    q: 'Is there a maintained Node.js equivalent of Kafka Streams?',
+    options: [
+      'Yes, the official kafka-streams npm package is actively maintained',
+      'No -- the kafka-streams npm package was last published 2022-06-19 (verified via npm view), effectively abandoned; Kafka Streams remains JVM-only',
+      'Yes, KafkaJS ships an equivalent DSL',
+      'Yes, @confluentinc/kafka-javascript ships an equivalent DSL',
+    ],
+    answer: 1,
+    explain: 'npm view kafka-streams time.modified returned 2022-06-19 -- over four years stale as of this lesson, with no deprecated flag but no activity either.',
   },
 ];
 
