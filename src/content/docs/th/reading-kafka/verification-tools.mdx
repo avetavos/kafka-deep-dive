@@ -1,0 +1,250 @@
+---
+title: Verification tools
+description: '`tsc --noEmit`, `kafka-configs.sh --describe --all`, `kafka-topics.sh --describe`, `kafka-consumer-groups.sh`, `kafka-dump-log.sh`, `kafka-console-share-consumer.sh`/`kafka-share-groups.sh`, `kafka-features.sh describe`, `kafka-acls.sh`, REST API ของ Connect และ Schema Registry, และ harness ของคอร์สนี้เอง แต่ละตัวพิสูจน์อะไรได้จริง — พร้อม output จริง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+ไม่มี tool ไหนข้างล่างนี้ทับซ้อนกันสมบูรณ์ และไม่มีตัวไหนใกล้ครบด้วยตัวเองเลย — บรรทัด "จับได้ด้วย" ของแต่ละ 21 รายการใน **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** บอกเป๊ะ ๆ ว่า tool ไหนข้างล่างนี้ (ถ้ามี) จะจับมันได้ และส่วนใหญ่ของ 21 รายการนั้นไม่มีตัวไหนจับได้เลย ณ จุดที่ bug ถูกใส่เข้ามา output ทุกอันข้างล่างเป็นของจริง จับใหม่สด ๆ สำหรับโมดูลนี้ กับ `kafka-reading-a` (cluster 3-broker ของโมดูลนี้เอง) หรือ harness broker ที่คอร์สนี้ใช้ร่วมกัน
+
+## `tsc --noEmit` — พิสูจน์ type เท่านั้น ไม่เคยพิสูจน์ durability หรือ ordering
+
+การ compile ผ่านของ TypeScript เป็นสัญญาณที่อ่อนและถูกที่สุดในหน้านี้ และสำคัญที่ต้องชัดเจนว่ามันตัดอะไรออกไปจริง ๆ: การเรียก `kafka.producer()` โดยไม่มี option `idempotent` compile เหมือนกันเป๊ะกับที่มี `idempotent: true` — ทั้งสอง valid ตาม type definition เพราะการไม่ตั้ง boolean option ไม่ใช่ type error ทุกรายการแบบ "สมมติ default" ใน catalog (4, 5, 11) compile ผ่านสะอาดทั้งในรูป bug และรูป fix:
+
+```text
+$ tsc --noEmit src/reading-kafka/ai-bug-catalog/04-idempotent-default.ts
+$ echo $?
+0
+```
+
+`tsc` เป็น gate ที่จริง มีประโยชน์ ต้นทุนเป็นศูนย์ — มันแค่เป็น gate สำหรับ bug คนละประเภท (ชื่อ option พิมพ์ผิด, argument type ผิด) จาก bug แทบทุกตัวใน catalog ของโมดูลนี้
+
+## `kafka-configs.sh --describe --all` — key นี้มีอยู่จริงไหม และค่าของมันมาจากไหนจริง ๆ
+
+นี่คือ command ที่มีประโยชน์ที่สุดตัวเดียวในหน้านี้สำหรับ catalog รายการ 13 และ 15 `--all` แสดง config ทุกตัวพร้อม `source` ของมัน — `DEFAULT_CONFIG`, `STATIC_BROKER_CONFIG`, หรือ `DYNAMIC_BROKER_CONFIG` — ซึ่งเป็นวิธีเดียวที่รู้ *ก่อน* ลองเปลี่ยนว่ามัน alter แบบ dynamic ได้เลยหรือไม่:
+
+```text
+$ kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --describe --entity-type brokers --entity-name 1 --all | grep auto.create
+  auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}
+```
+
+มีแค่ `DEFAULT_CONFIG` โผล่ใน `synonyms` — ไม่มี entry `DYNAMIC_BROKER_CONFIG` เลยสำหรับ key นี้ ซึ่งเป็นสัญญาณสดที่บอกว่าความพยายาม `--alter` ของรายการ 15 จะพังตั้งแต่ก่อนรันด้วยซ้ำ command เดียวกันกับ `min.insync.replicas` ของ topic (รายการ 13) แสดงว่า config ถูกรับไว้โดยไม่มี cross-check กับ `ReplicationFactor` เลย:
+
+```text
+$ kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --describe --entity-type topics --entity-name kip579-topic --all
+All configs for topic kip579-topic are:
+  min.insync.replicas=2 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:min.insync.replicas=2, DYNAMIC_DEFAULT_BROKER_CONFIG:min.insync.replicas=1, DEFAULT_CONFIG:min.insync.replicas=1}
+```
+
+## `kafka-topics.sh --describe` (และ `--under-min-isr-partitions`) — RF, ISR, และ flag ตัวเดียวที่ flag ความเปราะบางจริง
+
+`--describe` เฉย ๆ ไม่เคย flag combination ที่เปราะบางของรายการ 13 ว่าเป็น error เลย — มันแค่ print `ReplicationFactor: 1` กับ `Isr: 2` เคียงกันแล้วปล่อยให้ผู้อ่านสังเกตเองว่ามันไม่เหลือที่เลยใต้ `min.insync.replicas=2` `--under-min-isr-partitions` เป็น flag ตัวเดียวที่เรียกมันออกมาจริง ๆ และแค่ตอนที่ ISR count ต่ำกว่า minimum ที่ตั้งไว้จริง ๆ เท่านั้น:
+
+```text
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --topic kip579-topic
+Topic: kip579-topic	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=2
+	Topic: kip579-topic	Partition: 0	Leader: 2	Replicas: 2	Isr: 2
+```
+
+สำหรับรายการ 14 (partition remap) `--describe` ก่อนและหลัง `--alter --partitions` เป็นวิธีเร็วที่สุดที่ยืนยันว่า count เปลี่ยนจริงฝั่ง cluster — แต่มันไม่บอกอะไรเลยว่า client ที่ connect อยู่แล้วตัวไหน refresh metadata ของตัวเองไปแล้วบ้าง มีแค่ `producer.send()` จริงจาก client instance ตัวนั้นเจาะจงเท่านั้นที่ตอบได้ ตรงตามที่ catalog รายการนี้พิสูจน์
+
+## `kafka-consumer-groups.sh --describe` / `--list --type` — offset, lag, และ rebalance protocol ที่ group เข้าร่วมจริง
+
+`--describe --group <g>` เทียบ `CURRENT-OFFSET` กับ `LOG-END-OFFSET` เป็นสัญญาณสดที่เร็วที่สุดสำหรับ catalog รายการ 8 และ 9 (off-by-one commit และ DLQ loop) — `LAG` ที่ค้างนิ่งเป๊ะ ๆ ที่ 1 คือสัญญาณในทั้งสองกรณี:
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group off-by-one-group-3
+GROUP              TOPIC              PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+off-by-one-group-3 off-by-one-topic-3 0          2               3               1
+```
+
+`--list --type classic` เทียบกับ `--type consumer` เป็นวิธีเดียวที่ยืนยันคำกล่าวของรายการ 2 ได้ตรง ๆ — group ที่เข้าร่วมด้วย KafkaJS รายงานเป็น `Classic` เสมอ ไม่ว่าค่า `group.protocol` เฉพาะ Java จะอยู่ใน config object หรือไม่:
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type classic
+quick-batch-group-2              Classic
+```
+
+`--list --type` เข้มงวดกับค่า valid ของมัน ซึ่งตัวมันเองก็เป็นสัญญาณจริงที่มีประโยชน์ — มัน **ไม่** รับ `share` (share group มี tool เฉพาะของตัวเอง ดูต่อไป):
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type share
+Invalid types list 'share'. Valid types are: Consumer, Classic
+```
+
+## `kafka-console-share-consumer.sh` / `kafka-share-groups.sh` — CLI ที่ KafkaJS ไม่มีเทียบเท่า
+
+tool จริงแยกกันสองตัวที่ broker image ของคอร์สนี้มีให้เฉพาะสำหรับ share group ของ **KIP-932** ไม่มีตัวไหนมี KafkaJS เทียบเท่าเลย (catalog รายการ 21): `kafka-console-share-consumer.sh` consume ได้จริงด้วย semantics ACCEPT/RELEASE/REJECT และ `kafka-share-groups.sh` เป็น admin CLI เฉพาะ (`kafka-consumer-groups.sh` list หรือ describe share group ไม่ได้เลย):
+
+```text
+$ kafka-share-groups.sh --bootstrap-server "$BOOTSTRAP" --list
+my-share-group
+
+$ kafka-share-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group my-share-group
+GROUP           TOPIC             PARTITION  START-OFFSET  LAG
+my-share-group  share-group-topic 0          -             -
+```
+
+## `kafka-dump-log.sh` — byte จริงบน disk เกินกว่าที่ client-side API ไหนจะรายงาน
+
+`--print-data-log` อ่าน segment file จริงตรง ๆ และ print offset, size, และ payload จริงของทุก record — ความจริงพื้นฐานที่อยู่ใต้ catalog รายการที่เกี่ยวกับ offset ทุกอัน (8, 9, 10):
+
+```text
+$ kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/kafka-logs/off-by-one-topic-3-0/00000000000000000000.log
+Dumping /tmp/kafka-logs/off-by-one-topic-3-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 2 count: 3 baseSequence: 0 lastSequence: 2 producerId: -1 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1790650295771 size: 97 magic: 2 compresscodec: none crc: 200060204 isvalid: true
+| offset: 0 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 0 headerKeys: [] payload: msg-0
+| offset: 1 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 1 headerKeys: [] payload: msg-1
+| offset: 2 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 2 headerKeys: [] payload: msg-2
+```
+
+record ทั้งสามตัวอยู่บน disk จริงตรงนี้ `isTransactional: false` — นี่คือ tool ที่ให้ผู้อ่านยืนยันได้ ไม่ต้องพึ่งคำพูดของ client library ตัวไหนเลย ว่า segment นี้มีอะไรอยู่จริง ๆ
+
+## `kafka-features.sh describe` — KIP ไหนถูก finalize จริงบน cluster นี้เป๊ะ ๆ
+
+feature flag แต่ละตัว (`metadata.version`, `share.version`, `transaction.version`, `kraft.version`, `group.version`, `streams.version`) พก `FinalizedVersionLevel` — วิธีเดียวที่ยืนยันว่า KIP ที่โมดูลนี้พูดถึง (`group.version` ของ KIP-848, `share.version` ของ KIP-932) เปิดใช้งานจริง ไม่ใช่สมมติจากเลข version ของ Kafka อย่างเดียว:
+
+```text
+$ kafka-features.sh --bootstrap-server "$BOOTSTRAP" describe
+Feature: group.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 1        Epoch: 5926
+Feature: kraft.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 0        Epoch: 5926
+Feature: metadata.version           SupportedMinVersion: 3.3-IV3  SupportedMaxVersion: 4.3-IV0  FinalizedVersionLevel: 4.3-IV0   Epoch: 5926
+Feature: share.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 1        Epoch: 5926
+Feature: transaction.version        SupportedMinVersion: 0        SupportedMaxVersion: 2        FinalizedVersionLevel: 2        Epoch: 5926
+```
+
+## `kafka-acls.sh` — วิธีเร็วที่สุดที่รู้ว่า cluster ตรวจ permission อยู่หรือไม่
+
+ก่อนจะเชื่อ logic การ grant/deny ของ ACL ใด ๆ command เดียวนี้ตอบคำถามก่อนหน้าที่ catalog รายการ 18 พูดถึง — มี authorizer ถูกตั้งไว้เลยหรือไม่:
+
+```text
+$ kafka-acls.sh --bootstrap-server "$BOOTSTRAP" --list
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+```
+
+error นั้นเป๊ะ ๆ โดยไม่ต้องถามอะไรเพิ่ม เป็นการยืนยันที่เร็วที่สุดว่าทุก ACL rule ใน runbook เป็น no-op บน cluster นี้ตอนนี้เลย ดู **[Security and Production](/kafka/th/operations-and-production/security-and-production/)** สำหรับ `TopicAuthorizationException` จริง current ที่ principal ที่ตั้ง authorizer แล้วแต่ไม่มี grant จะได้ ตอนที่ authorizer *มี* อยู่จริง
+
+## Connect REST: `GET /connector-plugins` และ `PUT /.../config/validate`
+
+`/connector-plugins` แสดงเป๊ะ ๆ ว่า worker ที่รันอยู่ discover อะไรได้บ้าง — การยืนยัน fix ตรง ๆ สำหรับ catalog รายการ 19:
+
+```text
+$ curl localhost:8083/connector-plugins
+[{"class":"org.apache.kafka.connect.file.FileStreamSinkConnector","type":"sink","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.file.FileStreamSourceConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorCheckpointConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorHeartbeatConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorSourceConnector","type":"source","version":"4.3.1"}]
+```
+
+ทั้ง `FileStreamSourceConnector` และ `FileStreamSinkConnector` ถูก list ตอนนี้แล้ว — นี่คือ output ที่เปลี่ยนไปเป๊ะ ๆ พอเพิ่ม `plugin.path=/opt/kafka/libs` ยืนยัน discovery สด ๆ แทนการอ่านบรรทัด log `PUT /connector-plugins/<class>/config/validate` (endpoint ที่ catalog รายการ 20 ใช้) เช็ค config ที่เสนอกับ `ConfigDef` ของ connector ที่ register จริงโดยไม่ต้องเริ่มมันเลย — เป็นวิธีถูกที่สุดที่ยืนยันว่า `errors.tolerance` resolve เป็น `none` จริง ไม่ใช่สมมติจาก documentation ก่อนจะ submit อะไรจริง ๆ
+
+## Schema Registry: `/compatibility` — เกินขอบเขต docker budget ของโมดูลนี้เอง บอกตรง ๆ
+
+hard rule ของโมดูลนี้เองคือ docker stack เดียว และ `kafka-reading-a` สามตัวใช้ budget นั้นไปแล้ว — `confluentinc/cp-schema-registry` เป็น image แยกของ Confluent ที่โมดูลนี้ไม่ได้ pull endpoint `/compatibility/subjects/<subject>/versions/<version>` และ `409 Conflict` จริงของมันภายใต้ compatibility แบบ `BACKWARD` ถูกพิสูจน์แล้ว ด้วย HTTP output จริง ใน **[Schema Registry](/kafka/th/streams-connect-schema/schema-registry/)** — stack broker+registry ของบทนั้นเองคือที่ที่เห็นมันรันจริง แทนที่โมดูลนี้จะพิสูจน์ fact เดียวกันซ้ำบน stack ที่ไม่เคยถูกจัดให้สำหรับมัน
+
+## harness ของคอร์สนี้เอง: `tools/verify-snippets.mjs`
+
+ทุก fence ในโมดูลนี้ที่ประกาศ path จริงบนบรรทัดแรก (`// src/reading-kafka/ai-bug-catalog/<name>.ts`, `# scripts/.../<name>.sh`, `# config/.../<name>.properties`) ถูกเก็บและตรวจโดย harness ของ repo นี้เอง — อ่าน comment header ของ `tools/verify-snippets.mjs` (~120 บรรทัดแรก) ก่อนเชื่อคำอธิบายของมันจากที่ไหนก็ตาม รวมถึงอันนี้:
+
+```bash
+npm run verify              # tsc --noEmit + bash -n + properties-key check, over every collected fence
+npm run verify -- --run reading-kafka/ai-bug-catalog   # actually runs every // @run TypeScript fence
+npm run verify -- --cli reading-kafka/ai-bug-catalog   # actually runs every bash fence inside the broker container
+npm run verify -- --props   # properties-key check only, no broker needed
+```
+
+fence ที่บรรทัดแรกมีคำว่า `@expect-error` — snippet ที่เป็น bug ทุกตัวใน **[AI Bug Catalog](/kafka/th/reading-kafka/ai-bug-catalog/)** — จะไม่ถูกเก็บโดยตั้งใจ: harness เมินมันไปเลย และเนื้อหาบทพก output จริงที่จับแยกไว้แทน นี่คือ convention เดียวกับที่คอร์สนี้ใช้ทั้งเล่ม ไม่ใช่ของใหม่ในโมดูลนี้ output จริง รันสด ๆ กับ catalog นี้เป๊ะ ๆ:
+
+```text
+$ npm run -s verify -- --run reading-kafka/ai-bug-catalog
+running .../ai-bug-catalog.mdx:fence #12 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #15 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #18 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #21 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #24 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #27 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #31 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #34 ... exit code: 0
+```
+
+**ข้อจำกัด single-broker บอกตรง ๆ:** broker ของ harness เอง (`tools/probe/docker-compose.yml`) เป็น node KRaft แบบ broker+controller รวมเดียวบน host port 19092 — ทุก fence `// @run` ใน catalog นี้ใช้ `replicationFactor: 1` เพราะเหตุนี้เป๊ะ ๆ รายการที่หลักฐานจริงของมันต้องการ broker หลายตัวทำงานแยกกันจริง ๆ (รายการ KIP-579 และ partition-remap ของโมดูลนี้เองใช้ cluster 3-broker แยกชั่วคราวชื่อ `kafka-reading-a` บนพอร์ต 39092–39094 ปิดลงหลังจับ output ข้างบนเสร็จ) รันซ้ำกับ harness broker แบบเดิมไม่ได้ — ส่วน `PROOF` ของมันเป็น output จริงจาก cluster อื่นที่ปิดไปแล้ว ไม่ใช่ fence ที่ harness ตัวนี้จะรันซ้ำได้เลย โหมด `--run` ของ harness พิสูจน์ได้แค่สิ่งที่ broker เดียวพิสูจน์ได้เท่านั้น
+
+{/* TSPlayground slot */}
+
+## Mental Model
+
+<Mermaid title="Static tool พิสูจน์จาก source อย่างเดียวได้; dynamic tool ต้องมี broker, worker, หรือ restart จริง" code={verificationToolsDiagram} />
+
+export const verificationToolsDiagram = `flowchart TD
+  subgraph Static["Static (no broker needed)"]
+    Tsc["tsc --noEmit<br/>types only, never durability/ordering"]
+    Props["harness --props<br/>hallucinated config keys"]
+  end
+  subgraph Broker["Needs a real broker"]
+    Configs["kafka-configs.sh --describe --all<br/>does the key exist, where did it come from"]
+    Topics["kafka-topics.sh --describe /<br/>--under-min-isr-partitions"]
+    Groups["kafka-consumer-groups.sh /<br/>kafka-share-groups.sh"]
+    DumpLog["kafka-dump-log.sh<br/>real bytes on disk"]
+    Features["kafka-features.sh describe<br/>which KIPs are finalized"]
+    Acls["kafka-acls.sh<br/>is an authorizer even configured"]
+    Harness["harness --run / --cli<br/>this module's own proofs"]
+  end
+  subgraph Worker["Needs a real Connect worker"]
+    Plugins["GET /connector-plugins<br/>what can this worker actually load"]
+    Validate["PUT /.../config/validate<br/>errors.tolerance's real default"]
+  end
+  subgraph OutOfBudget["Out of THIS module's docker budget"]
+    SR["Schema Registry /compatibility<br/>proven in streams-connect-schema instead"]
+  end
+`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+tool ทุกตัวในหน้านี้เป็นตัวกรอง ไม่ใช่คำตัดสิน — แม้รันพร้อมกันหมด มันก็ยังจับ pattern ส่วนใหญ่ของ AI Bug Catalog ทั้ง 21 อัน (18 อันในนั้นรันเรียบ) ไม่ได้ จนกว่า restart จริง, crash window จริง, หรือ fencing event จริงจะเกิดขึ้น รัน `tsc`/`--props` ก่อน (ไม่ต้องใช้ broker) แล้วค่อย CLI tool กับ harness ของคอร์สนี้กับ broker จริง แล้วยังต้องไล่ **[Review Checklist](/kafka/th/reading-kafka/review-checklist/)** ด้วยตาสำหรับทุกอย่างที่มีแค่เวลาหรือความล้มเหลวจริงเท่านั้นที่จะเผยออกมาได้
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ kafka-configs.sh --describe --entity-type brokers --entity-name 1 --all | grep auto.create\n  auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}\n```\nจาก output จริงนี้ การไม่มี DYNAMIC_BROKER_CONFIG entry ใน synonyms ทำนายอะไรได้จริง?",
+    options: [
+      "ไม่มีอะไรเลย -- synonyms เป็นแค่ข้อมูลอ้างอิง",
+      "ว่าความพยายาม kafka-configs.sh --alter กับ key นี้เป๊ะ ๆ จะพังด้วย InvalidRequestException จริง -- มีแค่ key ที่มี synonym DYNAMIC_BROKER_CONFIG (หรือ DYNAMIC_TOPIC_CONFIG) เท่านั้นที่เปลี่ยนบน broker ที่รันอยู่ได้โดยไม่ต้อง restart",
+      "ว่าค่านี้จะเปลี่ยนอัตโนมัติตอน restart ครั้งหน้า",
+      "ว่า key นี้ไม่มีอยู่จริง",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ ใน AI Bug Catalog รายการ 15: output describe นี้เป๊ะ ๆ ที่เช็คก่อนลอง alter ทำนาย error จริง Cannot update these configs dynamically: [auto.create.topics.enable] ที่ตามมาได้แล้ว",
+  },
+  {
+    q: "ทำไม kafka-consumer-groups.sh --list --type ปฏิเสธค่า 'share' ทั้งที่มี tool แยก (kafka-share-groups.sh) สำหรับ share group โดยเฉพาะ?",
+    options: [
+      "share group ไม่มีอยู่จริงใน Kafka 4.3.1",
+      "kafka-consumer-groups.sh เข้าใจแค่ protocol classic และ KIP-848 consumer-group เท่านั้น -- share group (KIP-932) เป็น coordinator และ admin surface ที่แยกกันจริง มี CLI เฉพาะของตัวเอง ไม่ใช่แค่ค่า --type ตัวที่สามที่แปะเข้าไปกับตัวเดิม",
+      "นี่เป็น bug ใน kafka-consumer-groups.sh ที่จะถูกแก้",
+      "--type share ใช้ได้ แค่ไม่ใช้กับ --list",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: kafka-consumer-groups.sh --list --type share คืน 'Invalid types list share. Valid types are: Consumer, Classic' -- ในขณะที่ kafka-share-groups.sh --list ซึ่งเป็น tool แยกกันจริง list share group ตัวเดียวกันได้สำเร็จ",
+  },
+  {
+    q: "บทนี้บอกว่า harness ของคอร์สนี้รันหลักฐานของรายการ KIP-579 และ partition-remap ซ้ำไม่ได้ ทั้งที่ fence ของมันมี path comment จริง ทำไมถึงเป็นแบบนั้น ในเมื่อ harness รัน @run fence อื่นจาก catalog เดียวกันนี้ได้สำเร็จ?",
+    options: [
+      "fence สองอันนั้นมี syntax error",
+      "หลักฐานจริงของสองรายการนั้นถูกจับกับ cluster 3-broker แยกชั่วคราว (kafka-reading-a) ที่ปิดไปแล้วหลังใช้ -- probe broker ของ harness เองเป็น node รวมตัวเดียว เลย fence ไหนที่ต้องการ behavior หลาย broker ทำงานแยกกันจริง ไม่สามารถรันซ้ำกับมันได้อย่างซื่อตรง",
+      "harness รองรับแค่ 8 fence ต่อบท",
+      "min.insync.replicas กับ partition count ทดสอบด้วย automation ไม่ได้เลย",
+    ],
+    answer: 1,
+    explain: "บอกตรง ๆ ในบทนี้: ส่วน PROOF ของรายการ 13 และ 14 เป็น output จริงจาก cluster 3-broker ของ kafka-reading-a ที่ปิดไปแล้ว ไม่ใช่ fence ที่ harness broker เดียวที่ใช้ร่วมกันจะรันซ้ำได้เลย เพราะ behavior จริงของมันต้องมี broker มากกว่าหนึ่งตัวทำงานแยกกันจริง",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-kafka/verification-tools" />

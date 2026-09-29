@@ -1,0 +1,250 @@
+---
+title: Verification tools
+description: 'What tsc --noEmit, kafka-configs.sh --describe --all, kafka-topics.sh --describe, kafka-consumer-groups.sh, kafka-dump-log.sh, kafka-console-share-consumer.sh/kafka-share-groups.sh, kafka-features.sh describe, kafka-acls.sh, the Connect and Schema Registry REST APIs, and this course''s own harness each actually prove — with real output.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+None of the tools below overlap perfectly, and none is close to complete on its own — the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)**'s "Caught by" line for each of its 21 entries names exactly which one (if any) of the tools below would have caught it, and most of those 21 name none of them at the point the bug is introduced. Every output below is real, freshly captured for this module against either `kafka-reading-a` (this module's own 3-broker cluster) or this course's shared harness broker.
+
+## `tsc --noEmit` — proves types, never durability or ordering
+
+TypeScript compiling is the weakest and cheapest signal on this page, and it is important to be precise about what it actually rules out: a `kafka.producer()` call with no `idempotent` option compiles identically to one with `idempotent: true` — both are valid according to the type definitions, because leaving a boolean option unset is not a type error. Every "assumed default" entry in the catalog (4, 5, 11) compiles cleanly in both its buggy and fixed form:
+
+```text
+$ tsc --noEmit src/reading-kafka/ai-bug-catalog/04-idempotent-default.ts
+$ echo $?
+0
+```
+
+`tsc` is a real, useful, zero-cost gate — it is just a gate for a different class of bug (a typo'd option name, a wrong argument type) than almost everything in this module's catalog.
+
+## `kafka-configs.sh --describe --all` — does the key exist, and where did its value actually come from?
+
+This is the single most useful command on this page for catalog entries 13 and 15. `--all` prints every config with its `source` — `DEFAULT_CONFIG`, `STATIC_BROKER_CONFIG`, or `DYNAMIC_BROKER_CONFIG` — which is the only way to know *before* attempting a change whether it is even dynamically alterable:
+
+```text
+$ kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --describe --entity-type brokers --entity-name 1 --all | grep auto.create
+  auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}
+```
+
+Only `DEFAULT_CONFIG` appears in `synonyms` — no `DYNAMIC_BROKER_CONFIG` entry exists for this key, which is the live signal that entry 15's `--alter` attempt is doomed before it even runs. The same command against a topic's `min.insync.replicas` (entry 13) shows the config was accepted with no cross-check against `ReplicationFactor` at all:
+
+```text
+$ kafka-configs.sh --bootstrap-server "$BOOTSTRAP" --describe --entity-type topics --entity-name kip579-topic --all
+All configs for topic kip579-topic are:
+  min.insync.replicas=2 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:min.insync.replicas=2, DYNAMIC_DEFAULT_BROKER_CONFIG:min.insync.replicas=1, DEFAULT_CONFIG:min.insync.replicas=1}
+```
+
+## `kafka-topics.sh --describe` (and `--under-min-isr-partitions`) — RF, ISR, and the one flag that flags the fragility
+
+`--describe` alone never flags entry 13's fragile combination as an error — it just prints `ReplicationFactor: 1` and `Isr: 2` side by side and leaves the reader to notice they don't leave any room below `min.insync.replicas=2`. `--under-min-isr-partitions` is the one flag that actively calls it out, and only once the ISR count genuinely drops below the configured minimum:
+
+```text
+$ kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --describe --topic kip579-topic
+Topic: kip579-topic	PartitionCount: 1	ReplicationFactor: 1	Configs: min.insync.replicas=2
+	Topic: kip579-topic	Partition: 0	Leader: 2	Replicas: 2	Isr: 2
+```
+
+For entry 14 (partition remap), `--describe` before and after `--alter --partitions` is the fastest way to confirm the count actually changed cluster-side — but it tells you nothing about which of your already-connected clients have refreshed their own metadata since; only a real `producer.send()` from that specific client instance answers that, exactly as the catalog entry proves.
+
+## `kafka-consumer-groups.sh --describe` / `--list --type` — offsets, lag, and which rebalance protocol a group actually joined
+
+`--describe --group <g>` comparing `CURRENT-OFFSET` to `LOG-END-OFFSET` is the fastest live signal for catalog entries 8 and 9 (the off-by-one commit and the DLQ loop) — a permanent, unmoving `LAG` of exactly 1 is the tell in both cases:
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group off-by-one-group-3
+GROUP              TOPIC              PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+off-by-one-group-3 off-by-one-topic-3 0          2               3               1
+```
+
+`--list --type classic` vs `--type consumer` is the only way to confirm entry 2's claim directly — a group that joined with KafkaJS reports `Classic` no matter what Java-only `group.protocol` value was in the config object:
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type classic
+quick-batch-group-2              Classic
+```
+
+`--list --type` is strict about its valid values, which is itself a useful real signal — it does **not** accept `share` (share groups have their own dedicated tool, next):
+
+```text
+$ kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP" --list --type share
+Invalid types list 'share'. Valid types are: Consumer, Classic
+```
+
+## `kafka-console-share-consumer.sh` / `kafka-share-groups.sh` — the CLI KafkaJS has no equivalent of
+
+Two real, separate tools this course's broker image ships specifically for **KIP-932** share groups, neither of which has any KafkaJS counterpart (catalog entry 21): `kafka-console-share-consumer.sh` actually consumes with ACCEPT/RELEASE/REJECT semantics, and `kafka-share-groups.sh` is the dedicated admin CLI (`kafka-consumer-groups.sh` cannot list or describe a share group at all):
+
+```text
+$ kafka-share-groups.sh --bootstrap-server "$BOOTSTRAP" --list
+my-share-group
+
+$ kafka-share-groups.sh --bootstrap-server "$BOOTSTRAP" --describe --group my-share-group
+GROUP           TOPIC             PARTITION  START-OFFSET  LAG
+my-share-group  share-group-topic 0          -             -
+```
+
+## `kafka-dump-log.sh` — the actual bytes on disk, past what any client-side API reports
+
+`--print-data-log` reads a real segment file directly and prints every record's real offset, size, and payload — the ground truth underneath every offset-related catalog entry (8, 9, 10):
+
+```text
+$ kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/kafka-logs/off-by-one-topic-3-0/00000000000000000000.log
+Dumping /tmp/kafka-logs/off-by-one-topic-3-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 2 count: 3 baseSequence: 0 lastSequence: 2 producerId: -1 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1790650295771 size: 97 magic: 2 compresscodec: none crc: 200060204 isvalid: true
+| offset: 0 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 0 headerKeys: [] payload: msg-0
+| offset: 1 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 1 headerKeys: [] payload: msg-1
+| offset: 2 CreateTime: 1790650295771 keySize: -1 valueSize: 5 sequence: 2 headerKeys: [] payload: msg-2
+```
+
+All three records are genuinely on disk here, `isTransactional: false` — this is the tool that would let a reader confirm, independent of any client library's word for it, exactly what a segment holds.
+
+## `kafka-features.sh describe` — which KIPs are actually finalized on this exact cluster
+
+Feature flags (`metadata.version`, `share.version`, `transaction.version`, `kraft.version`, `group.version`, `streams.version`) each carry a `FinalizedVersionLevel` — the only way to confirm a KIP this module discusses (KIP-848's `group.version`, KIP-932's `share.version`) is actually active, rather than assumed from the Kafka version number alone:
+
+```text
+$ kafka-features.sh --bootstrap-server "$BOOTSTRAP" describe
+Feature: group.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 1        Epoch: 5926
+Feature: kraft.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 0        Epoch: 5926
+Feature: metadata.version           SupportedMinVersion: 3.3-IV3  SupportedMaxVersion: 4.3-IV0  FinalizedVersionLevel: 4.3-IV0   Epoch: 5926
+Feature: share.version              SupportedMinVersion: 0        SupportedMaxVersion: 1        FinalizedVersionLevel: 1        Epoch: 5926
+Feature: transaction.version        SupportedMinVersion: 0        SupportedMaxVersion: 2        FinalizedVersionLevel: 2        Epoch: 5926
+```
+
+## `kafka-acls.sh` — the fastest way to learn whether a cluster is checking permissions at all
+
+Before trusting any ACL grant/deny reasoning, this one command answers the prior question catalog entry 18 is about — is an authorizer even configured:
+
+```text
+$ kafka-acls.sh --bootstrap-server "$BOOTSTRAP" --list
+Error while executing ACL command: org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker
+```
+
+That exact error, unprompted, is the fastest possible confirmation that every ACL rule in a runbook is currently a no-op on this cluster; see **[Security and Production](/kafka/en/operations-and-production/security-and-production/)** for the real, current `TopicAuthorizationException` a configured-but-ungranted principal gets once an authorizer *is* in place.
+
+## Connect REST: `GET /connector-plugins` and `PUT /.../config/validate`
+
+`/connector-plugins` lists exactly what a running worker can discover — the direct fix-confirmation for catalog entry 19:
+
+```text
+$ curl localhost:8083/connector-plugins
+[{"class":"org.apache.kafka.connect.file.FileStreamSinkConnector","type":"sink","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.file.FileStreamSourceConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorCheckpointConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorHeartbeatConnector","type":"source","version":"4.3.1"},
+ {"class":"org.apache.kafka.connect.mirror.MirrorSourceConnector","type":"source","version":"4.3.1"}]
+```
+
+Both `FileStreamSourceConnector` and `FileStreamSinkConnector` are now listed — this is the exact output that changed once `plugin.path=/opt/kafka/libs` was added, confirming discovery live rather than reading a log line. `PUT /connector-plugins/<class>/config/validate` (the endpoint catalog entry 20 uses) checks a proposed config against a real, registered connector's `ConfigDef` without ever starting it — it is the cheapest way to confirm `errors.tolerance` resolved to `none`, not assumed from documentation, before submitting anything for real.
+
+## Schema Registry: `/compatibility` — out of this module's own docker budget, documented honestly
+
+This module's own hard rule is one docker stack, and `kafka-reading-a`'s three brokers already spend that budget — `confluentinc/cp-schema-registry` is a separate Confluent image this module did not pull. The `/compatibility/subjects/<subject>/versions/<version>` endpoint and its real `409 Conflict` under `BACKWARD` compatibility are already proven, with real HTTP output, in **[Schema Registry](/kafka/en/streams-connect-schema/schema-registry/)** — that lesson's own broker+registry stack is the place to see it run, rather than this module re-proving the same fact on a stack that was never provisioned for it.
+
+## This course's own harness: `tools/verify-snippets.mjs`
+
+Every fence in this module that declares a real path on its first line (`// src/reading-kafka/ai-bug-catalog/<name>.ts`, `# scripts/.../<name>.sh`, `# config/.../<name>.properties`) is collected and checked by this repository's own harness — read `tools/verify-snippets.mjs`'s header comment (its first ~120 lines) before trusting any description of it secondhand, including this one:
+
+```bash
+npm run verify              # tsc --noEmit + bash -n + properties-key check, over every collected fence
+npm run verify -- --run reading-kafka/ai-bug-catalog   # actually runs every // @run TypeScript fence
+npm run verify -- --cli reading-kafka/ai-bug-catalog   # actually runs every bash fence inside the broker container
+npm run verify -- --props   # properties-key check only, no broker needed
+```
+
+A fence whose first line contains `@expect-error` — every buggy snippet in the **[AI Bug Catalog](/kafka/en/reading-kafka/ai-bug-catalog/)** — is deliberately *not* collected: the harness skips it entirely, and the lesson prose carries the real, separately-captured output instead. This is the same convention the rest of this course uses, not something new to this module. Real, freshly run against this exact catalog:
+
+```text
+$ npm run -s verify -- --run reading-kafka/ai-bug-catalog
+running .../ai-bug-catalog.mdx:fence #12 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #15 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #18 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #21 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #24 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #27 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #31 ... exit code: 0
+running .../ai-bug-catalog.mdx:fence #34 ... exit code: 0
+```
+
+**The single-broker limitation, stated honestly:** the harness's own broker (`tools/probe/docker-compose.yml`) is one combined broker+controller KRaft node on host port 19092 — every `// @run` fence in this catalog uses `replicationFactor: 1` for exactly that reason. Entries whose real proof genuinely needs multiple brokers acting independently (this module's own KIP-579 and partition-remap entries used a separate, temporary 3-broker `kafka-reading-a` cluster on ports 39092–39094, torn down after capturing the output above) cannot be re-run against the harness broker as-is — their `PROOF` sections are real output from that other, already-torn-down cluster, not from a fence this harness will ever re-execute. The harness's `--run` mode only ever proves what a single broker can prove.
+
+{/* TSPlayground slot */}
+
+## Mental Model
+
+<Mermaid title="Static tools prove things from source alone; dynamic tools need a real broker, worker, or restart" code={verificationToolsDiagram} />
+
+export const verificationToolsDiagram = `flowchart TD
+  subgraph Static["Static (no broker needed)"]
+    Tsc["tsc --noEmit<br/>types only, never durability/ordering"]
+    Props["harness --props<br/>hallucinated config keys"]
+  end
+  subgraph Broker["Needs a real broker"]
+    Configs["kafka-configs.sh --describe --all<br/>does the key exist, where did it come from"]
+    Topics["kafka-topics.sh --describe /<br/>--under-min-isr-partitions"]
+    Groups["kafka-consumer-groups.sh /<br/>kafka-share-groups.sh"]
+    DumpLog["kafka-dump-log.sh<br/>real bytes on disk"]
+    Features["kafka-features.sh describe<br/>which KIPs are finalized"]
+    Acls["kafka-acls.sh<br/>is an authorizer even configured"]
+    Harness["harness --run / --cli<br/>this module's own proofs"]
+  end
+  subgraph Worker["Needs a real Connect worker"]
+    Plugins["GET /connector-plugins<br/>what can this worker actually load"]
+    Validate["PUT /.../config/validate<br/>errors.tolerance's real default"]
+  end
+  subgraph OutOfBudget["Out of THIS module's docker budget"]
+    SR["Schema Registry /compatibility<br/>proven in streams-connect-schema instead"]
+  end
+`;
+
+<Callout title="The one-line takeaway">
+Every tool on this page is a filter, not a verdict — even run together, they leave most of the AI Bug Catalog's 21 patterns (18 of which run cleanly) uncaught until a real restart, a real crash window, or a real fencing event passes. Run `tsc`/`--props` first (no broker needed), then the CLI tools and this course's own harness against a real broker, then still work through the **[Review Checklist](/kafka/en/reading-kafka/review-checklist/)** by eye for everything only time or a real failure can surface.
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ kafka-configs.sh --describe --entity-type brokers --entity-name 1 --all | grep auto.create\n  auto.create.topics.enable=true sensitive=false synonyms={DEFAULT_CONFIG:auto.create.topics.enable=true}\n```\nGiven this real output, what does the absence of a DYNAMIC_BROKER_CONFIG entry in synonyms actually predict?",
+    options: [
+      "Nothing -- synonyms is purely informational",
+      "That a kafka-configs.sh --alter attempt against this exact key will fail with a real InvalidRequestException -- only a key with a DYNAMIC_BROKER_CONFIG (or DYNAMIC_TOPIC_CONFIG) synonym can be changed on a live broker without a restart",
+      "That the value will change automatically on the next restart",
+      "That this key does not exist",
+    ],
+    answer: 1,
+    explain: "Proven directly in the AI Bug Catalog's entry 15: this exact describe output, checked BEFORE attempting the alter, already predicts the real Cannot update these configs dynamically: [auto.create.topics.enable] error that follows.",
+  },
+  {
+    q: "Why does kafka-consumer-groups.sh --list --type reject 'share' as a value, while a separate tool (kafka-share-groups.sh) exists specifically for share groups?",
+    options: [
+      "share groups are not real in Kafka 4.3.1",
+      "kafka-consumer-groups.sh only understands the classic and KIP-848 consumer-group protocols -- share groups (KIP-932) are a genuinely separate coordinator and admin surface, with their own dedicated CLI rather than a third --type value bolted onto the existing one",
+      "This is a bug in kafka-consumer-groups.sh that will be fixed",
+      "--type share works, just not with --list",
+    ],
+    answer: 1,
+    explain: "Proven directly: kafka-consumer-groups.sh --list --type share returns 'Invalid types list share. Valid types are: Consumer, Classic' -- while kafka-share-groups.sh --list, a genuinely separate tool, successfully lists the exact same share group.",
+  },
+  {
+    q: "The lesson says this course's harness cannot re-run the KIP-579 and partition-remap entries' proofs, even though their fences have real path comments. Why not, given the harness DOES run other @run fences from this same catalog successfully?",
+    options: [
+      "Those two fences have syntax errors",
+      "Those two entries' real proofs were captured against a separate, temporary 3-broker cluster (kafka-reading-a) that was torn down after use -- the harness's own probe broker is a single combined node, so any fence requiring independent multi-broker behavior cannot be faithfully re-executed against it",
+      "The harness only supports 8 fences per lesson",
+      "min.insync.replicas and partition count cannot be tested with any automation",
+    ],
+    answer: 1,
+    explain: "Stated directly in this lesson: entries 13 and 14's PROOF sections are real output from kafka-reading-a's 3-broker cluster, already torn down -- not fences the shared single-broker harness will ever execute, because their real behavior depends on more than one broker existing independently.",
+  },
+];
+
+<Quiz client:visible id="reading-kafka/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-kafka/verification-tools" />
