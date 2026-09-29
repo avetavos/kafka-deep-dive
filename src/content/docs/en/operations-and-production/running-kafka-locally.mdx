@@ -1,6 +1,6 @@
 ---
 title: 'Running Kafka Locally'
-description: 'Spin up a single-broker Kafka 4.x cluster in KRaft mode with Docker or kafka-storage.sh, then create a topic, produce, and consume from the CLI.'
+description: 'A single-node KRaft compose with the real reason each RF=1 env var is required (proven with a real broken run), apache/kafka vs apache/kafka-native measured on this Mac, a healthcheck that actually works, kafka-storage.sh format and cluster.id, and data volume vs ephemeral.'
 sidebar:
   order: 1
 ---
@@ -8,127 +8,317 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Running Kafka 4.x locally means starting a **single broker in KRaft mode** — no ZooKeeper, no external dependencies — then talking to it entirely through `--bootstrap-server localhost:9092` to create a topic, produce records, and consume them.
+Running Kafka 4.x locally means a **single broker in KRaft mode**, started with **three replication-factor env vars forced to `1`** so its own internal coordinator topics can actually be created on one broker — get any of the three wrong and the symptom is not a clean error, it is a client that just sits there.
 
-## The fastest path: one Docker container
-
-The official `apache/kafka` image ships a KRaft-ready broker that formats its own storage and starts as a combined broker plus controller. One command gives you a working cluster:
+## The Docker one-liner, and why three env vars matter more than it looks
 
 ```bash
-# Start a single-node Kafka 4.x broker in KRaft mode, port 9092 exposed
+# Start a single-node Kafka 4.x broker in KRaft mode
 docker run -d --name kafka -p 9092:9092 apache/kafka:4.3.1
 ```
 
-That is the whole cluster. There is nothing else to install — **no ZooKeeper process** exists in Kafka 4.x. The container comes with the CLI scripts baked in, so you can run admin commands inside it with `docker exec`, or install the Kafka tarball locally and point the scripts at `localhost:9092`.
+That bare command works with zero configuration because the image's own defaults already set `offsets.topic.replication.factor`, `transaction.state.log.replication.factor`, and `share.coordinator.state.topic.replication.factor` to `1` for a combined single-node container. A compose file that starts overriding **any** other `KAFKA_*` env var (this course's own probe does, to publish a second listener) switches the image's `KafkaDockerWrapper` into fully env-driven config generation — and that switch does not re-apply the friendly single-node defaults. From that point on you own all three explicitly:
 
-## The manual path: format storage, then start
+```properties
+# config/running-kafka-locally/rf-one.properties
+# section: broker
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+share.coordinator.state.topic.replication.factor=1
+```
 
-If you run the downloaded tarball instead of Docker, KRaft needs a one-time **storage format** step. You generate a cluster UUID and write it into the log directory before the first start:
+<Callout title="Why three, not one">
+Kafka 4.x ships three separate internal coordinators, each with its own backing topic, each defaulting to `replication.factor=3`: `__consumer_offsets` (classic/consumer-protocol group state), the transaction coordinator's log, and `__share_group_state` (KIP-932 share groups). A single broker can never satisfy `replication.factor=3` — `docker run` with no env vars avoids this by defaulting all three to `1` for you; any compose file that adds even one other `KAFKA_*` var must set all three itself.
+</Callout>
+
+## Proof: leave one out, and watch what actually happens
+
+To see the real failure, this lesson started a broker with the offsets and transaction RF env vars set to `1` but **`share.coordinator.state.topic.replication.factor` left at its default (3)** — a single-line mistake in an otherwise-correct compose file:
+
+```text
+$ docker exec broker kafka-console-share-consumer.sh --bootstrap-server localhost:9092 \
+    --topic share-test --timeout-ms 10000
+[... 10 seconds pass, no output at all ...]
+Processed a total of 0 messages
+```
+
+Nothing about that looks like a config error — no exception, no stack trace, just silence until the client's own timeout gives up. The real cause is in the **broker's** log, not the client's:
+
+```text
+[...] INFO Sent auto-creation request for Set(__share_group_state) to the active controller. (kafka.server.DefaultAutoTopicCreationManager)
+[...] WARN Auto topic creation failed for __share_group_state with error 'INVALID_REPLICATION_FACTOR': Unable to replicate the partition 3 time(s): The target replication factor of 3 cannot be reached because only 1 broker(s) are registered or some brokers have all their log directories cordoned. (kafka.server.DefaultAutoTopicCreationManager)
+[... repeats every ~2-4s until the client gives up ...]
+```
+
+The broker keeps **retrying** the auto-creation of `__share_group_state` at `replication.factor=3` against a cluster with exactly one broker, failing the same way every time, forever — the share group can never come up, and the client sees no error at all, just a hang. A **regular** classic/consumer-protocol group against the same broker works completely normally in the same run, because `__consumer_offsets` was correctly set to RF=1 — this is a per-coordinator failure, not a whole-broker failure, which is exactly what makes it easy to miss in a compose file that "mostly works."
+
+<Callout title="Corrects a common assumption">
+The literal exception name `GroupCoordinatorNotAvailable` does not appear anywhere in this real transcript. What you actually get is a silent hang plus a repeating `INVALID_REPLICATION_FACTOR` warning buried in the **broker's** logs — the client-visible symptom is "nothing happened," which is worse to debug than a named exception would be.
+</Callout>
+
+## `apache/kafka` vs `apache/kafka-native`, measured
+
+Apache also publishes `apache/kafka-native`, a GraalVM-compiled build of the same broker. Started with an identical single-node KRaft compose on this Mac, from `docker inspect .State.StartedAt` to the broker's own `Kafka Server started` log line:
+
+```text
+apache/kafka:4.3.1         container start -> "Kafka Server started"  ~1.97s  (JVM: class loading + JIT warmup)
+apache/kafka-native:4.3.1  container start -> "Kafka Server started"  ~0.28s  (ahead-of-time compiled, no JVM startup)
+```
+
+Roughly **7x faster to first-ready** on this machine — a real, single-run local number, not a benchmark claim. The container's own first log lines explain why, and also carry the real caveat:
+
+```text
+WARNING: THIS IS AN EXPERIMENTAL DOCKER IMAGE RECOMMENDED FOR LOCAL TESTING AND DEVELOPMENT PURPOSES.
+[...] INFO Starting Kafka server in the native mode. (kafka.docker.KafkaDockerWrapper$)
+```
+
+The bigger, undocumented-until-you-try-it caveat: `apache/kafka-native`'s `/opt/kafka/` contains exactly one file, the compiled server binary — no `bin/kafka-topics.sh`, no `kafka-console-producer.sh`, no `kafka-consumer-groups.sh`, nothing:
+
+```text
+$ docker exec kafka-native-broker ls -la /opt/kafka/
+total 129484
+-rwxr-xr-x 1 appuser appuser 132565240 kafka.Kafka
+drwxrwxr-x 1 appuser appuser        config
+drwxr-xr-x 2 appuser appuser        logs
+```
+
+Every CLI proof in this course (`kafka-topics.sh --describe`, `kafka-consumer-groups.sh`, `kafka-dump-log.sh`) needs the JVM distribution's `bin/` scripts, which `apache/kafka-native` does not ship at all — you would run the CLI from a separate `apache/kafka` container, a host install, or a client library instead. `apache/kafka-native` is the broker process only.
+
+<Mermaid title="apache/kafka vs apache/kafka-native, what each ships" code={imageDiagram} />
+
+export const imageDiagram = `flowchart LR
+  subgraph jvm["apache/kafka (JVM)"]
+    j1["kafka.Kafka (JVM)"] --- j2["bin/*.sh CLI tools"]
+  end
+  subgraph native["apache/kafka-native (GraalVM)"]
+    n1["kafka.Kafka (native binary)"]
+  end
+  jvm -->|"~1.97s to ready (this Mac)"| ready1["broker ready"]
+  native -->|"~0.28s to ready (this Mac)"| ready2["broker ready, no CLI tools included"]`;
+
+## Listeners: `PLAINTEXT`, `PLAINTEXT_HOST`, `CONTROLLER`
+
+This course's own probe compose (and this lesson's scratch compose) declares three listeners with three different jobs — `PLAINTEXT` for clients already inside the Docker network, `PLAINTEXT_HOST` published to the host for clients running outside the container, and `CONTROLLER` for KRaft's own quorum traffic between broker/controller roles, which regular clients never connect to at all:
+
+```properties
+# config/running-kafka-locally/listeners.properties
+# section: broker
+listeners=PLAINTEXT://:9092,PLAINTEXT_HOST://:39092,CONTROLLER://:39093
+advertised.listeners=PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:39092
+controller.listener.names=CONTROLLER
+```
+
+`listeners` is where the broker **binds**; `advertised.listeners` is the address it hands back to clients in metadata responses for every connection **after** the first one — and getting the second value wrong produces a real `getaddrinfo ENOTFOUND` from a working bootstrap connection, already proven end-to-end in [Brokers, Topics & Partitions](/kafka/en/foundations/brokers-topics-partitions/) — not repeated here.
+
+<Callout title="CONTROLLER is not a client listener">
+Notice `CONTROLLER` has no matching `advertised.listeners` entry above — it is not meant to be. Regular producer/consumer/admin clients never dial the controller listener directly; only broker processes acting as controllers use it, over `controller.quorum.voters`. Pointing a client at the controller port produces a connection that never completes a normal Kafka handshake.
+</Callout>
+
+## A healthcheck that actually works
+
+The obvious healthcheck is running the same tool the broker itself ships:
 
 ```bash
-# 1. Generate a unique cluster ID
+# scripts/running-kafka-locally/healthcheck.sh
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" | head -1
+```
+
+That looks complete, and it usually is — until a compose file also enables JMX for metrics (the [next lesson](/kafka/en/operations-and-production/monitoring-and-consumer-lag/) does exactly this). This lesson's own scratch compose set `JMX_PORT`/`KAFKA_JMX_OPTS` as container-wide env vars and used the command above, verbatim, as the Docker `healthcheck:`. Every single run failed:
+
+```text
+$ docker exec broker kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+Error: JMX connector server communication error: service:jmx:rmi://<container-id>:39094
+jdk.internal.agent.AgentConfigurationError: java.rmi.server.ExportException: Port already in use: 39094; nested exception is:
+	java.net.BindException: Address in use
+[...]
+```
+
+`kafka-broker-api-versions.sh` starts its own short-lived JVM to run the admin call — and that JVM inherits the **same** `KAFKA_JMX_OPTS` the container sets for the broker itself, so it tries to bind the identical JMX port the running broker process already holds. `docker inspect`'s own health log showed the real consequence: `FailingStreak` climbing on every 5-second retry, the container stuck at `health: starting` indefinitely. The fix is to strip those two env vars for the healthcheck's own process, not for the broker:
+
+```bash
+# scripts/running-kafka-locally/healthcheck-fixed.sh
+env -u JMX_PORT -u KAFKA_JMX_OPTS /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" | head -1
+```
+
+```text
+localhost:9092 (id: 1 rack: null isFenced: false) -> (
+```
+
+Re-applied as the compose `healthcheck.test`, the same container went `healthy` on the very next check.
+
+## `kafka-storage.sh format` and `cluster.id`
+
+The Docker image auto-formats storage on first start, but it does not generate a fresh UUID unless you tell it to — its own `configureDefaults` script bakes one in:
+
+```text
+$ docker run --rm --entrypoint sh apache/kafka:4.3.1 -c \
+    'grep -n CLUSTER_ID /etc/kafka/docker/configureDefaults'
+# Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid"
+  ["CLUSTER_ID"]="5L6g3nShT-eMCtK--X86sw"
+```
+
+Confirmed against two independent containers (`apache/kafka:4.3.1` and `apache/kafka-native:4.3.1`) started with no `CLUSTER_ID` set — both formatted with the **exact same** `cluster.id=5L6g3nShT-eMCtK--X86sw` in their `meta.properties`. Harmless for one standalone broker you throw away; a real problem if you ever script a multi-broker KRaft cluster and assume each container gets its own random ID — they will not, unless you generate and pass one explicitly:
+
+```bash
+# scripts/running-kafka-locally/random-uuid.sh
+/opt/kafka/bin/kafka-storage.sh random-uuid
+```
+
+```text
+EwfKmPniREOD__fBjwaROQ
+```
+
+Two calls, two different values — proving `random-uuid` genuinely randomizes, unlike the container's own silent default. The manual (non-Docker) bootstrap sequence uses exactly this value:
+
+```text
 KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
-
-# 2. Format the log directory for KRaft using that ID and the KRaft config
-bin/kafka-storage.sh format --standalone \
-  -t "$KAFKA_CLUSTER_ID" \
-  -c config/server.properties
-
-# 3. Start the broker (it is also the controller in a single-node setup)
+bin/kafka-storage.sh format --standalone -t "$KAFKA_CLUSTER_ID" -c config/server.properties
 bin/kafka-server-start.sh config/server.properties
 ```
 
-The `random-uuid` plus `format` pair is the KRaft bootstrap ritual — it replaces the old ZooKeeper handshake. You only do it once per data directory.
+## Data volume vs. ephemeral — the default is ephemeral
 
-<Mermaid title="Local KRaft workflow: format, start, then produce and consume" code={localFlow} />
+The image declares a named volume at `/var/lib/kafka/data`, which looks like where your data lives. It is not, unless you also set `KAFKA_LOG_DIRS` to point there. With no override, the broker's real, effective `log.dirs` is Kafka's own built-in default:
 
-export const localFlow = `flowchart LR
-  fmt["kafka-storage.sh format (KRaft)"] --> start["kafka-server-start.sh (broker + controller)"]
-  start --> topic["kafka-topics.sh --create"]
-  topic --> prod["kafka-console-producer.sh"]
-  topic --> cons["kafka-console-consumer.sh"]
-  prod -->|"records"| cons`;
+```text
+$ docker exec broker cat /tmp/kafka-logs/meta.properties
+cluster.id=5L6g3nShT-eMCtK--X86sw
+directory.id=O4H39-bgwrYSQm9VydOgxg
+node.id=1
+version=1
 
-## Create a topic, produce, consume
-
-With the broker up, every command targets `--bootstrap-server` — the `--zookeeper` flag no longer exists. Create a topic first:
-
-```bash
-# Create a topic named "demo" with 1 partition (fine for local)
-kafka-topics.sh --bootstrap-server localhost:9092 \
-  --create --topic demo --partitions 1 --replication-factor 1
+$ docker inspect broker --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}'
+/etc/kafka/secrets
+/mnt/shared/config
+/var/lib/kafka/data
 ```
 
-Then open a producer in one terminal and type messages, one per line:
+`/tmp/kafka-logs` — where the real data lives — is **not** in that mount list. `/var/lib/kafka/data` **is** a volume, but nothing is writing to it. `docker compose down -v`, or just `docker rm` without `-v`, loses every topic, every offset, everything — by default, on the official image, with no warning. For anything beyond a disposable local test, set `KAFKA_LOG_DIRS=/var/lib/kafka/data` explicitly (or bind-mount your own path) so the declared volume is the one actually in use.
 
-```bash
-# Produce: each line you type becomes a record
-kafka-console-producer.sh --bootstrap-server localhost:9092 --topic demo
-```
+<Mermaid title="Where a fresh container's data actually lives by default" code={volumeDiagram} />
 
-And a consumer in another terminal to read them back from the start:
-
-```bash
-# Consume: --from-beginning replays every record in the topic
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic demo --from-beginning
-```
-
-<Callout title="Never type --zookeeper">
-If a command or tutorial tells you to pass `--zookeeper localhost:2181`, it predates Kafka 4.x. In KRaft-only Kafka the flag is **gone**. Every CLI tool — `kafka-topics.sh`, `kafka-console-producer.sh`, `kafka-consumer-groups.sh` — takes **`--bootstrap-server`** and nothing else for cluster addressing.
-</Callout>
+export const volumeDiagram = `flowchart TD
+  start["docker run apache/kafka (no KAFKA_LOG_DIRS)"] --> logdirs["effective log.dirs = /tmp/kafka-logs (Kafka's own default)"]
+  logdirs --> notmounted["NOT one of the container's mounted volumes"]
+  declared["Image declares a volume at /var/lib/kafka/data"] --> unused["...but nothing writes there unless you set KAFKA_LOG_DIRS yourself"]
+  notmounted --> gone["docker compose down -v (or plain rm) -> all data lost"]`;
 
 <Callout title="The one-line takeaway">
-Local Kafka 4.x is a **single KRaft broker** with **no ZooKeeper**: run `apache/kafka` in **Docker** for one-command startup, or format the log directory with **`kafka-storage.sh format`** and launch with **`kafka-server-start.sh`**. Then create, produce, and consume through **`kafka-topics.sh`**, **`kafka-console-producer.sh`**, and **`kafka-console-consumer.sh`** — always via **`--bootstrap-server localhost:9092`**.
+The bare `docker run apache/kafka:4.3.1` one-liner works because its baked-in defaults already set all **three** coordinator replication factors to `1` — the instant a compose file adds any other `KAFKA_*` env var, you own restoring all three yourself, and leaving one out (proven above with `share.coordinator.state.topic.replication.factor`) produces a silent client hang plus a repeating `INVALID_REPLICATION_FACTOR` warning in the broker log, not a named exception. `apache/kafka-native` starts roughly 7x faster on this Mac but ships **zero** CLI tools. A healthcheck reusing `kafka-broker-api-versions.sh` breaks the instant JMX is also enabled unless you strip `JMX_PORT`/`KAFKA_JMX_OPTS` for that one call. Every fresh container gets the **same** baked-in `cluster.id` unless you pass a real one from `kafka-storage.sh random-uuid`. And by default your data lives in `/tmp/kafka-logs`, genuinely ephemeral, not in the volume the image declares.
 </Callout>
 
-export const quizLocal = [
+## Reading AI-generated code
+
+<SpotTheBug lang="yaml" code={`services:
+  broker:
+    image: apache/kafka:4.3.1
+    environment:
+      JMX_PORT: '9999'
+      KAFKA_JMX_OPTS: >-
+        -Dcom.sun.management.jmxremote
+        -Dcom.sun.management.jmxremote.rmi.port=9999
+    healthcheck:
+      # AI comment: "Reuse the broker's own CLI tool to verify it's alive"
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092']
+      interval: 5s
+      retries: 24
+`}>
+
+This is a plausible, common-looking compose fragment — enable JMX for metrics, then healthcheck with the broker's own admin CLI, which genuinely does prove the broker answers requests. The bug, proven above on this exact combination: `kafka-broker-api-versions.sh` starts its own JVM, which inherits `KAFKA_JMX_OPTS` from the container environment and tries to bind port `9999` — the same port the long-running broker process already holds. Every healthcheck invocation exits non-zero with a real `ExportException: Port already in use`, and the container sits at `health: starting` (then `unhealthy`) forever, even though the broker itself is completely fine and serving real traffic. The fix is `env -u JMX_PORT -u KAFKA_JMX_OPTS` prepended to the healthcheck command specifically — enable JMX for the broker, not for every short-lived CLI process the container also happens to run.
+
+</SpotTheBug>
+
+## Mental Model
+
+A fresh `apache/kafka` container is really two independent things layered together: a **bootstrap ritual** (format a log directory once, with a cluster ID, before anything can start — proven above, the image does this for you with a fixed default ID unless you override it) and a **runtime config surface** (every `KAFKA_*` env var you add). The bare `docker run` one-liner works by accident of good defaults on the second layer, not because the first layer is optional — the instant you touch the runtime config surface at all, you inherit responsibility for the pieces the defaults were quietly covering, including all three coordinator replication factors.
+
+## Trade-offs
+
+- **`apache/kafka` (JVM) vs `apache/kafka-native` (GraalVM)** — native starts ~7x faster on this machine (proven above) and has a smaller memory footprint typical of AOT-compiled binaries, at the direct cost of **zero bundled CLI tools** and an explicit "experimental, for local dev" warning from the image itself. Use JVM for anything you need to inspect with `kafka-*.sh`; native is attractive only where startup latency matters more than in-container tooling (e.g. ephemeral CI broker for an app-level test, run alongside a JVM-based tool container).
+- **Auto-formatted storage with a default cluster ID vs a manually generated one** — the default is genuinely convenient for a single disposable broker, and genuinely wrong the moment you script more than one container expecting independent identities.
+- **Ephemeral `/tmp` storage vs a real bind-mounted/volumed `log.dirs`** — ephemeral is exactly right for this course's own probes (throwaway per lesson), and exactly wrong for anything you want to survive a restart; the image does not make you choose correctly, its default silently chooses ephemeral for you.
+
+## Common Misconceptions
+
+- **"A bare `docker run apache/kafka` one-liner and my own compose file with extra env vars behave the same way underneath."** No — proven above: adding even one unrelated `KAFKA_*` env var (e.g. to publish a second listener) switches the wrapper into fully env-driven mode, which does not re-apply the bare command's friendly RF=1 defaults.
+- **"Missing a coordinator replication factor throws a config error at startup."** No — proven above: the broker starts fine; the failure only surfaces when a client actually tries to use that specific coordinator (here, a share group), as a silent hang plus a repeating `INVALID_REPLICATION_FACTOR` warning in the broker's own logs, not the client's.
+- **"`apache/kafka-native` is just a faster drop-in replacement for `apache/kafka`."** No — proven above: it ships the broker binary only, with no `bin/*.sh` CLI tools at all; every CLI-based proof in this course needs the JVM image or an external client.
+- **"The image's declared `/var/lib/kafka/data` volume means my data is automatically persisted."** No — proven above: the volume exists, but the broker's real `log.dirs` default (`/tmp/kafka-logs`) is not that volume; nothing gets written there unless you set `KAFKA_LOG_DIRS` yourself.
+
+export const quizRunningLocally = [
   {
-    q: 'What do you need to install alongside Kafka 4.x to run it locally?',
+    q: 'Why does a bare `docker run -d apache/kafka:4.3.1` with zero extra config work fine on a single broker?',
     options: [
-      'ZooKeeper, started before the broker',
-      'Nothing extra — Kafka 4.x is KRaft-only and needs no ZooKeeper',
-      'A relational database for metadata',
-      'A separate controller cluster on another machine',
+      'Kafka 4.x has no replication-factor concept at all',
+      "The image's own baked-in defaults already set all three coordinator replication factors (offsets, transaction, share) to 1 for a combined single-node container",
+      'ZooKeeper handles replication automatically',
+      'Replication factor only matters with more than 10 partitions',
     ],
     answer: 1,
+    explain: 'Proven above: as soon as a compose file adds any other KAFKA_* env var, the wrapper switches to fully env-driven config and those three RF defaults must be set explicitly again.',
   },
   {
-    q: 'What is the purpose of `kafka-storage.sh format` in the manual startup flow?',
+    q: 'Proven above, what actually happened when share.coordinator.state.topic.replication.factor was left at its default (3) on a single broker?',
     options: [
-      'It deletes all topics before every restart',
-      'It performs the one-time KRaft storage format, writing a cluster ID into the log directory before the first start',
-      'It connects the broker to ZooKeeper',
-      'It formats the disk partition table of the host',
+      'The broker refused to start, with a clear config error',
+      'A share-group consumer silently hung until its own timeout, while the broker log repeated a real INVALID_REPLICATION_FACTOR warning trying to auto-create __share_group_state',
+      'Classic consumer groups also stopped working',
+      'The broker automatically lowered the replication factor to 1',
     ],
     answer: 1,
+    explain: 'Real transcript: "Processed a total of 0 messages" client-side, with the broker log repeating "Unable to replicate the partition 3 time(s)... only 1 broker(s) are registered" — a per-coordinator failure, not a whole-broker one; regular consumer groups worked fine in the same run.',
   },
   {
-    q: 'Which flag do Kafka 4.x CLI tools use to address the cluster?',
+    q: 'What did the real, measured comparison on this Mac show between apache/kafka and apache/kafka-native?',
     options: [
-      '`--zookeeper localhost:2181`',
-      '`--bootstrap-server localhost:9092`',
-      '`--controller localhost:9093`',
-      '`--metadata-url localhost:8080`',
+      'They started in identical time',
+      'apache/kafka-native started roughly 7x faster (~0.28s vs ~1.97s to "Kafka Server started"), but ships no bin/*.sh CLI tools at all -- only the compiled server binary',
+      'apache/kafka-native was slower because of AOT compilation overhead',
+      'apache/kafka-native includes extra CLI tools apache/kafka does not have',
     ],
     answer: 1,
+    explain: 'Real docker exec ls -la /opt/kafka/ on the native image showed exactly one file (the kafka.Kafka native binary) -- no kafka-topics.sh, no kafka-consumer-groups.sh, nothing.',
   },
   {
-    q: 'How do you replay every record already in a topic with the console consumer?',
+    q: 'Proven above, why did a Docker healthcheck running kafka-broker-api-versions.sh fail on a broker that also had KAFKA_JMX_OPTS set?',
     options: [
-      'Add `--from-beginning`',
-      'Add `--replay-all`',
-      'Restart the broker',
-      'You cannot read old records with the console consumer',
+      'The bootstrap server address was wrong',
+      "kafka-broker-api-versions.sh starts its own short-lived JVM, which inherits KAFKA_JMX_OPTS too and tries to bind the same JMX port the running broker already holds, causing a real ExportException: Port already in use",
+      'The broker was actually down',
+      'Healthchecks cannot run CLI tools inside the same container',
     ],
-    answer: 0,
+    answer: 1,
+    explain: 'Real docker inspect health log showed FailingStreak climbing on every retry with the exact ExportException text; env -u JMX_PORT -u KAFKA_JMX_OPTS prepended to the same command fixed it, confirmed by the container going healthy on the next check.',
+  },
+  {
+    q: 'Proven above, what cluster.id did a fresh apache/kafka:4.3.1 container with no CLUSTER_ID env var set get, and why does it matter?',
+    options: [
+      'A fresh random UUID every time, so it never matters',
+      "The exact same baked-in default (5L6g3nShT-eMCtK--X86sw, confirmed in /etc/kafka/docker/configureDefaults) every single time -- harmless for one disposable broker, a real bug if you script multiple containers assuming each gets its own independent identity",
+      "Kafka refuses to start without an explicit CLUSTER_ID",
+      'The cluster.id is randomly generated but cached in the image layer',
+    ],
+    answer: 1,
+    explain: 'Confirmed against two independent containers (JVM and native images) -- both formatted with the identical cluster.id with no CLUSTER_ID env var set; kafka-storage.sh random-uuid, run twice, gave two different real values, proving the container default is what is actually static, not the tool.',
+  },
+  {
+    q: 'By default, where does an apache/kafka container actually store its log segments, and is that persisted?',
+    options: [
+      'In the declared /var/lib/kafka/data volume, persisted across restarts',
+      'In /tmp/kafka-logs, which is NOT one of the container\'s mounted volumes -- genuinely ephemeral unless you explicitly set KAFKA_LOG_DIRS',
+      'In a bind mount to the host automatically',
+      'Kafka refuses to run without an explicit log.dirs',
+    ],
+    answer: 1,
+    explain: "Real docker inspect --format '{{range .Mounts}}' listed /etc/kafka/secrets, /mnt/shared/config, and /var/lib/kafka/data as the only mounts -- /tmp/kafka-logs, where meta.properties and the real segments actually live, was not among them.",
   },
 ];
 
-<Quiz client:visible id="operations-and-production/running-kafka-locally" questions={quizLocal} />
+<Quiz client:visible id="operations-and-production/running-kafka-locally" questions={quizRunningLocally} />
 
 <ProgressTracker client:visible id="operations-and-production/running-kafka-locally" />

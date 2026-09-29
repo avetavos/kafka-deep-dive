@@ -1,6 +1,6 @@
 ---
 title: 'Running Kafka Locally'
-description: 'ยก Kafka 4.x cluster แบบ single-broker ในโหมด KRaft ด้วย Docker หรือ kafka-storage.sh แล้วสร้าง topic produce และ consume จาก CLI'
+description: 'compose แบบ single-node KRaft ที่ถูกต้อง พร้อมเหตุผลจริงว่าทำไมต้องตั้ง RF=1 ทั้งสามตัว (พิสูจน์ด้วย run ที่พังจริง), เทียบ apache/kafka กับ apache/kafka-native บนเครื่องนี้จริง, healthcheck ที่ใช้งานได้จริง, kafka-storage.sh format กับ cluster.id, และ data volume เทียบกับ ephemeral'
 sidebar:
   order: 1
 ---
@@ -8,127 +8,317 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-รัน Kafka 4.x บนเครื่องคือการสตาร์ท **broker ตัวเดียวในโหมด KRaft** ไม่มี ZooKeeper ไม่มี dependency ภายนอก แล้วคุยกับ broker ตัวนั้นทั้งหมดผ่าน `--bootstrap-server localhost:9092` เพื่อสร้าง topic, produce record และ consume กลับมา
+การรัน Kafka 4.x บนเครื่องคือการสตาร์ท **broker ตัวเดียวในโหมด KRaft** พร้อม **บังคับ replication-factor env var สามตัวเป็น `1`** เพื่อให้ internal coordinator topic ของตัวมันเองสร้างได้จริงบน broker เดียว — ตั้งผิดแม้ตัวเดียวใน 3 ตัว อาการที่ได้ไม่ใช่ error ที่ชัดเจน แต่คือ client ที่นั่งเฉย ๆ ไม่ตอบสนอง
 
-## ทางที่เร็วที่สุด: Docker container เดียว
-
-Image ทางการ `apache/kafka` มาพร้อม broker ที่รองรับ KRaft ซึ่ง format storage ให้ตัวเองและสตาร์ทเป็น broker รวมกับ controller คำสั่งเดียวได้ cluster ที่ใช้งานได้เลย
+## คำสั่งเดียวของ Docker และทำไม env var 3 ตัวถึงสำคัญกว่าที่คิด
 
 ```bash
-# Start a single-node Kafka 4.x broker in KRaft mode, port 9092 exposed
+# Start a single-node Kafka 4.x broker in KRaft mode
 docker run -d --name kafka -p 9092:9092 apache/kafka:4.3.1
 ```
 
-นั่นคือ cluster ทั้งหมด ไม่มีอะไรต้องติดตั้งเพิ่ม **ไม่มี process ZooKeeper** ใน Kafka 4.x container มี CLI script ติดมาให้ในตัว คุณจึงรันคำสั่ง admin ข้างในด้วย `docker exec` ได้ หรือจะติดตั้ง Kafka tarball บนเครื่องแล้วชี้ script ไปที่ `localhost:9092` ก็ได้
+คำสั่งเปล่านั้นทำงานได้โดยไม่ต้องตั้งค่าอะไรเลย เพราะ default ของ image เองตั้ง `offsets.topic.replication.factor`, `transaction.state.log.replication.factor`, และ `share.coordinator.state.topic.replication.factor` เป็น `1` ให้อยู่แล้วสำหรับ container แบบ combined single-node แต่ compose file ที่เริ่ม override `KAFKA_*` env var **ตัวอื่นใดก็ตาม** (probe ของคอร์สนี้เองก็ทำแบบนี้ เพื่อ publish listener ตัวที่สอง) จะสลับ `KafkaDockerWrapper` ของ image ไปเป็นโหมด generate config จาก env ทั้งหมด — และการสลับนั้นจะ**ไม่**เอา default ที่เป็นมิตรของ single-node กลับมาใช้ ตั้งแต่จุดนั้นคุณต้องตั้งเองทั้งสามตัว
 
-## ทางแบบ manual: format storage แล้วค่อยสตาร์ท
+```properties
+# config/running-kafka-locally/rf-one.properties
+# section: broker
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+share.coordinator.state.topic.replication.factor=1
+```
 
-ถ้าคุณรัน tarball ที่โหลดมาแทน Docker KRaft ต้องมีขั้นตอน **format storage** ครั้งเดียว คุณ generate cluster UUID แล้วเขียน UUID นั้นลง log directory ก่อนสตาร์ทครั้งแรก
+<Callout title="ทำไมต้องสามตัว ไม่ใช่ตัวเดียว">
+Kafka 4.x มี internal coordinator แยกกันสามตัว แต่ละตัวมี backing topic ของตัวเอง แต่ละตัว default `replication.factor=3`: `__consumer_offsets` (state ของ group แบบ classic/consumer-protocol), log ของ transaction coordinator, และ `__share_group_state` (KIP-932 share group) broker ตัวเดียวไม่มีทางสนอง `replication.factor=3` ได้เลย — `docker run` แบบไม่มี env var หลีกเลี่ยงปัญหานี้ด้วยการตั้งทั้งสามตัวเป็น `1` ให้คุณ; compose file ที่เพิ่ม `KAFKA_*` ตัวอื่นแม้ตัวเดียวต้องตั้งทั้งสามตัวนี้เอง
+</Callout>
+
+## พิสูจน์: ลืมตัวเดียว แล้วดูว่าเกิดอะไรขึ้นจริง
+
+เพื่อดู failure ที่แท้จริง บทนี้สตาร์ท broker ที่ตั้ง offsets กับ transaction RF env var เป็น `1` แต่ **`share.coordinator.state.topic.replication.factor` ปล่อยไว้ที่ default (3)** — ความผิดพลาดบรรทัดเดียวใน compose file ที่ดูเหมือนถูกต้องทุกอย่าง
+
+```text
+$ docker exec broker kafka-console-share-consumer.sh --bootstrap-server localhost:9092 \
+    --topic share-test --timeout-ms 10000
+[... รอ 10 วินาที ไม่มี output อะไรเลย ...]
+Processed a total of 0 messages
+```
+
+ไม่มีอะไรในนั้นดูเหมือน config error เลย — ไม่มี exception ไม่มี stack trace มีแค่ความเงียบจนกว่า timeout ของ client เองจะยอมแพ้ สาเหตุจริงอยู่ใน log ของ **broker** ไม่ใช่ของ client
+
+```text
+[...] INFO Sent auto-creation request for Set(__share_group_state) to the active controller. (kafka.server.DefaultAutoTopicCreationManager)
+[...] WARN Auto topic creation failed for __share_group_state with error 'INVALID_REPLICATION_FACTOR': Unable to replicate the partition 3 time(s): The target replication factor of 3 cannot be reached because only 1 broker(s) are registered or some brokers have all their log directories cordoned. (kafka.server.DefaultAutoTopicCreationManager)
+[... ซ้ำทุก ~2-4 วินาที จนกว่า client จะยอมแพ้ ...]
+```
+
+broker **retry** การ auto-create `__share_group_state` ที่ `replication.factor=3` กับ cluster ที่มี broker เดียวไปเรื่อย ๆ พังแบบเดิมทุกครั้ง ตลอดไป — share group ไม่มีทาง up ได้ ในขณะที่ client ไม่เห็น error อะไรเลย มีแค่การค้าง group แบบ classic/consumer-protocol **ธรรมดา** บน broker เดียวกันทำงานปกติสมบูรณ์ใน run เดียวกันนั้น เพราะ `__consumer_offsets` ถูกตั้งเป็น RF=1 อย่างถูกต้อง — นี่คือความล้มเหลวระดับ per-coordinator ไม่ใช่ทั้ง broker ซึ่งเป็นเหตุผลที่มันพลาดง่ายมากใน compose file ที่ "ส่วนใหญ่ทำงานได้"
+
+<Callout title="แก้ความเข้าใจผิดที่พบบ่อย">
+ชื่อ exception ตรง ๆ อย่าง `GroupCoordinatorNotAvailable` ไม่ปรากฏที่ไหนเลยใน transcript จริงนี้ สิ่งที่คุณได้จริงคือการค้างแบบเงียบ ๆ บวกกับ warning `INVALID_REPLICATION_FACTOR` ที่ซ้ำไปซ้ำมาฝังอยู่ใน log ของ **broker** — อาการที่ client เห็นคือ "ไม่มีอะไรเกิดขึ้น" ซึ่ง debug ยากกว่า exception ที่มีชื่อชัดเจนมาก
+</Callout>
+
+## `apache/kafka` เทียบกับ `apache/kafka-native` วัดจริง
+
+Apache ยังเผยแพร่ `apache/kafka-native` ซึ่งเป็น broker ตัวเดียวกันที่ compile ด้วย GraalVM สตาร์ทด้วย compose แบบ single-node KRaft เดียวกันเป๊ะบน Mac เครื่องนี้ วัดจาก `docker inspect .State.StartedAt` ถึง log line `Kafka Server started` ของ broker เอง
+
+```text
+apache/kafka:4.3.1         container start -> "Kafka Server started"  ~1.97s  (JVM: class loading + JIT warmup)
+apache/kafka-native:4.3.1  container start -> "Kafka Server started"  ~0.28s  (compile แบบ ahead-of-time ไม่ต้อง startup JVM)
+```
+
+เร็วกว่าประมาณ **7 เท่า** ในการ ready ครั้งแรกบนเครื่องนี้ — เป็นตัวเลขจริงจาก run เดียวในเครื่อง ไม่ใช่การ claim แบบ benchmark log line แรก ๆ ของ container เองอธิบายเหตุผล และมี caveat จริงมาด้วย
+
+```text
+WARNING: THIS IS AN EXPERIMENTAL DOCKER IMAGE RECOMMENDED FOR LOCAL TESTING AND DEVELOPMENT PURPOSES.
+[...] INFO Starting Kafka server in the native mode. (kafka.docker.KafkaDockerWrapper$)
+```
+
+caveat ที่ใหญ่กว่าและไม่มีเอกสารบอกจนกว่าจะลองเอง: `/opt/kafka/` ของ `apache/kafka-native` มีไฟล์เดียวเป๊ะ คือ binary ของ server ที่ compile แล้ว — ไม่มี `bin/kafka-topics.sh` ไม่มี `kafka-console-producer.sh` ไม่มี `kafka-consumer-groups.sh` ไม่มีอะไรเลย
+
+```text
+$ docker exec kafka-native-broker ls -la /opt/kafka/
+total 129484
+-rwxr-xr-x 1 appuser appuser 132565240 kafka.Kafka
+drwxrwxr-x 1 appuser appuser        config
+drwxr-xr-x 2 appuser appuser        logs
+```
+
+การพิสูจน์ผ่าน CLI ทุกอันในคอร์สนี้ (`kafka-topics.sh --describe`, `kafka-consumer-groups.sh`, `kafka-dump-log.sh`) ต้องใช้ script `bin/` ของ distribution แบบ JVM ซึ่ง `apache/kafka-native` ไม่มีติดมาเลย — คุณจะต้องรัน CLI จาก container `apache/kafka` แยกต่างหาก, ติดตั้งบน host, หรือใช้ client library แทน `apache/kafka-native` มีแค่ broker process เท่านั้น
+
+<Mermaid title="apache/kafka เทียบกับ apache/kafka-native แต่ละตัวมีอะไรบ้าง" code={imageDiagram} />
+
+export const imageDiagram = `flowchart LR
+  subgraph jvm["apache/kafka (JVM)"]
+    j1["kafka.Kafka (JVM)"] --- j2["bin/*.sh CLI tools"]
+  end
+  subgraph native["apache/kafka-native (GraalVM)"]
+    n1["kafka.Kafka (native binary)"]
+  end
+  jvm -->|"~1.97s to ready (this Mac)"| ready1["broker ready"]
+  native -->|"~0.28s to ready (this Mac)"| ready2["broker ready, no CLI tools included"]`;
+
+## Listener: `PLAINTEXT`, `PLAINTEXT_HOST`, `CONTROLLER`
+
+probe compose ของคอร์สนี้เอง (และ scratch compose ของบทนี้) ประกาศ listener สามตัว แต่ละตัวมีหน้าที่ต่างกัน — `PLAINTEXT` สำหรับ client ที่อยู่ใน Docker network เดียวกันอยู่แล้ว, `PLAINTEXT_HOST` publish ออกสู่ host สำหรับ client ที่รันนอก container, และ `CONTROLLER` สำหรับ traffic quorum ของ KRaft เองระหว่าง broker/controller role ซึ่ง client ทั่วไปไม่เคยต่อเข้าไปเลย
+
+```properties
+# config/running-kafka-locally/listeners.properties
+# section: broker
+listeners=PLAINTEXT://:9092,PLAINTEXT_HOST://:39092,CONTROLLER://:39093
+advertised.listeners=PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:39092
+controller.listener.names=CONTROLLER
+```
+
+`listeners` คือที่ broker **bind**; `advertised.listeners` คือ address ที่มันส่งกลับให้ client ใน metadata response สำหรับทุก connection **หลังจาก** ตัวแรก — และถ้าตั้งค่าตัวที่สองผิด จะได้ `getaddrinfo ENOTFOUND` จริงจาก bootstrap connection ที่เชื่อมต่อได้ปกติ ซึ่งพิสูจน์ครบวงจรไว้แล้วใน [Brokers, Topics & Partitions](/kafka/th/foundations/brokers-topics-partitions/) — จะไม่พูดซ้ำที่นี่
+
+<Callout title="CONTROLLER ไม่ใช่ listener สำหรับ client">
+สังเกตว่า `CONTROLLER` ไม่มี entry คู่กันใน `advertised.listeners` ด้านบน — และตั้งใจให้เป็นแบบนั้น client ทั่วไปไม่ว่าจะเป็น producer/consumer/admin ไม่เคย dial controller listener โดยตรง มีแค่ broker process ที่ทำหน้าที่ controller เท่านั้นที่ใช้มัน ผ่าน `controller.quorum.voters` การชี้ client ไปที่ port ของ controller จะได้ connection ที่ไม่มีวัน handshake ของ Kafka แบบปกติสำเร็จ
+</Callout>
+
+## healthcheck ที่ใช้งานได้จริง
+
+healthcheck ที่ดูเหมือนตรงไปตรงมาคือการรัน tool ตัวเดียวกับที่ broker เองมีติดมา
 
 ```bash
-# 1. Generate a unique cluster ID
+# scripts/running-kafka-locally/healthcheck.sh
+/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" | head -1
+```
+
+ดูสมบูรณ์และมักจะเป็นแบบนั้นจริง — จนกว่า compose file จะเปิด JMX สำหรับ metrics ด้วย ([บทถัดไป](/kafka/th/operations-and-production/monitoring-and-consumer-lag/) ทำแบบนี้เป๊ะ) scratch compose ของบทนี้เองตั้ง `JMX_PORT`/`KAFKA_JMX_OPTS` เป็น env var ระดับ container และใช้คำสั่งด้านบนตรง ๆ เป็น Docker `healthcheck:` ทุก run พังหมด
+
+```text
+$ docker exec broker kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+Error: JMX connector server communication error: service:jmx:rmi://<container-id>:39094
+jdk.internal.agent.AgentConfigurationError: java.rmi.server.ExportException: Port already in use: 39094; nested exception is:
+	java.net.BindException: Address in use
+[...]
+```
+
+`kafka-broker-api-versions.sh` สตาร์ท JVM สั้น ๆ ของตัวเองเพื่อรัน admin call — และ JVM นั้น inherit `KAFKA_JMX_OPTS` เดียวกันที่ container ตั้งไว้สำหรับ broker เอง เลยพยายาม bind JMX port **เดียวกัน** กับที่ broker process ที่รันอยู่ถืออยู่แล้ว `docker inspect` health log เองแสดงผลลัพธ์จริง: `FailingStreak` ไต่ขึ้นทุก retry 5 วินาที container ค้างที่ `health: starting` ตลอดไป วิธีแก้คือถอด env var สองตัวนั้นออกสำหรับ process ของ healthcheck เอง ไม่ใช่สำหรับ broker
+
+```bash
+# scripts/running-kafka-locally/healthcheck-fixed.sh
+env -u JMX_PORT -u KAFKA_JMX_OPTS /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" | head -1
+```
+
+```text
+localhost:9092 (id: 1 rack: null isFenced: false) -> (
+```
+
+เอาไปใส่เป็น compose `healthcheck.test` ใหม่ container เดียวกันเข้าสถานะ `healthy` ในการเช็กครั้งถัดไปทันที
+
+## `kafka-storage.sh format` กับ `cluster.id`
+
+image ของ Docker auto-format storage ตอนสตาร์ทครั้งแรก แต่ไม่ได้ generate UUID ใหม่ให้เว้นแต่คุณจะบอกมัน — script `configureDefaults` ของมันเองฝัง UUID ไว้แล้ว
+
+```text
+$ docker run --rm --entrypoint sh apache/kafka:4.3.1 -c \
+    'grep -n CLUSTER_ID /etc/kafka/docker/configureDefaults'
+# Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid"
+  ["CLUSTER_ID"]="5L6g3nShT-eMCtK--X86sw"
+```
+
+ยืนยันกับ container อิสระสองตัว (`apache/kafka:4.3.1` กับ `apache/kafka-native:4.3.1`) ที่สตาร์ทโดยไม่ตั้ง `CLUSTER_ID` เลย — ทั้งคู่ format ด้วย `cluster.id=5L6g3nShT-eMCtK--X86sw` **ตัวเดียวกันเป๊ะ** ใน `meta.properties` ของตัวเอง ไม่มีปัญหาสำหรับ broker เดี่ยวที่ใช้แล้วทิ้ง แต่เป็นปัญหาจริงถ้าคุณเขียนสคริปต์ทำ multi-broker KRaft cluster แล้วคิดว่าแต่ละ container จะได้ ID สุ่มของตัวเอง — มันจะไม่ได้ เว้นแต่คุณจะ generate แล้วส่งเข้าไปเอง
+
+```bash
+# scripts/running-kafka-locally/random-uuid.sh
+/opt/kafka/bin/kafka-storage.sh random-uuid
+```
+
+```text
+EwfKmPniREOD__fBjwaROQ
+```
+
+เรียกสองครั้ง ได้ค่าต่างกันสองค่า — พิสูจน์ว่า `random-uuid` สุ่มจริง ต่างจาก default ที่เงียบ ๆ ของ container เอง ลำดับการ bootstrap แบบ manual (ไม่ใช้ Docker) ใช้ค่านี้เป๊ะ
+
+```text
 KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
-
-# 2. Format the log directory for KRaft using that ID and the KRaft config
-bin/kafka-storage.sh format --standalone \
-  -t "$KAFKA_CLUSTER_ID" \
-  -c config/server.properties
-
-# 3. Start the broker (it is also the controller in a single-node setup)
+bin/kafka-storage.sh format --standalone -t "$KAFKA_CLUSTER_ID" -c config/server.properties
 bin/kafka-server-start.sh config/server.properties
 ```
 
-คู่ `random-uuid` กับ `format` คือพิธี bootstrap ของ KRaft ใช้แทนการ handshake กับ ZooKeeper แบบเดิม ทำแค่ครั้งเดียวต่อ data directory หนึ่งอัน
+## data volume เทียบกับ ephemeral — default คือ ephemeral
 
-<Mermaid title="workflow KRaft บนเครื่อง: format, สตาร์ท แล้ว produce และ consume" code={localFlow} />
+image ประกาศ named volume ที่ `/var/lib/kafka/data` ซึ่งดูเหมือนเป็นที่ข้อมูลของคุณอยู่ มันไม่ใช่ เว้นแต่คุณจะตั้ง `KAFKA_LOG_DIRS` ให้ชี้ไปที่นั่นด้วย ถ้าไม่ override อะไร `log.dirs` จริงที่ broker ใช้คือ default ในตัวของ Kafka เอง
 
-export const localFlow = `flowchart LR
-  fmt["kafka-storage.sh format (KRaft)"] --> start["kafka-server-start.sh (broker + controller)"]
-  start --> topic["kafka-topics.sh --create"]
-  topic --> prod["kafka-console-producer.sh"]
-  topic --> cons["kafka-console-consumer.sh"]
-  prod -->|"records"| cons`;
+```text
+$ docker exec broker cat /tmp/kafka-logs/meta.properties
+cluster.id=5L6g3nShT-eMCtK--X86sw
+directory.id=O4H39-bgwrYSQm9VydOgxg
+node.id=1
+version=1
 
-## สร้าง topic, produce, consume
-
-พอ broker ขึ้นแล้ว ทุกคำสั่งเล็งไปที่ `--bootstrap-server` flag `--zookeeper` ไม่มีอยู่แล้ว สร้าง topic ก่อน
-
-```bash
-# Create a topic named "demo" with 1 partition (fine for local)
-kafka-topics.sh --bootstrap-server localhost:9092 \
-  --create --topic demo --partitions 1 --replication-factor 1
+$ docker inspect broker --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}'
+/etc/kafka/secrets
+/mnt/shared/config
+/var/lib/kafka/data
 ```
 
-จากนั้นเปิด producer ใน terminal หนึ่งแล้วพิมพ์ข้อความ บรรทัดละหนึ่ง record
+`/tmp/kafka-logs` — ที่ข้อมูลจริงอยู่ — **ไม่อยู่** ใน mount list นั้น `/var/lib/kafka/data` **เป็น** volume จริง แต่ไม่มีอะไรเขียนลงไปเลย `docker compose down -v` หรือแค่ `docker rm` โดยไม่มี `-v` ก็ทำให้ทุก topic ทุก offset ทุกอย่างหายหมด — โดย default บน official image โดยไม่มีคำเตือนใด ๆ สำหรับอะไรที่มากกว่าการทดสอบแบบใช้แล้วทิ้งในเครื่อง ให้ตั้ง `KAFKA_LOG_DIRS=/var/lib/kafka/data` ตรง ๆ (หรือ bind-mount path ของคุณเอง) เพื่อให้ volume ที่ประกาศไว้เป็นตัวที่ถูกใช้งานจริง
 
-```bash
-# Produce: each line you type becomes a record
-kafka-console-producer.sh --bootstrap-server localhost:9092 --topic demo
-```
+<Mermaid title="ข้อมูลของ container ใหม่อยู่ที่ไหนจริง ๆ โดย default" code={volumeDiagram} />
 
-และ consumer ใน terminal อีกอันเพื่ออ่านกลับตั้งแต่ต้น
+export const volumeDiagram = `flowchart TD
+  start["docker run apache/kafka (no KAFKA_LOG_DIRS)"] --> logdirs["effective log.dirs = /tmp/kafka-logs (Kafka's own default)"]
+  logdirs --> notmounted["NOT one of the container's mounted volumes"]
+  declared["Image declares a volume at /var/lib/kafka/data"] --> unused["...but nothing writes there unless you set KAFKA_LOG_DIRS yourself"]
+  notmounted --> gone["docker compose down -v (or plain rm) -> all data lost"]`;
 
-```bash
-# Consume: --from-beginning replays every record in the topic
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic demo --from-beginning
-```
-
-<Callout title="อย่าพิมพ์ --zookeeper">
-ถ้าคำสั่งหรือ tutorial บอกให้ใส่ `--zookeeper localhost:2181` แสดงว่าเก่ากว่า Kafka 4.x ใน Kafka แบบ KRaft-only flag นี้ **หายไปแล้ว** CLI tool ทุกตัว ทั้ง `kafka-topics.sh`, `kafka-console-producer.sh`, `kafka-consumer-groups.sh` ใช้ **`--bootstrap-server`** อย่างเดียวสำหรับระบุ address ของ cluster
+<Callout title="สรุปในหนึ่งบรรทัด">
+คำสั่งเปล่า `docker run apache/kafka:4.3.1` ทำงานได้เพราะ default ในตัวมันตั้งค่า replication factor ของ coordinator ทั้ง**สาม**เป็น `1` อยู่แล้ว — ทันทีที่ compose file เพิ่ม `KAFKA_*` env var ตัวอื่น คุณต้องคืนค่าทั้งสามตัวเอง และลืมตัวเดียว (พิสูจน์ด้านบนด้วย `share.coordinator.state.topic.replication.factor`) จะได้ client ค้างแบบเงียบ ๆ บวก warning `INVALID_REPLICATION_FACTOR` ที่ซ้ำในบล็อก ไม่ใช่ exception ที่มีชื่อ `apache/kafka-native` สตาร์ทเร็วกว่าประมาณ 7 เท่าบน Mac เครื่องนี้ แต่ไม่มี CLI tool ติดมาเลย healthcheck ที่ใช้ `kafka-broker-api-versions.sh` ซ้ำจะพังทันทีที่เปิด JMX ด้วย เว้นแต่จะถอด `JMX_PORT`/`KAFKA_JMX_OPTS` สำหรับ call นั้นตัวเดียว container ใหม่ทุกตัวได้ `cluster.id` **เดิม** เหมือนกันหมด เว้นแต่จะส่งค่าจริงจาก `kafka-storage.sh random-uuid` เข้าไป และโดย default ข้อมูลของคุณอยู่ที่ `/tmp/kafka-logs` ซึ่ง ephemeral จริง ไม่ใช่ volume ที่ image ประกาศไว้
 </Callout>
 
-<Callout title="สรุปหนึ่งบรรทัด">
-Kafka 4.x บนเครื่องคือ **broker KRaft ตัวเดียว** ที่ **ไม่มี ZooKeeper** รัน `apache/kafka` บน **Docker** เพื่อสตาร์ทคำสั่งเดียว หรือ format log directory ด้วย **`kafka-storage.sh format`** แล้วสตาร์ทด้วย **`kafka-server-start.sh`** จากนั้นสร้าง produce และ consume ผ่าน **`kafka-topics.sh`**, **`kafka-console-producer.sh`** และ **`kafka-console-consumer.sh`** โดยใช้ **`--bootstrap-server localhost:9092`** เสมอ
-</Callout>
+## อ่านโค้ดที่ AI เขียน
 
-export const quizLocal = [
+<SpotTheBug lang="yaml" code={`services:
+  broker:
+    image: apache/kafka:4.3.1
+    environment:
+      JMX_PORT: '9999'
+      KAFKA_JMX_OPTS: >-
+        -Dcom.sun.management.jmxremote
+        -Dcom.sun.management.jmxremote.rmi.port=9999
+    healthcheck:
+      # AI comment: "Reuse the broker's own CLI tool to verify it's alive"
+      test: ['CMD-SHELL', '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092']
+      interval: 5s
+      retries: 24
+`}>
+
+นี่คือ compose fragment ที่ดูสมเหตุสมผลและพบเห็นบ่อย — เปิด JMX สำหรับ metrics แล้ว healthcheck ด้วย admin CLI ของ broker เอง ซึ่งพิสูจน์ได้จริงว่า broker ตอบ request จริง ๆ bug ที่พิสูจน์ไว้ด้านบนกับ combination เป๊ะนี้: `kafka-broker-api-versions.sh` สตาร์ท JVM ของตัวเอง ซึ่ง inherit `KAFKA_JMX_OPTS` จาก container environment แล้วพยายาม bind port `9999` — port เดียวกับที่ broker process ที่รันอยู่ถืออยู่แล้ว healthcheck ทุกครั้ง exit ไม่เป็นศูนย์ด้วย `ExportException: Port already in use` จริง และ container ค้างที่ `health: starting` (แล้วเป็น `unhealthy`) ตลอดไป ทั้งที่ broker เองทำงานปกติสมบูรณ์และให้บริการ traffic จริง วิธีแก้คือใส่ `env -u JMX_PORT -u KAFKA_JMX_OPTS` นำหน้าคำสั่ง healthcheck โดยเฉพาะ — เปิด JMX ให้ broker แต่ไม่ใช่ให้ทุก short-lived CLI process ที่ container ดันรันด้วย
+
+</SpotTheBug>
+
+## Mental Model
+
+container `apache/kafka` ใหม่แท้จริงแล้วคือสองสิ่งอิสระที่ซ้อนกันอยู่: **พิธีกรรม bootstrap** (format log directory ครั้งเดียว พร้อม cluster ID ก่อนที่อะไรจะสตาร์ทได้ — พิสูจน์ด้านบน image ทำสิ่งนี้ให้คุณด้วย ID default ที่ตายตัวเว้นแต่จะ override) และ **พื้นผิว config runtime** (`KAFKA_*` env var ทุกตัวที่คุณเพิ่ม) คำสั่งเปล่า `docker run` ทำงานได้เพราะบังเอิญมี default ที่ดีบนชั้นที่สอง ไม่ใช่เพราะชั้นแรกเป็น optional — ทันทีที่คุณแตะพื้นผิว config runtime คุณรับผิดชอบส่วนที่ default เคยครอบคลุมเงียบ ๆ รวมถึง replication factor ของ coordinator ทั้งสามตัว
+
+## Trade-offs
+
+- **`apache/kafka` (JVM) เทียบกับ `apache/kafka-native` (GraalVM)** — native สตาร์ทเร็วกว่าประมาณ 7 เท่าบนเครื่องนี้ (พิสูจน์ด้านบน) และมี memory footprint เล็กกว่าตามแบบฉบับ binary ที่ compile แบบ AOT แลกกับ **ไม่มี CLI tool ติดมาเลย** และคำเตือน "experimental, for local dev" ตรง ๆ จาก image เอง ใช้ JVM สำหรับอะไรก็ตามที่ต้อง inspect ด้วย `kafka-*.sh`; native น่าสนใจเฉพาะตอนที่ startup latency สำคัญกว่า tooling ใน container (เช่น broker ชั่วคราวสำหรับ test ระดับ app ใน CI รันคู่กับ container tool ที่เป็น JVM)
+- **Storage ที่ auto-format ด้วย cluster ID default เทียบกับสร้างเอง** — default สะดวกจริงสำหรับ broker เดี่ยวที่ใช้แล้วทิ้ง และผิดจริงทันทีที่คุณเขียนสคริปต์มากกว่าหนึ่ง container ที่คาดหวัง identity อิสระของตัวเอง
+- **Storage แบบ ephemeral ใน `/tmp` เทียบกับ `log.dirs` ที่ bind-mount/volume จริง** — ephemeral ถูกต้องเป๊ะสำหรับ probe ของคอร์สนี้เอง (ใช้แล้วทิ้งต่อบท) และผิดเป๊ะสำหรับอะไรก็ตามที่คุณอยากให้รอดจาก restart image ไม่ได้บังคับให้คุณเลือกถูก default ของมันเลือก ephemeral ให้เงียบ ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`docker run apache/kafka` เปล่า ๆ กับ compose file ของฉันที่มี env var เพิ่มเติมทำงานเหมือนกันข้างใต้"** ไม่ — พิสูจน์ด้านบน: การเพิ่ม `KAFKA_*` env var ที่ไม่เกี่ยวกันแม้ตัวเดียว (เช่น เพื่อ publish listener ตัวที่สอง) สลับ wrapper ไปโหมด env-driven เต็มรูปแบบ ซึ่งไม่เอา default RF=1 ที่เป็นมิตรของคำสั่งเปล่ากลับมาใช้
+- **"การลืม replication factor ของ coordinator ตัวใดตัวหนึ่งจะได้ config error ตอน startup"** ไม่ — พิสูจน์ด้านบน: broker สตาร์ทได้ปกติดี; failure จะโผล่มาตอนที่ client พยายามใช้ coordinator ตัวนั้นจริง ๆ เท่านั้น (ในที่นี้คือ share group) เป็นการค้างแบบเงียบ ๆ บวก warning `INVALID_REPLICATION_FACTOR` ที่ซ้ำใน log ของ broker เอง ไม่ใช่ของ client
+- **"`apache/kafka-native` เป็นแค่ตัวแทนที่เร็วกว่าของ `apache/kafka`"** ไม่ — พิสูจน์ด้านบน: มันมีแค่ binary ของ broker เท่านั้น ไม่มี CLI tool `bin/*.sh` เลย การพิสูจน์ที่ใช้ CLI ทุกอันในคอร์สนี้ต้องใช้ image แบบ JVM หรือ client จากภายนอก
+- **"volume `/var/lib/kafka/data` ที่ image ประกาศไว้แปลว่าข้อมูลของฉันถูก persist อัตโนมัติ"** ไม่ — พิสูจน์ด้านบน: volume มีอยู่จริง แต่ `log.dirs` default จริงของ broker (`/tmp/kafka-logs`) ไม่ใช่ volume นั้น ไม่มีอะไรถูกเขียนลงไปเลยเว้นแต่คุณจะตั้ง `KAFKA_LOG_DIRS` เอง
+
+export const quizRunningLocally = [
   {
-    q: 'ต้องติดตั้งอะไรเพิ่มคู่กับ Kafka 4.x เพื่อรันบนเครื่อง',
+    q: 'ทำไม `docker run -d apache/kafka:4.3.1` เปล่า ๆ ไม่ต้องตั้งค่าเพิ่มถึงทำงานได้บน broker เดียว?',
     options: [
-      'ZooKeeper และสตาร์ท ZooKeeper ก่อน broker',
-      'ไม่ต้องเพิ่มอะไร Kafka 4.x เป็น KRaft-only ไม่ต้องใช้ ZooKeeper',
-      'ฐานข้อมูล relational สำหรับเก็บ metadata',
-      'controller cluster แยกบนอีกเครื่อง',
+      'Kafka 4.x ไม่มีแนวคิด replication factor เลย',
+      'default ในตัวของ image เองตั้ง replication factor ของ coordinator ทั้งสาม (offsets, transaction, share) เป็น 1 ให้อยู่แล้วสำหรับ container แบบ combined single-node',
+      'ZooKeeper จัดการ replication ให้อัตโนมัติ',
+      'replication factor สำคัญเฉพาะตอนมีมากกว่า 10 partition',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบน: ทันทีที่ compose file เพิ่ม KAFKA_* env var ตัวอื่น wrapper จะสลับไปโหมด env-driven config เต็มรูปแบบ และ default RF ทั้งสามต้องตั้งเองใหม่',
   },
   {
-    q: 'จุดประสงค์ของ `kafka-storage.sh format` ในขั้นตอนสตาร์ทแบบ manual คืออะไร',
+    q: 'พิสูจน์ด้านบน เกิดอะไรขึ้นจริงตอน share.coordinator.state.topic.replication.factor ถูกปล่อยไว้ที่ default (3) บน broker เดียว?',
     options: [
-      'ลบ topic ทั้งหมดก่อน restart ทุกครั้ง',
-      'ทำการ format storage ของ KRaft ครั้งเดียว เขียน cluster ID ลง log directory ก่อนสตาร์ทครั้งแรก',
-      'เชื่อม broker เข้ากับ ZooKeeper',
-      'format partition table ของดิสก์บน host',
+      'broker ปฏิเสธการสตาร์ท พร้อม config error ที่ชัดเจน',
+      'share-group consumer ค้างแบบเงียบ ๆ จนกว่า timeout ของตัวเอง ในขณะที่ broker log ซ้ำ warning INVALID_REPLICATION_FACTOR จริงตอนพยายาม auto-create __share_group_state',
+      'consumer group แบบ classic ก็หยุดทำงานด้วย',
+      'broker ลด replication factor ลงเป็น 1 ให้อัตโนมัติ',
     ],
     answer: 1,
+    explain: 'transcript จริง: "Processed a total of 0 messages" ฝั่ง client โดย broker log ซ้ำ "Unable to replicate the partition 3 time(s)... only 1 broker(s) are registered" — เป็น failure ระดับ per-coordinator ไม่ใช่ทั้ง broker; consumer group ธรรมดาทำงานปกติใน run เดียวกัน',
   },
   {
-    q: 'CLI tool ของ Kafka 4.x ใช้ flag ไหนระบุ address ของ cluster',
+    q: 'การเทียบวัดจริงบน Mac เครื่องนี้ระหว่าง apache/kafka กับ apache/kafka-native แสดงอะไร?',
     options: [
-      '`--zookeeper localhost:2181`',
-      '`--bootstrap-server localhost:9092`',
-      '`--controller localhost:9093`',
-      '`--metadata-url localhost:8080`',
+      'สตาร์ทเวลาเท่ากันเป๊ะ',
+      'apache/kafka-native สตาร์ทเร็วกว่าประมาณ 7 เท่า (~0.28s เทียบ ~1.97s ถึง "Kafka Server started") แต่ไม่มี CLI tool bin/*.sh เลย มีแค่ binary ของ server ที่ compile แล้ว',
+      'apache/kafka-native ช้ากว่าเพราะ overhead ของการ compile แบบ AOT',
+      'apache/kafka-native มี CLI tool เพิ่มเติมที่ apache/kafka ไม่มี',
     ],
     answer: 1,
+    explain: 'docker exec ls -la /opt/kafka/ จริงบน native image แสดงไฟล์เดียวเป๊ะ (native binary kafka.Kafka) — ไม่มี kafka-topics.sh ไม่มี kafka-consumer-groups.sh ไม่มีอะไรเลย',
   },
   {
-    q: 'จะ replay ทุก record ที่มีอยู่แล้วใน topic ด้วย console consumer ยังไง',
+    q: 'พิสูจน์ด้านบน ทำไม Docker healthcheck ที่รัน kafka-broker-api-versions.sh ถึงพังบน broker ที่ตั้ง KAFKA_JMX_OPTS ไว้ด้วย?',
     options: [
-      'ใส่ `--from-beginning`',
-      'ใส่ `--replay-all`',
-      'restart broker',
-      'อ่าน record เก่าด้วย console consumer ไม่ได้',
+      'bootstrap server address ผิด',
+      'kafka-broker-api-versions.sh สตาร์ท JVM สั้น ๆ ของตัวเอง ซึ่ง inherit KAFKA_JMX_OPTS ด้วย แล้วพยายาม bind JMX port เดียวกับที่ broker process ที่รันอยู่ถืออยู่แล้ว ทำให้เกิด ExportException: Port already in use จริง',
+      'broker หยุดทำงานจริง',
+      'healthcheck รัน CLI tool ใน container เดียวกันไม่ได้',
     ],
-    answer: 0,
+    answer: 1,
+    explain: 'docker inspect health log จริงแสดง FailingStreak ไต่ขึ้นทุก retry พร้อมข้อความ ExportException เป๊ะ; env -u JMX_PORT -u KAFKA_JMX_OPTS นำหน้าคำสั่งเดียวกันแก้ได้ ยืนยันด้วย container เข้าสถานะ healthy ในการเช็กถัดไป',
+  },
+  {
+    q: 'พิสูจน์ด้านบน container apache/kafka:4.3.1 ใหม่ที่ไม่ตั้ง CLUSTER_ID เลยได้ cluster.id อะไร และทำไมมันถึงสำคัญ?',
+    options: [
+      'UUID สุ่มใหม่ทุกครั้ง เลยไม่สำคัญเลย',
+      'default ที่ฝังไว้เดิม ๆ (5L6g3nShT-eMCtK--X86sw ยืนยันใน /etc/kafka/docker/configureDefaults) ทุกครั้งเป๊ะ — ไม่มีปัญหาสำหรับ broker เดี่ยวที่ใช้แล้วทิ้ง แต่เป็น bug จริงถ้าเขียนสคริปต์หลาย container โดยคิดว่าแต่ละตัวจะได้ identity อิสระของตัวเอง',
+      'Kafka ปฏิเสธการสตาร์ทถ้าไม่มี CLUSTER_ID ชัดเจน',
+      'cluster.id ถูกสุ่มแต่ cache ไว้ใน image layer',
+    ],
+    answer: 1,
+    explain: 'ยืนยันกับ container อิสระสองตัว (image แบบ JVM และ native) — ทั้งคู่ format ด้วย cluster.id เดียวกันเป๊ะโดยไม่ตั้ง CLUSTER_ID เลย; kafka-storage.sh random-uuid เรียกสองครั้งได้ค่าจริงสองค่าที่ต่างกัน พิสูจน์ว่า default ของ container ต่างหากที่เป็นตัวตายตัว ไม่ใช่ tool',
+  },
+  {
+    q: 'โดย default container apache/kafka เก็บ log segment ไว้ที่ไหนจริง ๆ และมันถูก persist หรือไม่?',
+    options: [
+      'ใน volume /var/lib/kafka/data ที่ประกาศไว้ persist ข้าม restart',
+      'ใน /tmp/kafka-logs ซึ่งไม่ใช่ mount ของ container เลย — ephemeral จริง เว้นแต่จะตั้ง KAFKA_LOG_DIRS ชัดเจน',
+      'bind mount ไปที่ host อัตโนมัติ',
+      'Kafka ปฏิเสธการรันถ้าไม่มี log.dirs ชัดเจน',
+    ],
+    answer: 1,
+    explain: "docker inspect --format '{{range .Mounts}}' จริงแสดงแค่ /etc/kafka/secrets, /mnt/shared/config, และ /var/lib/kafka/data — /tmp/kafka-logs ที่ meta.properties กับ segment จริงอยู่ ไม่อยู่ในนั้นเลย",
   },
 ];
 
-<Quiz client:visible id="operations-and-production/running-kafka-locally" questions={quizLocal} />
+<Quiz client:visible id="operations-and-production/running-kafka-locally" questions={quizRunningLocally} />
 
 <ProgressTracker client:visible id="operations-and-production/running-kafka-locally" />
