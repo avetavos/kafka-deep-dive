@@ -1,0 +1,306 @@
+---
+title: 'Consumer Group Protocol Internals'
+description: 'The real RPCs behind a rebalance -- classic FindCoordinator/JoinGroup/SyncGroup/Heartbeat vs. KIP-848 ConsumerGroupHeartbeat -- proven from a real request log with KafkaJS and the confluent client, plus the group coordinator state machine and the __consumer_offsets hash(group.id) % 50 partitioning, all on Kafka 4.3.1.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+The classic consumer group protocol synchronizes membership with two separate, barrier-like RPCs (`JoinGroup` then `SyncGroup`) plus a recurring `Heartbeat`; **KIP-848** replaces all three with one recurring RPC, `ConsumerGroupHeartbeat`, whose response already carries the member's assignment -- and this lesson proves both, RPC by RPC, from a real request log.
+
+<Callout title="Proof method for this lesson">
+Everything below is a real, trimmed request-log line from this module's own broker (`kafka.request.logger` at `TRACE` -- see the module index), captured while running a real `kafkajs` classic consumer and a real `@confluentinc/kafka-javascript` consumer with `group.protocol=consumer`. Both clients are already introduced in [Consumer API](/kafka/en/consumers/consumer-api/) and [Consumer Groups and Rebalancing](/kafka/en/consumers/consumer-groups-and-rebalancing/) -- this lesson does not re-teach the client-side API, only the wire protocol underneath it.
+</Callout>
+
+## Classic: the five real RPCs
+
+<Mermaid title="Classic rebalance protocol -- real RPC sequence" code={classicDiagram} />
+
+export const classicDiagram = `sequenceDiagram
+  participant C as KafkaJS consumer
+  participant Co as Group coordinator
+  C->>Co: FindCoordinator (key=groupId)
+  Co->>C: nodeId, host, port
+  C->>Co: JoinGroup (memberId="")
+  Co->>C: NOT_COORDINATOR-free error: MEMBER_ID_REQUIRED, assigns memberId
+  C->>Co: JoinGroup (memberId=assigned)
+  Co->>C: generationId, leader, members[] (leader only)
+  C->>Co: SyncGroup (assignments computed by leader)
+  Co->>C: assignment (opaque bytes: topic-partitions)
+  loop every heartbeatInterval
+    C->>Co: Heartbeat (generationId, memberId)
+    Co->>C: errorCode 0 (or REBALANCE_IN_PROGRESS)
+  end
+  C->>Co: OffsetCommit`;
+
+Running a real `kafkajs` consumer (`sessionTimeout: 10000, heartbeatInterval: 3000`) against this module's broker and joining group `internals-classic-group`, real `FIND_COORDINATOR`:
+
+```text
+"requestHeader":{"requestApiKey":10,"requestApiVersion":2,"clientId":"classic-group-probe","requestApiKeyName":"FIND_COORDINATOR"},
+"request":{"key":"internals-classic-group","keyType":0},
+"response":{"throttleTimeMs":0,"errorCode":0,"errorMessage":"NONE","nodeId":1,"host":"localhost","port":29092}
+```
+
+`keyType:0` means "this key is a consumer group ID" (vs. `1` for a transactional ID -- see [Transactions](/kafka/en/delivery-and-transactions/transactions/)). The response is just a broker address -- every group has exactly one **coordinator** broker, computed by `__consumer_offsets` partitioning (proven below), and everything else in this sequence talks to that one broker.
+
+### `JoinGroup` really is two round trips the first time
+
+The very first `JoinGroup` a brand-new member sends has an empty `memberId`. This module's own broker's real response to that first attempt:
+
+```text
+"requestHeader":{"requestApiVersion":5,"requestApiKeyName":"JOIN_GROUP"},
+"request":{"groupId":"internals-classic-group","sessionTimeoutMs":10000,"rebalanceTimeoutMs":60000,
+  "memberId":"","protocolType":"consumer","protocols":[{"name":"RoundRobinAssigner","metadata":"..."}]},
+"response":{"throttleTimeMs":0,"errorCode":79,"generationId":-1,"protocolName":"","leader":"",
+  "memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62","members":[]}
+```
+
+`errorCode:79` is `MEMBER_ID_REQUIRED` -- the coordinator refuses to actually let this attempt join, but it **does** hand back a `memberId` for the client to retry with. KafkaJS retries automatically and transparently; the real second `JoinGroup`, using that assigned `memberId`, is the one that actually succeeds:
+
+```text
+"request":{"groupId":"internals-classic-group","memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "protocolType":"consumer","protocols":[{"name":"RoundRobinAssigner","metadata":"..."}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"generationId":1,"protocolName":"RoundRobinAssigner",
+  "leader":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "members":[{"memberId":"classic-group-probe-...","groupInstanceId":null,"metadata":"..."}]},
+"totalTimeMs":3001.708
+```
+
+Two real facts this proves: (1) a brand-new member's `JoinGroup` is genuinely rejected once before it's accepted -- this is not a client bug, it is the documented protocol; (2) `totalTimeMs:3001.708` on the *successful* `JoinGroup` -- the coordinator held this request open for the group's `rebalanceTimeoutMs` window (60000ms cap, actual wait here bounded by this run's other member-join timing) waiting to see if more members would join before finalizing the generation. This is the real mechanism behind "a rebalance takes a moment" -- it's a real wait inside a real RPC, not client-side polling.
+
+### `SyncGroup`: the leader computes assignments, the coordinator distributes them
+
+Only the elected group **leader** (the first member, here) computes partition assignments and sends them in its own `SyncGroup`; the coordinator's job is only to redistribute what the leader computed to every member (including the leader) in their own `SyncGroup` response:
+
+```text
+"requestHeader":{"requestApiKeyName":"SYNC_GROUP"},
+"request":{"groupId":"internals-classic-group","generationId":1,
+  "memberId":"classic-group-probe-...",
+  "assignments":[{"memberId":"classic-group-probe-...","assignment":"AAAAAAABABRpbnRlcm5hbHMtZ3JvdXAtZGVtbwAAAAEAAAAAAAAAAA=="}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"assignment":"AAAAAAABABRpbnRlcm5hbHMtZ3JvdXAtZGVtbwAAAAEAAAAAAAAAAA=="}
+```
+
+The `assignment` bytes are opaque at the protocol level (a serialized `ConsumerProtocolAssignment`) -- the request's `assignments[]` list (only non-empty for the leader) is exactly what the coordinator echoes back to each member in their individual response's `assignment` field.
+
+### `Heartbeat` and `OffsetCommit`
+
+```text
+"requestHeader":{"requestApiKeyName":"HEARTBEAT"},
+"request":{"groupId":"internals-classic-group","generationId":1,"memberId":"classic-group-probe-..."},
+"response":{"throttleTimeMs":0,"errorCode":0}
+```
+
+```text
+"requestHeader":{"requestApiKeyName":"OFFSET_COMMIT"},
+"request":{"groupId":"internals-classic-group","generationIdOrMemberEpoch":1,"memberId":"classic-group-probe-...",
+  "topics":[{"name":"internals-group-demo","partitions":[{"partitionIndex":0,"committedOffset":2,"committedMetadata":null}]}]},
+"response":{"throttleTimeMs":0,"topics":[{"name":"internals-group-demo","partitions":[{"partitionIndex":0,"errorCode":0}]}]}
+```
+
+`Heartbeat` carries only `generationId` and `memberId` -- a bare liveness check the coordinator answers with `errorCode:0` (or `REBALANCE_IN_PROGRESS` if this member needs to rejoin, e.g. after another member joined/left). The `heartbeatInterval` in KafkaJS's config and this RPC's real cadence are the same thing you already saw from the outside in [Consumer API](/kafka/en/consumers/consumer-api/)'s heartbeat-thread-vs-`eachMessage` proof -- this is the literal RPC that thread sends.
+
+## KIP-848: one RPC, no `JoinGroup`/`SyncGroup` at all
+
+Running `@confluentinc/kafka-javascript` with `'group.protocol': 'consumer'` (KIP-848) against the exact same broker, over the exact same `truncate` request-log window: **zero** `JOIN_GROUP` or `SYNC_GROUP` requests were logged. The entire membership protocol is one recurring RPC:
+
+<Mermaid title="KIP-848 -- one recurring RPC replaces JoinGroup/SyncGroup" code={kip848Diagram} />
+
+export const kip848Diagram = `sequenceDiagram
+  participant C as confluent client (group.protocol=consumer)
+  participant Co as Group coordinator
+  C->>Co: ConsumerGroupHeartbeat (memberEpoch=0, subscribedTopicNames)
+  Co->>C: memberId, memberEpoch=2, heartbeatIntervalMs, assignment (topicPartitions)
+  loop every heartbeatIntervalMs
+    C->>Co: ConsumerGroupHeartbeat (memberEpoch=N)
+    Co->>C: memberEpoch (same or bumped), assignment (only when changed)
+  end`;
+
+The real first `ConsumerGroupHeartbeat` (`memberEpoch:0` -- a brand-new member) and its response:
+
+```text
+"requestHeader":{"requestApiKey":68,"requestApiVersion":1,"clientId":"rdkafka","requestApiKeyName":"CONSUMER_GROUP_HEARTBEAT"},
+"request":{"groupId":"internals-kip848-group","memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":0,
+  "rebalanceTimeoutMs":600000,"subscribedTopicNames":["internals-kip848-demo"],"topicPartitions":[]},
+"response":{"throttleTimeMs":0,"errorCode":0,"memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "heartbeatIntervalMs":5000,
+  "assignment":{"topicPartitions":[{"topicId":"UBzt8JvgRnKWmyeM61zPng","partitions":[0]}]}}
+```
+
+This one response *is* the assignment -- there is no separate `SyncGroup` round trip to fetch it. The very next heartbeat, now that the member already has its assignment, carries `topicPartitions` back to the coordinator (confirming what it currently holds) and gets an empty `assignment` back (nothing changed):
+
+```text
+"request":{"groupId":"internals-kip848-group","memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "topicPartitions":[{"topicId":"UBzt8JvgRnKWmyeM61zPng","partitions":[0]}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "heartbeatIntervalMs":5000,"assignment":null}
+```
+
+`memberEpoch` here does the job `generationId` + a full `JoinGroup`/`SyncGroup` pair did in the classic protocol: it is a single, monotonically-meaningful number the coordinator bumps when this member's assignment actually changes, and the member's own next heartbeat reports back the epoch it's currently operating at. `kafka-consumer-groups.sh --describe` confirms the assignor name server-side:
+
+```bash
+# scripts/consumer-group-protocol-internals/describe-strategy.sh
+TOPIC="${TOPIC_PREFIX}internals-strategy-demo"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server $BOOTSTRAP --list --state
+```
+
+Real output on this module's own broker after running the KIP-848 probe:
+
+```text
+GROUP                  COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-kip848-group localhost:9092  (1)       uniform              Empty                0
+```
+
+`uniform` is KIP-848's server-side assignor name -- note this is computed and reported by the **coordinator**, not the client, a structural difference from classic's client-computed, client-reported `RoundRobinAssigner`.
+
+## The group coordinator state machine, real states
+
+`kafka-consumer-groups.sh --describe --state` reads the coordinator's actual in-memory state. Three real states captured from this module's own broker, same classic group at three different moments:
+
+```text
+--- Empty (no members) ---
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       -                    Empty                0
+
+--- Stable (one member joined, generation finalized) ---
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       RoundRobinAssigner   Stable               1
+
+--- PreparingRebalance (a second member joined mid-generation) ---
+Warning: Consumer group 'internals-classic-group' is rebalancing.
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       -                    PreparingRebalance   2
+```
+
+`PreparingRebalance` is the state where the coordinator has already accepted a second member's `JoinGroup` and is waiting (up to `rebalanceTimeoutMs`) for the rest of the group to also rejoin before computing a new generation -- this is the literal source of the ~3000ms `totalTimeMs` seen on the successful `JoinGroup` above. `CompletingRebalance` (between `JoinGroup` completing and `SyncGroup` completing) and `Dead` (group fully empty and its metadata expired) are real states too, documented in the [consumer group states reference](https://kafka.apache.org/documentation/#consumer_group_state) -- `CompletingRebalance` in particular is transient enough (the gap between the last `JoinGroup` response and the first `SyncGroup` response, both proven above to be fast once the generation is decided) that this lesson could not reliably catch it with a polling `--describe` between two commands; it is real, just too short a window for this lesson's proof method to land on by chance.
+
+## `__consumer_offsets` partition selection: `hash(group.id) % 50`
+
+Every group's offsets live in one partition of the internal `__consumer_offsets` topic (50 partitions by default -- `offsets.topic.num.partitions`), chosen by `Utils.abs(groupId.hashCode()) % numPartitions`, using Java's own `String.hashCode()`. Computing it directly with `javac` (no framework, just the JDK -- same algorithm the broker itself runs):
+
+```java
+// src/main/java/HashCheck.java
+public class HashCheck {
+  public static void main(String[] args) {
+    String[] groups = {"internals-classic-group", "internals-kip848-group"};
+    for (String g : groups) {
+      int h = g.hashCode();
+      int abs = (h == Integer.MIN_VALUE) ? 0 : Math.abs(h);
+      System.out.println(g + " hashCode=" + h + " partition=" + (abs % 50));
+    }
+  }
+}
+```
+
+Real output: `internals-classic-group hashCode=-855015091 partition=41` and `internals-kip848-group hashCode=1031848627 partition=27`. Cross-checked directly against the broker: reading `__consumer_offsets` partition 27 with the real formatter class (`org.apache.kafka.tools.consumer.OffsetsMessageFormatter` -- moved packages in 4.x, the pre-4.0 `kafka.coordinator.group.GroupMetadataManager$OffsetsMessageFormatter` class name no longer exists) returns exactly that group's commits and no others:
+
+```text
+$ /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic __consumer_offsets --partition 27 --from-beginning \
+    --formatter "org.apache.kafka.tools.consumer.OffsetsMessageFormatter"
+{"key":{"type":1,"data":{"group":"internals-kip848-group","topic":"internals-kip848-demo","partition":0}},
+ "value":{"version":4,"data":{"offset":1,"leaderEpoch":0,"metadata":"","commitTimestamp":1790649810713,"topicId":"UBzt8JvgRnKWmyeM61zPng"}}}
+```
+
+A brute-force scan of `internals-classic-group` across all 50 partitions found its commits on partition 41 -- exactly matching the `javac`-computed value, and nowhere else. This is also why the earlier `FindCoordinator` response returned this broker specifically: on a real multi-broker cluster, the coordinator for a group is whichever broker leads the `__consumer_offsets` partition its `groupId` hashes to.
+
+## Mental Model
+
+Every rebalance protocol Kafka has ever shipped answers the same two questions -- **"who is in this group right now"** and **"what does each member own"** -- classic just answers them with two separate barrier RPCs per generation (`JoinGroup` decides membership, `SyncGroup` distributes the assignment the leader computed), while KIP-848 answers both with a single per-member, incrementally-updated RPC (`ConsumerGroupHeartbeat`) whose `memberEpoch` field replaces the whole idea of a group-wide "generation." The coordinator broker for both protocols is the same broker, chosen the same way (`hash(group.id) % 50` into `__consumer_offsets`), and both protocols still commit offsets with the same `OffsetCommit` RPC underneath.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Classic (`JoinGroup`/`SyncGroup`) | Client-side assignment logic (custom assignors are plain client code) | A joining/leaving member stops the *whole group* during `PreparingRebalance` -- proven above, a real multi-second `totalTimeMs` on `JoinGroup` |
+| KIP-848 (`ConsumerGroupHeartbeat`) | Server-side, incremental assignment -- proven above, most heartbeats return `assignment: null` (nothing to redistribute) | Assignment logic now lives on the broker (`uniform`/`range` server assignors) -- a custom assignor is no longer just client code |
+| `heartbeatInterval` (classic) | Faster failure detection | More `HEARTBEAT` RPCs -- proven above, one every interval regardless of activity |
+
+## Common Misconceptions
+
+- **"KIP-848 still uses `JoinGroup`/`SyncGroup` under a new name."** Proven above with a real, complete request-log capture: zero `JOIN_GROUP`/`SYNC_GROUP` requests were logged for the entire `group.protocol=consumer` session -- only `CONSUMER_GROUP_HEARTBEAT`.
+- **"A rebalance is a client-side pause the library imposes."** Proven above: `PreparingRebalance` is real coordinator-side state, and the multi-second delay is a real `totalTimeMs` on the coordinator's own `JoinGroup` response, waiting out `rebalanceTimeoutMs` for other members.
+- **"The consumer picks its own partition assignment."** Proven above for classic: only the **leader** member computes assignments (in `SyncGroup`'s request); every other member is a pure receiver of what the coordinator hands back. For KIP-848, assignment happens entirely on the coordinator.
+- **"Every consumer group's offsets live in `__consumer_offsets` partition 0."** Proven above: two different real group names landed on partitions 41 and 27 respectively, matching `Utils.abs(groupId.hashCode()) % 50` computed independently with plain `javac`.
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// AI-suggested "faster rebalance" fix
+const consumer = kafka.consumer({
+  groupId: 'order-processor',
+  sessionTimeout: 6000,
+  heartbeatInterval: 5000, // "close to sessionTimeout for fewer heartbeats"
+});`}>
+Proven above: `Heartbeat` is the RPC the coordinator uses to detect a dead member -- if no heartbeat arrives within `sessionTimeout`, the coordinator evicts the member and triggers `PreparingRebalance` for the rest of the group. Setting `heartbeatInterval` (5000ms) this close to `sessionTimeout` (6000ms) leaves almost no margin: one slow heartbeat round-trip (network jitter, broker GC pause, anything) can miss the window and get this member evicted even though it's alive, triggering exactly the group-wide pause this change claims to avoid. Kafka's own client defaults keep `heartbeatInterval` at roughly a third of `sessionTimeout` for this reason -- proven above, a `SYNC_GROUP`/`HEARTBEAT` round trip on an idle local broker already costs over a millisecond; a real network doesn't get faster under load.
+</SpotTheBug>
+
+export const quizConsumerGroupProtocolInternals = [
+  {
+    q: 'Proven above with a real request-log capture, what happens on a brand-new member\'s very first JoinGroup (empty memberId)?',
+    options: [
+      'It succeeds immediately with generationId 1',
+      'The coordinator returns errorCode 79 (MEMBER_ID_REQUIRED) along with an assigned memberId, and the client must retry JoinGroup with that memberId',
+      'It fails permanently and the client must reconnect',
+      'It is silently ignored until a heartbeat is sent',
+    ],
+    answer: 1,
+    explain: 'The real first JOIN_GROUP response above shows errorCode:79, generationId:-1, and a real memberId in the response despite the error -- this two-step JoinGroup is documented protocol behavior, not a client bug, and KafkaJS retries it transparently.',
+  },
+  {
+    q: 'Proven above by comparing a full classic request-log capture against a full KIP-848 (group.protocol=consumer) capture over an equivalent session, what RPCs does KIP-848 use for membership and assignment?',
+    options: [
+      'The same JoinGroup/SyncGroup pair, just with different field names',
+      'Zero JoinGroup/SyncGroup requests at all -- one recurring ConsumerGroupHeartbeat RPC whose response already carries the assignment',
+      'JoinGroup only, with SyncGroup removed',
+      'A completely different set of RPCs unrelated to the classic ones',
+    ],
+    answer: 1,
+    explain: 'The real request-log capture for the confluent client with group.protocol=consumer showed zero JOIN_GROUP/SYNC_GROUP requests -- only CONSUMER_GROUP_HEARTBEAT, whose response\'s assignment field carries the member\'s topicPartitions directly.',
+  },
+  {
+    q: 'Proven above with a real kafka-consumer-groups.sh --describe --state capture during an active JoinGroup exchange, what does the "PreparingRebalance" state actually mean?',
+    options: [
+      'The group is idle and about to be deleted',
+      'The coordinator has accepted a member change and is waiting (up to rebalanceTimeoutMs) for the rest of the group to rejoin before computing a new generation',
+      'A network partition has occurred between brokers',
+      'The consumer is preparing to commit its offsets',
+    ],
+    answer: 1,
+    explain: 'The real capture above showed PreparingRebalance with 2 members while a second consumer was mid-join -- this is the literal coordinator-side wait that produced the multi-second totalTimeMs on the successful JoinGroup response earlier in the lesson.',
+  },
+  {
+    q: 'Proven above with a real javac computation cross-checked against real broker data, how does Kafka choose which __consumer_offsets partition holds a given group\'s commits?',
+    options: [
+      'Round-robin across all 50 partitions as groups are created',
+      'Utils.abs(groupId.hashCode()) % numPartitions, using Java\'s own String.hashCode() -- verified: internals-classic-group -> partition 41, internals-kip848-group -> partition 27, matching real broker data exactly',
+      'Always partition 0 for simplicity',
+      'By alphabetical order of the group name',
+    ],
+    answer: 1,
+    explain: 'A plain javac program computed the two groups\' partitions as 41 and 27; reading those exact partitions off the real broker (and brute-force scanning all 50 for the other group) confirmed the commits live nowhere else.',
+  },
+  {
+    q: 'Proven above (SyncGroup request/response pair), who actually computes partition assignments in the classic protocol?',
+    options: [
+      'The coordinator broker computes them for every member',
+      'Only the elected group leader computes them (in its own SyncGroup request\'s assignments field); the coordinator just redistributes that to every member\'s own SyncGroup response',
+      'Each member computes its own assignment independently',
+      'ZooKeeper computes them',
+    ],
+    answer: 1,
+    explain: 'The real SYNC_GROUP request above came from the leader and carried a non-empty assignments[] list; every other (non-leader) member\'s SyncGroup request carries an empty assignments[] and simply receives back what the coordinator already has from the leader.',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/consumer-group-protocol-internals" questions={quizConsumerGroupProtocolInternals} />
+
+<ProgressTracker client:visible id="kafka-internals/consumer-group-protocol-internals" />

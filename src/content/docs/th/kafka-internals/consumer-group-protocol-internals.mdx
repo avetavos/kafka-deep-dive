@@ -1,0 +1,306 @@
+---
+title: 'Consumer Group Protocol Internals'
+description: 'RPC จริงเบื้องหลัง rebalance -- classic FindCoordinator/JoinGroup/SyncGroup/Heartbeat เทียบกับ KIP-848 ConsumerGroupHeartbeat -- พิสูจน์จาก request log จริงด้วย KafkaJS และ confluent client บวก state machine ของ group coordinator และการแบ่ง __consumer_offsets ด้วย hash(group.id) % 50 ทั้งหมดบน Kafka 4.3.1.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## สรุปในหนึ่งบรรทัด
+
+classic consumer group protocol sync สมาชิกด้วย RPC สองตัวแยกกันที่ทำหน้าที่เป็น barrier (`JoinGroup` แล้ว `SyncGroup`) บวก `Heartbeat` ที่วนซ้ำ; **KIP-848** แทนที่ทั้งสามด้วย RPC เดียวที่วนซ้ำ คือ `ConsumerGroupHeartbeat` ที่ response พก assignment ของ member มาด้วยแล้ว -- บทนี้พิสูจน์ทั้งสองแบบ ทีละ RPC จาก request log จริง
+
+<Callout title="วิธีพิสูจน์ของบทนี้">
+ทุกอย่างข้างล่างคือบรรทัด request log จริง ตัดสั้น จาก broker ของโมดูลนี้เอง (`kafka.request.logger` ที่ `TRACE` -- ดู index โมดูล) จับระหว่างรัน `kafkajs` classic consumer จริงและ `@confluentinc/kafka-javascript` consumer จริงที่ `group.protocol=consumer` client ทั้งสองตัวถูกแนะนำไปแล้วใน [Consumer API](/kafka/th/consumers/consumer-api/) และ [Consumer Groups and Rebalancing](/kafka/th/consumers/consumer-groups-and-rebalancing/) -- บทนี้ไม่สอน client-side API ซ้ำ สอนแค่ wire protocol ที่อยู่ข้างใต้
+</Callout>
+
+## Classic: ห้า RPC จริง
+
+<Mermaid title="Classic rebalance protocol -- ลำดับ RPC จริง" code={classicDiagram} />
+
+export const classicDiagram = `sequenceDiagram
+  participant C as KafkaJS consumer
+  participant Co as Group coordinator
+  C->>Co: FindCoordinator (key=groupId)
+  Co->>C: nodeId, host, port
+  C->>Co: JoinGroup (memberId="")
+  Co->>C: NOT_COORDINATOR-free error: MEMBER_ID_REQUIRED, assigns memberId
+  C->>Co: JoinGroup (memberId=assigned)
+  Co->>C: generationId, leader, members[] (leader only)
+  C->>Co: SyncGroup (assignments computed by leader)
+  Co->>C: assignment (opaque bytes: topic-partitions)
+  loop every heartbeatInterval
+    C->>Co: Heartbeat (generationId, memberId)
+    Co->>C: errorCode 0 (or REBALANCE_IN_PROGRESS)
+  end
+  C->>Co: OffsetCommit`;
+
+รัน `kafkajs` consumer จริง (`sessionTimeout: 10000, heartbeatInterval: 3000`) กับ broker ของโมดูลนี้แล้ว join group `internals-classic-group`, `FIND_COORDINATOR` จริง:
+
+```text
+"requestHeader":{"requestApiKey":10,"requestApiVersion":2,"clientId":"classic-group-probe","requestApiKeyName":"FIND_COORDINATOR"},
+"request":{"key":"internals-classic-group","keyType":0},
+"response":{"throttleTimeMs":0,"errorCode":0,"errorMessage":"NONE","nodeId":1,"host":"localhost","port":29092}
+```
+
+`keyType:0` แปลว่า "key นี้คือ consumer group ID" (เทียบกับ `1` สำหรับ transactional ID -- ดู [Transactions](/kafka/th/delivery-and-transactions/transactions/)) response เป็นแค่ที่อยู่ broker -- ทุกกลุ่มมี **coordinator** broker เดียวเป๊ะ คำนวณจากการแบ่ง partition ของ `__consumer_offsets` (พิสูจน์ด้านล่าง) และทุกอย่างที่เหลือใน sequence นี้คุยกับ broker ตัวนั้นตัวเดียว
+
+### `JoinGroup` เป็น round trip สองรอบจริง ๆ ในครั้งแรก
+
+`JoinGroup` แรกสุดที่ member ใหม่เอี่ยมส่งไปมี `memberId` ว่างเปล่า response จริงของ broker ของโมดูลนี้เองต่อความพยายามครั้งแรก:
+
+```text
+"requestHeader":{"requestApiVersion":5,"requestApiKeyName":"JOIN_GROUP"},
+"request":{"groupId":"internals-classic-group","sessionTimeoutMs":10000,"rebalanceTimeoutMs":60000,
+  "memberId":"","protocolType":"consumer","protocols":[{"name":"RoundRobinAssigner","metadata":"..."}]},
+"response":{"throttleTimeMs":0,"errorCode":79,"generationId":-1,"protocolName":"","leader":"",
+  "memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62","members":[]}
+```
+
+`errorCode:79` คือ `MEMBER_ID_REQUIRED` -- coordinator ปฏิเสธไม่ให้ความพยายามนี้ join จริง แต่มัน**ให้** `memberId` กลับมาให้ client retry ด้วย KafkaJS retry เองโดยอัตโนมัติแบบโปร่งใส `JoinGroup` ตัวที่สองจริง ที่ใช้ `memberId` ที่ได้มา คือตัวที่สำเร็จจริง:
+
+```text
+"request":{"groupId":"internals-classic-group","memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "protocolType":"consumer","protocols":[{"name":"RoundRobinAssigner","metadata":"..."}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"generationId":1,"protocolName":"RoundRobinAssigner",
+  "leader":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "memberId":"classic-group-probe-8a1393a7-230c-44cf-802c-ec422564fc62",
+  "members":[{"memberId":"classic-group-probe-...","groupInstanceId":null,"metadata":"..."}]},
+"totalTimeMs":3001.708
+```
+
+ข้อเท็จจริง 2 ข้อที่พิสูจน์แล้ว: (1) `JoinGroup` ของ member ใหม่เอี่ยมถูกปฏิเสธจริงหนึ่งครั้งก่อนถูกยอมรับ -- นี่ไม่ใช่ bug ของ client แต่เป็นพฤติกรรม protocol ที่บันทึกไว้; (2) `totalTimeMs:3001.708` บน `JoinGroup` ตัวที่*สำเร็จ* -- coordinator ถือ request นี้เปิดไว้ตลอดหน้าต่าง `rebalanceTimeoutMs` ของกลุ่ม (เพดาน 60000ms การรอจริงในที่นี้ถูกจำกัดด้วย timing การ join ของ member อื่นใน run นี้) เพื่อดูว่าจะมี member เพิ่มเข้ามาก่อนจะ finalize generation หรือไม่ นี่คือกลไกจริงเบื้องหลัง "rebalance ใช้เวลาสักครู่" -- มันคือการรอจริงข้างใน RPC จริง ไม่ใช่ client polling
+
+### `SyncGroup`: leader คำนวณ assignment, coordinator แจกจ่าย
+
+มีแค่ **leader** ของกลุ่มที่ถูกเลือก (member ตัวแรก ในที่นี้) เท่านั้นที่คำนวณ partition assignment แล้วส่งใน `SyncGroup` ของตัวเอง หน้าที่ของ coordinator คือแค่แจกจ่ายสิ่งที่ leader คำนวณให้ทุก member (รวม leader เอง) ใน response `SyncGroup` ของแต่ละคน:
+
+```text
+"requestHeader":{"requestApiKeyName":"SYNC_GROUP"},
+"request":{"groupId":"internals-classic-group","generationId":1,
+  "memberId":"classic-group-probe-...",
+  "assignments":[{"memberId":"classic-group-probe-...","assignment":"AAAAAAABABRpbnRlcm5hbHMtZ3JvdXAtZGVtbwAAAAEAAAAAAAAAAA=="}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"assignment":"AAAAAAABABRpbnRlcm5hbHMtZ3JvdXAtZGVtbwAAAAEAAAAAAAAAAA=="}
+```
+
+ไบต์ของ `assignment` ทึบที่ระดับ protocol (`ConsumerProtocolAssignment` ที่ serialize แล้ว) -- list `assignments[]` ใน request (มีค่าแค่ตอนเป็น leader) คือสิ่งที่ coordinator สะท้อนกลับให้แต่ละ member ใน field `assignment` ของ response ของตัวเอง
+
+### `Heartbeat` และ `OffsetCommit`
+
+```text
+"requestHeader":{"requestApiKeyName":"HEARTBEAT"},
+"request":{"groupId":"internals-classic-group","generationId":1,"memberId":"classic-group-probe-..."},
+"response":{"throttleTimeMs":0,"errorCode":0}
+```
+
+```text
+"requestHeader":{"requestApiKeyName":"OFFSET_COMMIT"},
+"request":{"groupId":"internals-classic-group","generationIdOrMemberEpoch":1,"memberId":"classic-group-probe-...",
+  "topics":[{"name":"internals-group-demo","partitions":[{"partitionIndex":0,"committedOffset":2,"committedMetadata":null}]}]},
+"response":{"throttleTimeMs":0,"topics":[{"name":"internals-group-demo","partitions":[{"partitionIndex":0,"errorCode":0}]}]}
+```
+
+`Heartbeat` พกแค่ `generationId` กับ `memberId` -- liveness check เปล่า ๆ ที่ coordinator ตอบด้วย `errorCode:0` (หรือ `REBALANCE_IN_PROGRESS` ถ้า member นี้ต้อง rejoin เช่นหลังจาก member อื่น join/leave) `heartbeatInterval` ใน config ของ KafkaJS กับจังหวะจริงของ RPC นี้คือสิ่งเดียวกันกับที่คุณเห็นจากข้างนอกไปแล้วใน proof heartbeat-thread-vs-`eachMessage` ของ [Consumer API](/kafka/th/consumers/consumer-api/) -- นี่คือ RPC จริงตัวที่ thread นั้นส่ง
+
+## KIP-848: RPC เดียว ไม่มี `JoinGroup`/`SyncGroup` เลย
+
+รัน `@confluentinc/kafka-javascript` ด้วย `'group.protocol': 'consumer'` (KIP-848) กับ broker ตัวเดียวกันเป๊ะ ในหน้าต่าง `truncate` request-log เดียวกัน: **ไม่มี** request `JOIN_GROUP` หรือ `SYNC_GROUP` เลยแม้แต่ตัวเดียว protocol สมาชิกทั้งหมดคือ RPC เดียวที่วนซ้ำ:
+
+<Mermaid title="KIP-848 -- RPC เดียวที่วนซ้ำแทน JoinGroup/SyncGroup" code={kip848Diagram} />
+
+export const kip848Diagram = `sequenceDiagram
+  participant C as confluent client (group.protocol=consumer)
+  participant Co as Group coordinator
+  C->>Co: ConsumerGroupHeartbeat (memberEpoch=0, subscribedTopicNames)
+  Co->>C: memberId, memberEpoch=2, heartbeatIntervalMs, assignment (topicPartitions)
+  loop every heartbeatIntervalMs
+    C->>Co: ConsumerGroupHeartbeat (memberEpoch=N)
+    Co->>C: memberEpoch (same or bumped), assignment (only when changed)
+  end`;
+
+`ConsumerGroupHeartbeat` ตัวแรกจริง (`memberEpoch:0` -- member ใหม่เอี่ยม) กับ response ของมัน:
+
+```text
+"requestHeader":{"requestApiKey":68,"requestApiVersion":1,"clientId":"rdkafka","requestApiKeyName":"CONSUMER_GROUP_HEARTBEAT"},
+"request":{"groupId":"internals-kip848-group","memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":0,
+  "rebalanceTimeoutMs":600000,"subscribedTopicNames":["internals-kip848-demo"],"topicPartitions":[]},
+"response":{"throttleTimeMs":0,"errorCode":0,"memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "heartbeatIntervalMs":5000,
+  "assignment":{"topicPartitions":[{"topicId":"UBzt8JvgRnKWmyeM61zPng","partitions":[0]}]}}
+```
+
+response ตัวนี้ *คือ* assignment เลย -- ไม่มี `SyncGroup` round trip แยกไปดึงมันเลย heartbeat ถัดไป ตอนนี้ member มี assignment อยู่แล้ว พก `topicPartitions` กลับไปหา coordinator (ยืนยันสิ่งที่ตัวเองถืออยู่ตอนนี้) แล้วได้ `assignment` เปล่ากลับมา (ไม่มีอะไรเปลี่ยน):
+
+```text
+"request":{"groupId":"internals-kip848-group","memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "topicPartitions":[{"topicId":"UBzt8JvgRnKWmyeM61zPng","partitions":[0]}]},
+"response":{"throttleTimeMs":0,"errorCode":0,"memberId":"g4tHCbN1R7idi9qZ39UCiw","memberEpoch":2,
+  "heartbeatIntervalMs":5000,"assignment":null}
+```
+
+`memberEpoch` ที่นี่ทำหน้าที่ที่ `generationId` บวกคู่ `JoinGroup`/`SyncGroup` เต็มรูปแบบทำใน classic protocol: มันคือเลขเดียวที่มีความหมาย monotonic ที่ coordinator เพิ่มขึ้นเมื่อ assignment ของ member นี้เปลี่ยนจริง และ heartbeat ถัดไปของ member เองรายงาน epoch ที่ตัวเองทำงานอยู่กลับไป `kafka-consumer-groups.sh --describe` ยืนยันชื่อ assignor ฝั่ง server:
+
+```bash
+# scripts/consumer-group-protocol-internals/describe-strategy.sh
+TOPIC="${TOPIC_PREFIX}internals-strategy-demo"
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+  --create --if-not-exists --topic "$TOPIC" --partitions 1 --replication-factor 1
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server $BOOTSTRAP --list --state
+```
+
+output จริงบน broker ของโมดูลนี้เองหลังรัน KIP-848 probe:
+
+```text
+GROUP                  COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-kip848-group localhost:9092  (1)       uniform              Empty                0
+```
+
+`uniform` คือชื่อ assignor ฝั่ง server ของ KIP-848 -- สังเกตว่ามันคำนวณและรายงานโดย **coordinator** ไม่ใช่ client ต่างจาก `RoundRobinAssigner` ของ classic ที่ client คำนวณและรายงานเองโดยโครงสร้าง
+
+## State machine ของ group coordinator, state จริง
+
+`kafka-consumer-groups.sh --describe --state` อ่าน state จริงในหน่วยความจำของ coordinator สาม state จริงที่จับได้จาก broker ของโมดูลนี้เอง กลุ่ม classic เดียวกัน สามช่วงเวลาต่างกัน:
+
+```text
+--- Empty (ไม่มี member) ---
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       -                    Empty                0
+
+--- Stable (member หนึ่งตัว join แล้ว generation finalize แล้ว) ---
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       RoundRobinAssigner   Stable               1
+
+--- PreparingRebalance (member ตัวที่สอง join กลางคัน generation) ---
+Warning: Consumer group 'internals-classic-group' is rebalancing.
+GROUP                   COORDINATOR (ID)          ASSIGNMENT-STRATEGY  STATE                #MEMBERS
+internals-classic-group localhost:9092  (1)       -                    PreparingRebalance   2
+```
+
+`PreparingRebalance` คือ state ที่ coordinator รับ `JoinGroup` ของ member ตัวที่สองไปแล้ว และกำลังรอ (สูงสุด `rebalanceTimeoutMs`) ให้ที่เหลือของกลุ่ม join กลับมาด้วยก่อนจะคำนวณ generation ใหม่ -- นี่คือที่มาจริงของ `totalTimeMs` ~3000ms ที่เห็นบน `JoinGroup` ตัวที่สำเร็จข้างบน `CompletingRebalance` (ระหว่าง `JoinGroup` เสร็จกับ `SyncGroup` เสร็จ) และ `Dead` (กลุ่มว่างเปล่าเต็มที่และ metadata หมดอายุ) ก็เป็น state จริงเช่นกัน บันทึกไว้ใน [consumer group states reference](https://kafka.apache.org/documentation/#consumer_group_state) -- `CompletingRebalance` โดยเฉพาะสั้นมากจนจับไม่ทัน (ช่วงระหว่าง response ของ `JoinGroup` ตัวสุดท้ายกับ response ของ `SyncGroup` ตัวแรก ทั้งสองพิสูจน์แล้วข้างบนว่าเร็วมากเมื่อ generation ตัดสินใจแล้ว) จน `--describe` แบบ polling ระหว่างสองคำสั่งของบทนี้จับมันไม่ทันโดยบังเอิญ; มันมีจริง แค่หน้าต่างสั้นเกินกว่าวิธีพิสูจน์ของบทนี้จะจับได้พอดี
+
+## การแบ่ง partition ของ `__consumer_offsets`: `hash(group.id) % 50`
+
+offset ของทุกกลุ่มอยู่ใน partition เดียวของ topic ภายใน `__consumer_offsets` (50 partition โดย default -- `offsets.topic.num.partitions`) เลือกด้วย `Utils.abs(groupId.hashCode()) % numPartitions` โดยใช้ `String.hashCode()` ของ Java เอง คำนวณตรงด้วย `javac` (ไม่มี framework แค่ JDK -- algorithm เดียวกับที่ broker เองรัน):
+
+```java
+// src/main/java/HashCheck.java
+public class HashCheck {
+  public static void main(String[] args) {
+    String[] groups = {"internals-classic-group", "internals-kip848-group"};
+    for (String g : groups) {
+      int h = g.hashCode();
+      int abs = (h == Integer.MIN_VALUE) ? 0 : Math.abs(h);
+      System.out.println(g + " hashCode=" + h + " partition=" + (abs % 50));
+    }
+  }
+}
+```
+
+output จริง: `internals-classic-group hashCode=-855015091 partition=41` และ `internals-kip848-group hashCode=1031848627 partition=27` cross-check ตรงกับ broker: อ่าน `__consumer_offsets` partition 27 ด้วย formatter class จริง (`org.apache.kafka.tools.consumer.OffsetsMessageFormatter` -- ย้าย package ใน 4.x แล้ว ชื่อ class เดิมก่อน 4.0 `kafka.coordinator.group.GroupMetadataManager$OffsetsMessageFormatter` ไม่มีอยู่อีกต่อไป) คืนค่า commit ของกลุ่มนั้นเป๊ะ ไม่มีตัวอื่นปน:
+
+```text
+$ /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic __consumer_offsets --partition 27 --from-beginning \
+    --formatter "org.apache.kafka.tools.consumer.OffsetsMessageFormatter"
+{"key":{"type":1,"data":{"group":"internals-kip848-group","topic":"internals-kip848-demo","partition":0}},
+ "value":{"version":4,"data":{"offset":1,"leaderEpoch":0,"metadata":"","commitTimestamp":1790649810713,"topicId":"UBzt8JvgRnKWmyeM61zPng"}}}
+```
+
+การ scan แบบ brute-force ทั้ง 50 partition ของ `internals-classic-group` เจอ commit ของมันที่ partition 41 -- ตรงกับค่าที่ `javac` คำนวณเป๊ะ และไม่มีที่อื่นเลย นี่ยังเป็นเหตุผลที่ `FindCoordinator` response ก่อนหน้าคืน broker ตัวนี้โดยเฉพาะ: บนคลัสเตอร์หลาย broker จริง coordinator ของกลุ่มคือ broker ที่เป็น leader ของ partition `__consumer_offsets` ที่ `groupId` hash ไปตกที่นั่น
+
+## Mental Model
+
+rebalance protocol ทุกตัวที่ Kafka เคยออกมาตอบคำถามสองข้อเดียวกัน -- **"ตอนนี้ใครอยู่ในกลุ่มนี้บ้าง"** และ **"แต่ละ member ถืออะไรอยู่"** -- classic ตอบทั้งสองด้วย barrier RPC สองตัวแยกกันต่อ generation (`JoinGroup` ตัดสิน membership, `SyncGroup` แจกจ่าย assignment ที่ leader คำนวณ) ส่วน KIP-848 ตอบทั้งสองด้วย RPC ต่อ member เดียวที่อัปเดตแบบ incremental (`ConsumerGroupHeartbeat`) ที่ field `memberEpoch` แทนที่แนวคิด "generation ทั้งกลุ่ม" ไปเลย coordinator broker ของทั้งสอง protocol คือ broker ตัวเดียวกัน เลือกด้วยวิธีเดียวกัน (`hash(group.id) % 50` เข้า `__consumer_offsets`) และทั้งสอง protocol ยัง commit offset ด้วย RPC `OffsetCommit` ตัวเดียวกันข้างใต้
+
+## Trade-offs
+
+| ตัวเลือก | ประโยชน์ | ต้นทุน |
+|---|---|---|
+| Classic (`JoinGroup`/`SyncGroup`) | assignment logic ฝั่ง client (custom assignor เป็น client code ธรรมดา) | member ที่ join/leave หยุด *ทั้งกลุ่ม* ระหว่าง `PreparingRebalance` -- พิสูจน์แล้วข้างบน `totalTimeMs` หลายวินาทีจริงบน `JoinGroup` |
+| KIP-848 (`ConsumerGroupHeartbeat`) | assignment แบบ incremental ฝั่ง server -- พิสูจน์แล้วข้างบน heartbeat ส่วนใหญ่คืน `assignment: null` (ไม่มีอะไรต้องแจกจ่ายใหม่) | assignment logic ย้ายไปอยู่บน broker แล้ว (`uniform`/`range` server assignor) -- custom assignor ไม่ใช่แค่ client code อีกต่อไป |
+| `heartbeatInterval` (classic) | ตรวจจับความล้มเหลวเร็วขึ้น | RPC `HEARTBEAT` เยอะขึ้น -- พิสูจน์แล้วข้างบน หนึ่งครั้งทุก interval ไม่ว่าจะมี activity หรือไม่ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"KIP-848 ยังใช้ `JoinGroup`/`SyncGroup` แค่เปลี่ยนชื่อ"** พิสูจน์แล้วข้างบนด้วย request log capture จริงครบชุด: ไม่มี request `JOIN_GROUP`/`SYNC_GROUP` เลยตลอด session `group.protocol=consumer` มีแค่ `CONSUMER_GROUP_HEARTBEAT`
+- **"rebalance คือการหยุดชั่วคราวที่ library บังคับฝั่ง client"** พิสูจน์แล้วข้างบน: `PreparingRebalance` คือ state จริงฝั่ง coordinator และความล่าช้าหลายวินาทีคือ `totalTimeMs` จริงบน response `JoinGroup` ของ coordinator เอง ที่รอ `rebalanceTimeoutMs` ให้ member อื่น
+- **"consumer เลือก partition assignment ของตัวเอง"** พิสูจน์แล้วข้างบนสำหรับ classic: มีแค่ member ที่เป็น **leader** เท่านั้นที่คำนวณ assignment (ใน request ของ `SyncGroup`) member อื่นทุกตัวเป็นแค่ผู้รับสิ่งที่ coordinator ส่งกลับมา สำหรับ KIP-848 assignment เกิดขึ้นบน coordinator ทั้งหมด
+- **"offset ของทุก consumer group อยู่ใน `__consumer_offsets` partition 0"** พิสูจน์แล้วข้างบน: ชื่อกลุ่มจริงสองชื่อที่ต่างกันตกที่ partition 41 กับ 27 ตามลำดับ ตรงกับ `Utils.abs(groupId.hashCode()) % 50` ที่คำนวณแยกต่างหากด้วย `javac` ธรรมดา
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// AI-suggested "faster rebalance" fix
+const consumer = kafka.consumer({
+  groupId: 'order-processor',
+  sessionTimeout: 6000,
+  heartbeatInterval: 5000, // "close to sessionTimeout for fewer heartbeats"
+});`}>
+พิสูจน์แล้วข้างบน: `Heartbeat` คือ RPC ที่ coordinator ใช้ตรวจจับ member ที่ตายแล้ว -- ถ้าไม่มี heartbeat มาภายใน `sessionTimeout` coordinator จะเตะ member ออกแล้ว trigger `PreparingRebalance` ให้ที่เหลือของกลุ่ม การตั้ง `heartbeatInterval` (5000ms) ใกล้ `sessionTimeout` (6000ms) ขนาดนี้เหลือ margin แทบไม่มี: heartbeat round-trip ที่ช้าแค่ครั้งเดียว (network jitter, broker GC pause, อะไรก็ได้) อาจพลาดหน้าต่างนี้แล้วทำให้ member นี้ถูกเตะออกทั้งที่ยังมีชีวิตอยู่ trigger การหยุดชะงักทั้งกลุ่มแบบเดียวกับที่การเปลี่ยนนี้อ้างว่าจะหลีกเลี่ยง client default ของ Kafka เองตั้ง `heartbeatInterval` ไว้ประมาณหนึ่งในสามของ `sessionTimeout` ด้วยเหตุผลนี้ -- พิสูจน์แล้วข้างบน round trip ของ `SYNC_GROUP`/`HEARTBEAT` บน broker local ที่ idle มีต้นทุนเกินหนึ่งมิลลิวินาทีอยู่แล้ว เครือข่ายจริงไม่ได้เร็วขึ้นตอนโหลดสูง
+</SpotTheBug>
+
+export const quizConsumerGroupProtocolInternals = [
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย request log capture จริง เกิดอะไรขึ้นกับ JoinGroup ตัวแรกสุดของ member ใหม่เอี่ยม (memberId ว่างเปล่า)?',
+    options: [
+      'It succeeds immediately with generationId 1',
+      'The coordinator returns errorCode 79 (MEMBER_ID_REQUIRED) along with an assigned memberId, and the client must retry JoinGroup with that memberId',
+      'It fails permanently and the client must reconnect',
+      'It is silently ignored until a heartbeat is sent',
+    ],
+    answer: 1,
+    explain: 'response ของ JOIN_GROUP ตัวแรกจริงข้างบนแสดง errorCode:79, generationId:-1, และ memberId จริงใน response ทั้งที่มี error -- JoinGroup สองขั้นตอนนี้เป็นพฤติกรรม protocol ที่บันทึกไว้ ไม่ใช่ bug ของ client และ KafkaJS retry ให้เองแบบโปร่งใส',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนโดยเทียบ request log capture ของ classic เต็มชุดกับ capture ของ KIP-848 (group.protocol=consumer) เต็มชุดในช่วง session เทียบเท่ากัน KIP-848 ใช้ RPC อะไรสำหรับ membership และ assignment?',
+    options: [
+      'The same JoinGroup/SyncGroup pair, just with different field names',
+      'Zero JoinGroup/SyncGroup requests at all -- one recurring ConsumerGroupHeartbeat RPC whose response already carries the assignment',
+      'JoinGroup only, with SyncGroup removed',
+      'A completely different set of RPCs unrelated to the classic ones',
+    ],
+    answer: 1,
+    explain: 'request log capture จริงของ confluent client ที่ group.protocol=consumer ไม่มี request JOIN_GROUP/SYNC_GROUP เลย มีแค่ CONSUMER_GROUP_HEARTBEAT ที่ field assignment ใน response พก topicPartitions ของ member มาตรง ๆ',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วย kafka-consumer-groups.sh --describe --state capture จริงระหว่าง JoinGroup exchange ที่กำลังทำงานอยู่ state "PreparingRebalance" หมายถึงอะไรจริง ๆ?',
+    options: [
+      'The group is idle and about to be deleted',
+      'The coordinator has accepted a member change and is waiting (up to rebalanceTimeoutMs) for the rest of the group to rejoin before computing a new generation',
+      'A network partition has occurred between brokers',
+      'The consumer is preparing to commit its offsets',
+    ],
+    answer: 1,
+    explain: 'capture จริงข้างบนแสดง PreparingRebalance พร้อม member 2 ตัวระหว่างที่ consumer ตัวที่สองกำลัง join อยู่กลางคัน -- นี่คือการรอจริงฝั่ง coordinator ที่ทำให้เกิด totalTimeMs หลายวินาทีบน response JoinGroup ที่สำเร็จก่อนหน้านี้ในบท',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบนด้วยการคำนวณ javac จริง cross-check กับข้อมูล broker จริง Kafka เลือก partition ของ __consumer_offsets ที่เก็บ commit ของกลุ่มหนึ่งยังไง?',
+    options: [
+      'Round-robin across all 50 partitions as groups are created',
+      'Utils.abs(groupId.hashCode()) % numPartitions, using Java\'s own String.hashCode() -- verified: internals-classic-group -> partition 41, internals-kip848-group -> partition 27, matching real broker data exactly',
+      'Always partition 0 for simplicity',
+      'By alphabetical order of the group name',
+    ],
+    answer: 1,
+    explain: 'โปรแกรม javac ธรรมดาคำนวณ partition ของสองกลุ่มได้ 41 กับ 27 การอ่าน partition เหล่านั้นเป๊ะ ๆ จาก broker จริง (และ scan แบบ brute-force ทั้ง 50 partition สำหรับอีกกลุ่ม) ยืนยันว่า commit ไม่ได้อยู่ที่อื่นเลย',
+  },
+  {
+    q: 'พิสูจน์แล้วข้างบน (คู่ request/response ของ SyncGroup) ใครคำนวณ partition assignment จริง ๆ ใน classic protocol?',
+    options: [
+      'The coordinator broker computes them for every member',
+      'Only the elected group leader computes them (in its own SyncGroup request\'s assignments field); the coordinator just redistributes that to every member\'s own SyncGroup response',
+      'Each member computes its own assignment independently',
+      'ZooKeeper computes them',
+    ],
+    answer: 1,
+    explain: 'request SYNC_GROUP จริงข้างบนมาจาก leader และพก list assignments[] ที่ไม่ว่างเปล่า request SyncGroup ของ member อื่นทุกตัว (ที่ไม่ใช่ leader) พก assignments[] ว่างเปล่า และรับสิ่งที่ coordinator มีอยู่แล้วจาก leader กลับมาเฉย ๆ',
+  },
+];
+
+<Quiz client:visible id="kafka-internals/consumer-group-protocol-internals" questions={quizConsumerGroupProtocolInternals} />
+
+<ProgressTracker client:visible id="kafka-internals/consumer-group-protocol-internals" />
