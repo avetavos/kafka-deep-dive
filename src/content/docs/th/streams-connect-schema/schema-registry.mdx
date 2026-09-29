@@ -1,6 +1,6 @@
 ---
 title: 'Schema Registry'
-description: 'ทำไม producer กับ consumer ต้องตกลงรูปร่างของ record ให้ตรงกัน Schema Registry เก็บ schema แบบมีเวอร์ชัน record พก schema id ไปด้วย และ compatibility mode ช่วยให้ schema วิวัฒน์ได้อย่างปลอดภัย'
+description: 'ทำไม producer และ consumer ต้องตกลงรูปร่าง record กัน, Schema Registry เก็บ schema แบบมีเวอร์ชันอย่างไร, การถูก reject จริงแบบ BACKWARD-incompatible (HTTP 409), subject naming strategy, และการ encode/decode จริงด้วย KafkaJS พร้อม hex dump ของ wire format'
 sidebar:
   order: 1
 ---
@@ -8,24 +8,29 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในหนึ่งประโยค
 
-**Schema Registry** คือ contract แบบมีเวอร์ชันที่แชร์กันสำหรับรูปร่างของ record — producer ลงทะเบียน schema ไว้ แต่ละ record พกแค่ **schema id** เล็ก ๆ แทนที่จะพก definition เต็ม ๆ ส่วน consumer ก็ดึง schema ตาม id นั้นมาใช้ ทั้งสองฝั่งจึงตกลงกันได้เสมอว่าจะอ่าน bytes ยังไง
+**Schema Registry** คือสัญญาที่มีเวอร์ชันและใช้ร่วมกันสำหรับรูปร่างของ record — producer register schema แล้วทุก record จะพก **schema id** เล็ก ๆ แทนที่จะพก definition เต็ม ๆ และ consumer ดึง schema นั้นด้วย id เพื่อให้ทั้งสองฝั่งเข้าใจตรงกันเสมอว่าจะอ่าน byte เหล่านั้นอย่างไร
 
-## ทำไมต้องมี schema
+<Callout title="ผลิตภัณฑ์ของ Confluent รันแยกต่างหาก — วิธีที่บทนี้พิสูจน์">
+Schema Registry ไม่ได้เป็นส่วนหนึ่งของ `apache/kafka` — ไม่มี `kafka-schema-registry.sh` ใน image ของ broker ที่คอร์สนี้ใช้ปกติ ทุกคำกล่าวด้านล่างพิสูจน์จริงกับ container `confluentinc/cp-schema-registry` จริงที่รันขึ้นมาเฉพาะสำหรับบทนี้ ต่อกับ broker จริง แล้วปิดลง — ไม่ได้จำลอง ไม่ได้แค่ยกคำพูดมา
+</Callout>
 
-ตัว Kafka เองไม่สนใจว่าใน record มีอะไร — สำหรับ broker แล้ว value ก็คือ bytes ก้อนหนึ่ง ความอิสระนี้กลายเป็นปัญหาทันทีที่ทีมที่สองมา consume topic ของคุณ ถ้า producer เปลี่ยนชื่อ field หรือเปลี่ยน type ทุก consumer จะพังเงียบ ๆ บน production **schema** เปลี่ยนข้อสมมติที่ซ่อนอยู่ให้กลายเป็น contract ที่ชัดเจน
+## ทำไมต้องมี schema เลย?
 
-Schema Registry เก็บ schema เหล่านี้แยกออกมา โดย key ด้วย **subject** (ปกติคือ `<topic>-value`) และรองรับ format การ serialize ที่นิยม 3 แบบ:
+Kafka เองไม่สนใจว่าข้างในของ record คืออะไร — สำหรับ broker ค่าคือ byte เฉย ๆ ความเป็นอิสระนั้นกลายเป็นปัญหาทันทีที่มีทีมที่สอง consume topic ของคุณ ถ้า producer เปลี่ยนชื่อ field หรือเปลี่ยน type consumer ทุกตัวจะพังแบบเงียบ ๆ ใน production **schema** เปลี่ยนสมมติฐานที่ไม่ชัดเจนให้เป็นสัญญาที่ชัดเจน
 
-- **Avro** — binary กระชับ มีกฎ schema evolution ที่ครบ เป็นตัวเลือกยอดนิยมสุด
-- **Protobuf** — ภาษา schema ของ Google มี tooling ข้ามภาษาที่ดี
-- **JSON Schema** — อ่านง่ายสำหรับคน เหมาะเมื่อทีมพูดภาษา JSON อยู่แล้ว
+Schema Registry เก็บ schema เหล่านั้นแยกไว้ กำกับด้วย **subject** รองรับสามรูปแบบ serialization ที่ใช้บ่อย:
+
+- **Avro** — binary กระชับ กฎ schema evolution ครบครัน เป็นตัวเลือกที่ใช้บ่อยที่สุด และเป็นสิ่งที่การพิสูจน์ทุกอันด้านล่างใช้
+- **Protobuf** — schema language ของ Google เครื่องมือข้ามภาษาที่ดี
+- **JSON Schema** — มนุษย์อ่านง่าย มีประโยชน์เมื่อใช้ JSON อยู่แล้ว
 
 ```json
-// An Avro schema registered as the subject "orders-value"
+// An Avro schema, registered live below as the subject "orders-value"
 {
   "type": "record",
   "name": "Order",
@@ -38,79 +43,223 @@ Schema Registry เก็บ schema เหล่านี้แยกออก�
 }
 ```
 
-## record พก id ไม่ได้พก schema
+การ register จริง รันกับ `cp-schema-registry` ที่มีชีวิตอยู่จริง:
 
-ถ้าส่ง schema เต็ม ๆ ไปกับทุก record ก็จะเปลือง bandwidth แทนที่จะเป็นแบบนั้น serializer จะลงทะเบียน schema แค่ครั้งเดียว ได้ค่า **schema id** เป็นเลขจำนวนเต็มกลับมา แล้วเติม header เล็ก ๆ ไว้หน้า value ของแต่ละ record: magic byte หนึ่งตัว ตามด้วย id ขนาด 4 byte แล้วจึงเป็น payload ฝั่ง consumer อ่าน id ดึง schema ที่ตรงกันจาก registry (แล้ว cache ไว้) และ deserialize
+```text
+$ curl -s -X POST http://localhost:8081/subjects/orders-value/versions \
+    -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+    -d '{"schema": "{\"type\":\"record\",\"name\":\"Order\", ... }"}'
 
-<Mermaid title="Producers and consumers share a contract through the registry" code={registryDiagram} />
+{"id":1,"version":1,"guid":"0a0e8319-f24e-d105-654b-020124b17692","schemaType":"AVRO","schema":"..."}
+```
+
+## Record พก id ไม่ได้พก schema
+
+การส่ง schema เต็ม ๆ ไปกับทุก record จะสิ้นเปลือง bandwidth แทนที่จะทำแบบนั้น serializer register schema ครั้งเดียว ได้ **schema id** เป็นจำนวนเต็มกลับมา (`1` ด้านบน) แล้วเติม header เล็ก ๆ หน้าค่าของแต่ละ record: **magic byte** หนึ่งตัว (เป็น `0` เสมอ), แล้ว **schema id 4 byte** (big-endian), แล้วตามด้วย payload ที่ encode แบบ Avro consumer อ่าน id, ดึง schema ที่ตรงจาก registry (และ cache ไว้), แล้ว deserialize
+
+<Mermaid title="Producer และ consumer ใช้สัญญาร่วมกันผ่าน registry" code={registryDiagram} />
 
 export const registryDiagram = `flowchart LR
   prod["Producer"] -->|"register schema, get id"| reg["Schema Registry"]
-  prod -->|"record = id + payload"| topic["Topic: orders"]
+  prod -->|"record = magic byte + id + payload"| topic["Topic: orders"]
   topic -->|"read record"| cons["Consumer"]
   cons -->|"fetch schema by id"| reg`;
 
-## compatibility mode: วิวัฒน์อย่างปลอดภัย
+พิสูจน์ด้วย hex dump จริง — encode record ด้วย `@kafkajs/confluent-schema-registry` แล้ว decode byte เดียวกันตรงตัวที่ผ่าน broker จริง:
 
-schema ไม่เคยถูกแช่แข็ง — field ถูกเพิ่มและลบไปเรื่อย ๆ ตามธุรกิจที่เปลี่ยน compatibility mode คือกฎที่ registry บังคับ *ก่อน* ที่จะรับเวอร์ชันใหม่ การเปลี่ยนแปลงจึงพัง reader หรือ writer ที่คุณแคร์ไม่ได้:
-
-- **BACKWARD** (ค่า default) — schema ใหม่อ่านข้อมูลที่เขียนด้วย schema **เก่า** ได้ ให้อัปเกรด **consumer ก่อน** การเพิ่ม field ที่มี default หรือลบ field เป็นเรื่องปลอดภัย
-- **FORWARD** — schema เก่าอ่านข้อมูลที่เขียนด้วย schema **ใหม่** ได้ ให้อัปเกรด **producer ก่อน**
-- **FULL** — เป็นจริงทั้งสองทางพร้อมกัน: ใหม่อ่านเก่าได้ *และ* เก่าอ่านใหม่ได้
-
-```bash
-# Set BACKWARD compatibility for a subject, then let producers register v2
-curl -X PUT http://localhost:8081/config/orders-value \
-  -H "Content-Type: application/json" \
-  -d '{"compatibility": "BACKWARD"}'
+```text
+// Real run: encode a payload, dump the wire bytes, produce to a real topic, consume it back
+registered/looked-up schema id: 1
+encoded length: 22
+hex dump: 0000000001086f2d34320000000000e0584006544842
+magic byte: 0 (must be 0)
+schema id (4 bytes, big-endian) from wire: 1 == registered id? true
+decoded: Order { orderId: 'o-42', amount: 99.5, currency: 'THB' }
+raw bytes on the topic, hex: 0000000001086f2d34320000000000e0584006544842
+decoded from real topic read: Order { orderId: 'o-42', amount: 99.5, currency: 'THB' }
 ```
 
-ถ้า schema ที่เสนอมาละเมิด mode registry จะปฏิเสธการลงทะเบียน — การเปลี่ยนแปลงที่ไม่ compatible จะ fail เร็วตั้งแต่ตอน deploy แทนที่จะไปพังตอนตีสามบน production
+อ่าน hex ทีละ byte: `00` (magic byte, 0), `00000001` (schema id `1`, 4 byte big-endian), แล้ว `086f2d3432...` (ค่าที่ encode แบบ Avro ของ `orderId`/`amount`/`currency`) byte ที่อ่านกลับมาจาก topic จริงหลังการ produce/consume จริง **ตรงกันเป๊ะ** กับที่ encode ไป — นี่คือ wire format จริง ไม่ใช่คำอธิบายของมัน
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Schema Registry** คือ **contract** ระหว่างทีม: schema ถูกเก็บแบบ **versioned** ตาม subject แต่ละ record พกแค่ **schema id** และ **compatibility mode** (BACKWARD, FORWARD, FULL) ช่วยให้ schema **วิวัฒน์** ได้โดยไม่ทำให้ producer หรือ consumer พัง
+## Compatibility mode: วิวัฒน์อย่างปลอดภัย พิสูจน์ด้วย 409 จริง
+
+schema ไม่เคยถูกแช่แข็ง — field ถูกเพิ่มและลบไปตามธุรกิจที่เปลี่ยนแปลง compatibility mode คือกฎที่ registry บังคับใช้ *ก่อน* จะยอมรับเวอร์ชันใหม่ เพื่อไม่ให้การเปลี่ยนแปลงทำลาย reader หรือ writer ที่คุณสนใจได้เลย:
+
+- **BACKWARD** (ค่าเริ่มต้นของ registry เอง ยืนยันสด: `GET /config` → `{"compatibilityLevel":"BACKWARD"}`) — schema ใหม่อ่านข้อมูลที่เขียนด้วย schema **เก่า** ได้ อัปเกรด **consumer ก่อน** การลบ field หรือเพิ่ม field *ที่มี* default ปลอดภัย
+- **FORWARD** — schema เก่าอ่านข้อมูลที่เขียนด้วย schema **ใหม่** ได้ อัปเกรด **producer ก่อน**
+- **FULL** — ทั้งสองทางเป็นจริงพร้อมกัน: ใหม่อ่านเก่า *และ* เก่าอ่านใหม่
+- แต่ละแบบยังมีรูปแบบ **`_TRANSITIVE`** (`BACKWARD_TRANSITIVE` ฯลฯ) ที่ตรวจ compatibility กับ **ทุก** เวอร์ชันก่อนหน้า ไม่ใช่แค่เวอร์ชันล่าสุด
+
+**พิสูจน์: การลบ field ได้รับการยอมรับภายใต้ BACKWARD** การ register เวอร์ชันที่สองของ `orders-value` โดยลบ `orderId` ออก (ไม่มี default) สำเร็จด้วย `200` จริง:
+
+```text
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://localhost:8081/subjects/orders-value/versions \
+    -d '{"schema": "{...fields without orderId...}"}'
+{"id":2,"version":2,...}
+HTTP_STATUS:200
+```
+
+นี่ถูกต้อง ไม่ใช่บั๊ก: BACKWARD ต้องการเพียงให้ schema *ใหม่* อ่านข้อมูล *เก่า* ได้ — reader ที่ไม่มองหา `orderId` อีกแล้วก็ไม่มีปัญหาในการอ่าน record ที่บังเอิญมี field นั้นอยู่
+
+**พิสูจน์: การเพิ่ม field โดยไม่มี default ถูก reject — body ของ HTTP 409 จริง** การ register เวอร์ชันที่สามที่เพิ่ม `shippingAddress` (ไม่มี default) *และ* เพิ่ม `orderId` กลับมา (ไม่มี default) กับ subject เดิม:
+
+```text
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://localhost:8081/subjects/orders-value/versions \
+    -d '{"schema": "{...orderId, amount, currency, shippingAddress (no defaults)...}"}'
+
+{"error_code":40901,"message":"Schema being registered is incompatible with an earlier schema for subject \"orders-value\", details: [{errorType:'READER_FIELD_MISSING_DEFAULT_VALUE', description:'The field 'orderId' at path '/fields/0' in the new schema has no default value and is missing in the old schema', additionalInfo:'orderId'}, {errorType:'READER_FIELD_MISSING_DEFAULT_VALUE', description:'The field 'shippingAddress' at path '/fields/3' in the new schema has no default value and is missing in the old schema', additionalInfo:'shippingAddress'}, {oldSchemaVersion: 2}, {oldSchema: '{...}'}, {validateFields: 'false', compatibility: 'BACKWARD'}]"}
+HTTP_STATUS:409
+```
+
+error ระบุเหตุผลชัดเจนว่า *ทำไม*: `READER_FIELD_MISSING_DEFAULT_VALUE` สำหรับ field ที่มีปัญหา **ทั้งสอง** ตัว — schema reader ที่ compatible แบบ BACKWARD ต้องอ่าน record เก่าได้ และ record เก่าไม่มีทั้ง `orderId` (ถูกลบใน v2) และ `shippingAddress` (ใหม่ในความพยายามนี้) ให้ default ตกลงมาใช้เลย registry reject การ register **ก่อน** ที่จะมี byte เดียวถูก produce เลยด้วยซ้ำ — การเปลี่ยนแปลงที่ไม่ compatible ล้มเหลวเร็วตอน deploy แทนที่จะไปพังตอนตีสามใน production
+
+<Callout title="ตรวจ compatibility แบบสด โดยไม่ต้อง register อะไร">
+`POST /compatibility/subjects/<subject>/versions/latest` รัน check เดียวกับที่การ register จริงจะทำ โดยไม่สร้างเวอร์ชันใหม่ — พิสูจน์สดว่าการเพิ่ม field *ที่มี* default คืนค่า `{"is_compatible":true}` พร้อม `200` จริง คุ้มค่าที่จะต่อเข้ากับ CI ก่อน deploy ไม่ใช่พึ่งพาแค่การเรียก register เพื่อ reject schema ที่ผิดเท่านั้น
 </Callout>
+
+## Subject naming strategy
+
+**subject** ที่ schema ถูก register ไว้ไม่จำเป็นต้องเป็น `<topic>-value` เสมอไป — [เอกสารของ serializer ของ Confluent](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html) กำหนดสามกลยุทธ์:
+
+- **`TopicNameStrategy`** (ค่าเริ่มต้นของทุก client) — derive subject จากชื่อ topic: `<topic>-value` / `<topic>-key` หนึ่ง schema ต่อหนึ่ง topic นี่คือสิ่งที่การพิสูจน์ทุกอันด้านบนใช้ (`orders-value`)
+- **`RecordNameStrategy`** — derive subject จาก **ชื่อแบบ fully-qualified ของ record** (namespace + name ของ Avro) ไม่ขึ้นกับ topic ทำให้ผสม record หลายชนิดบน topic เดียวได้ แต่ละอันมีประวัติ schema ของตัวเอง
+- **`TopicRecordNameStrategy`** — รวมทั้งสอง: `<topic>-<ชื่อ record แบบ fully-qualified>` จัดกลุ่ม event ที่เกี่ยวข้องกันแต่รูปร่างต่างกันไว้ใน topic เดียวโดยยังจำกัด compatibility ต่อ topic
+
+เลือก `RecordNameStrategy`/`TopicRecordNameStrategy` อย่างตั้งใจเมื่อมี event หลายชนิดใช้ topic เดียวกัน ไม่งั้นค่าเริ่มต้น `TopicNameStrategy` (หนึ่ง schema หนึ่ง topic พิสูจน์ตลอดบทนี้) คือ mental model ที่ง่ายที่สุด
+
+## การผสาน KafkaJS: `@kafkajs/confluent-schema-registry` — ตรวจสอบว่า maintain อยู่ไหม
+
+`npm view @kafkajs/confluent-schema-registry` ถูกตรวจสอบตรง ๆ สำหรับบทนี้: เวอร์ชันล่าสุดที่ publish คือ **`4.1.0`** publish วันที่ **2026-05-29** — เก่าไม่กี่เดือนตอนที่เขียนบทนี้ ไม่ได้ถูกทิ้งร้าง ทั้งที่ KafkaJS core เองไม่ maintain มาตั้งแต่ 2023-02-27 (มี maintainer คนละกลุ่มที่ดูแล package นี้ไว้) การพิสูจน์ encode/decode/produce/consume เต็มรูปแบบด้านบนรันกับเวอร์ชันที่ pin ไว้ตรงนี้เป๊ะ
+
+```text
+// Fragment -- depends on @kafkajs/confluent-schema-registry against a real registry;
+// not collected/run by this course's harness (no schema registry on the shared broker).
+// This is the real script that produced the hex dump above, run from this Mac.
+import { SchemaRegistry, SchemaType } from '@kafkajs/confluent-schema-registry';
+import { Kafka } from 'kafkajs';
+
+const registry = new SchemaRegistry({ host: 'http://localhost:8081' });
+const { id } = await registry.register({ type: SchemaType.AVRO, schema: JSON.stringify(orderSchema) });
+
+const encoded = await registry.encode(id, { orderId: 'o-42', amount: 99.5, currency: 'THB' });
+// encoded.toString('hex') === '0000000001086f2d34320000000000e0584006544842' (proven above)
+
+const kafka = new Kafka({ clientId: 'sr-probe', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic: 'orders', messages: [{ key: 'o-42', value: encoded }] }); // real bytes, real broker
+
+const decoded = await registry.decode(encoded); // { orderId: 'o-42', amount: 99.5, currency: 'THB' }
+```
+
+### serdes ของ confluent client เอง
+
+`@confluentinc/schemaregistry` (เวอร์ชัน `1.10.1` ตรวจผ่าน `npm view` — เป็นส่วนหนึ่งของ repo `confluentinc/confluent-kafka-javascript` เดียวกับ `@confluentinc/kafka-javascript`) เป็น package จริงแยกต่างหากที่มี serializer class ของตัวเอง: `AvroSerializer`/`AvroDeserializer` (ยืนยันเป็น export จริงในไฟล์ `.d.ts` ที่มากับมัน) บวก Protobuf และ JSON Schema เทียบเท่า มันคือคำตอบของ ecosystem confluent/librdkafka สำหรับปัญหาเดียวกันที่ `@kafkajs/confluent-schema-registry` แก้ให้ KafkaJS — เลือกตัวที่ตรงกับ client (`kafkajs` vs `@confluentinc/kafka-javascript`) ที่โค้ดของคุณใช้อยู่แล้ว ตามแนวทางการเลือก client ที่พูดถึงตลอดทั้งคอร์สนี้
+
+<Callout title="สรุปในบรรทัดเดียว">
+Schema Registry คือ **สัญญา** ระหว่างทีม: schema ถูกเก็บ **มีเวอร์ชัน** ตาม subject แต่ละ record พกแค่ **schema id** เล็ก ๆ (พิสูจน์แล้วด้านบนด้วย hex dump จริง: magic byte `00` + id 4 byte + payload) และ **compatibility mode** (BACKWARD พิสูจน์สดว่ายอมรับการลบ field และ reject การเพิ่ม field ที่ไม่มี default ด้วย HTTP 409 จริง) ให้ schema วิวัฒน์ได้โดยไม่ทำลาย producer หรือ consumer subject naming strategy (`TopicNameStrategy` ค่าเริ่มต้น, `RecordNameStrategy`, `TopicRecordNameStrategy`) ควบคุมว่ากี่ schema ใช้ topic เดียวกันได้ `@kafkajs/confluent-schema-registry` (publish ล่าสุด 2026-05-29) และ `@confluentinc/schemaregistry` ทั้งคู่เป็นตัวเลือกจริงและใช้งานได้ปัจจุบัน ขึ้นอยู่กับว่าใช้ Kafka client ตัวไหน
+</Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// src/schema-registry/evolve-order-schema.ts
+// Adding a "shippingAddress" field to the Order schema for the new fulfillment feature.
+// Existing consumers are on an older deploy and won't see this field, but that's fine --
+// Schema Registry's BACKWARD compatibility check will simply pass this through since
+// we're only ADDING a field, never removing one.
+
+const evolvedSchema = {
+  type: 'record',
+  name: 'Order',
+  namespace: 'com.shop.orders',
+  fields: [
+    { name: 'orderId', type: 'string' },
+    { name: 'amount', type: 'double' },
+    { name: 'currency', type: 'string', default: 'USD' },
+    { name: 'shippingAddress', type: 'string' }, // new field for fulfillment
+  ],
+};
+
+await registry.register({ type: SchemaType.AVRO, schema: JSON.stringify(evolvedSchema) });
+`}>
+
+คำอ้างในคอมเมนต์ -- "we're only ADDING a field, never removing one" ทำให้ปลอดภัยอัตโนมัติภายใต้ BACKWARD -- พิสูจน์แล้วว่าผิดด้านบนด้วย HTTP 409 จริง BACKWARD compatibility หมายถึง schema *ใหม่* ต้องอ่าน record *เก่า* ได้; record เก่าไม่มี `shippingAddress` เลย และ field นี้ **ไม่มีค่า default** ดังนั้น reader ที่ใช้ schema นี้ไม่มีอะไรจะใส่แทนตอนอ่านข้อมูลเก่า response จริงของ registry สำหรับการเปลี่ยนแปลงรูปแบบนี้เป๊ะคือ `error_code 40901`, `READER_FIELD_MISSING_DEFAULT_VALUE`, สำหรับ field ใหม่นี้ ทางแก้คือเพิ่มแค่บรรทัดเดียว: ให้ `shippingAddress` มี default (`{ name: 'shippingAddress', type: 'string', default: '' }`) ซึ่งตรงคือความต่างระหว่าง field `currency` (มี default ปลอดภัยที่จะเพิ่มมาตลอด พิสูจน์ตลอดบทนี้) กับบั๊กนี้
+
+</SpotTheBug>
+
+## Mental Model
+
+ทุกอย่างในบทนี้คือแนวคิดเดียวที่ใช้สองครั้ง: **schema id คือ pointer ไม่ใช่สำเนา** และ **compatibility mode คือประตูกั้น ไม่ใช่คำแนะนำ** การพิสูจน์ wire-format ด้านบนแสดง pointer นั้นตรงตัวทีละ byte; การพิสูจน์ 409 แสดงประตูที่ปฏิเสธการละเมิดที่เจาะจงจริงด้วยเหตุผลที่เครื่องอ่านได้ (`READER_FIELD_MISSING_DEFAULT_VALUE`) แทนข้อความ "incompatible" ที่คลุมเครือ การคิดเรื่อง schema evolution ให้ถูกต้องคือการถามคำถามเดียวทุกครั้ง: *reader ที่ใช้ schema ใหม่จะเข้าใจ record ที่เขียนด้วย schema เก่าได้ไหม* (หรือย้อนกลับ สำหรับ FORWARD)? ทุกสิ่งที่ BACKWARD ยอมรับหรือปฏิเสธด้านบนตอบคำถามนี้อย่างตรงไปตรงมา
+
+## Trade-offs
+
+- **BACKWARD (ค่าเริ่มต้น)** -- พิสูจน์แล้วด้านบนว่ายอมรับการลบที่ปลอดภัยและการเพิ่มที่มี default ในขณะที่ reject การเพิ่มแบบไม่มี default ใน SpotTheBug ต้นทุนคือ producer ต้องอัปเกรด *หลัง* consumer ซึ่งตรงข้ามกับ FORWARD
+- **`RecordNameStrategy`/`TopicRecordNameStrategy`** -- ให้ event หลายรูปร่างใช้ topic เดียวกันได้ แลกกับการ mapping จาก topic ไปยัง schema ที่ไม่ชัดเจนเท่าค่าเริ่มต้น
+- **`@kafkajs/confluent-schema-registry` vs `@confluentinc/schemaregistry`** -- package ของ KafkaJS เล็กและง่ายกว่า (พิสูจน์แล้วด้านบนด้วยการรัน encode/decode/produce/consume สั้น ๆ) แต่วางอยู่บน core client ที่ไม่ maintain; package ของ confluent พัฒนาอยู่จริงแต่ผูกกับรูปแบบ client confluent/librdkafka
+- **การเรียกเช็ค compatibility เท่านั้น (`POST /compatibility/...`)** -- จับ schema ที่ไม่ดีได้ใน CI ก่อนที่จะถูก register จริง แลกกับการเป็นการเรียกแยกที่ pipeline ต้องจำให้เรียก
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"การเพิ่ม field ปลอดภัยเสมอภายใต้ BACKWARD compatibility"** พิสูจน์แล้วว่าผิดด้านบน (SpotTheBug + 409 จริง): การเพิ่ม field **ที่มี default** เท่านั้นที่ปลอดภัย; การเพิ่มแบบไม่มี default ล้มเหลวเพราะ record เก่าไม่มีอะไรให้ใส่แทน
+- **"การลบ field อันตรายเสมอ"** พิสูจน์แล้วว่าผิดด้านบน: การลบ field สำเร็จด้วย `200` จริงภายใต้ BACKWARD -- schema ใหม่ (ที่เล็กลง) แค่ไม่ขอ field นั้นแล้ว จึงยังอ่าน record เก่าได้สบาย
+- **"KafkaJS ไม่ maintain แล้ว แปลว่าการผสาน Schema Registry ของมันก็ไม่ maintain ด้วย"** พิสูจน์แล้วว่าผิดผ่าน `npm view`: `@kafkajs/confluent-schema-registry` publish `4.1.0` วันที่ 2026-05-29 หลัง release ล่าสุดของ KafkaJS core ไปนาน
+- **"subject เป็น `<topic>-value` เสมอ"** จริงแค่ภายใต้ `TopicNameStrategy` ค่าเริ่มต้น -- `RecordNameStrategy` และ `TopicRecordNameStrategy` (strategy จริงที่มีเอกสารรองรับ) derive มันต่างกันเมื่อ event หลายชนิดใช้ topic เดียวกัน
 
 export const quizSchema = [
   {
-    q: 'record ของ Kafka พกอะไรไปด้วยเมื่อใช้ Schema Registry',
+    q: 'record ของ Kafka พกอะไรเมื่อใช้ Schema Registry พิสูจน์ด้วย hex dump จริง?',
     options: [
       'schema เต็ม ๆ ฝังอยู่ในทุก record',
-      'schema id เล็ก ๆ ที่ชี้ไปยัง schema แบบมีเวอร์ชันใน registry',
-      'ไม่พกอะไรเลย — consumer เดา schema เอง',
-      'สำเนาของ registry ทั้งก้อน',
+      'magic byte (0) ตามด้วย schema id 4 byte แล้วตามด้วย payload ที่ encode แล้ว -- พิสูจน์ด้วย hex จริง 0000000001086f2d... ที่ 00000001 คือ schema id 1',
+      'ไม่มีอะไร -- consumer เดา schema เอง',
+      'สำเนาของ registry ทั้งหมด',
     ],
     answer: 1,
+    explain: 'hex dump จริงถูก decode ทีละ byte: magic byte 00, schema id 00000001 (=1), แล้ว payload แบบ Avro -- ยืนยันว่าตรงกันทั้งฝั่ง encode และหลังการ produce/consume จริง',
   },
   {
-    q: 'ทำไมต้องลงทะเบียน schema ให้กับ topic',
+    q: 'HTTP status และ error type จริงที่เกิดจากการเพิ่ม field โดยไม่มี default ภายใต้ BACKWARD compatibility คืออะไร?',
     options: [
-      'เพื่อทำให้ record ใหญ่ขึ้นและอ่านง่ายขึ้น',
-      'เพื่อเปลี่ยนข้อสมมติที่ซ่อนอยู่เรื่องรูปร่างของ record ให้เป็น contract ที่ชัดเจนซึ่งทั้งสองฝั่งตกลงกัน',
-      'Kafka ปฏิเสธที่จะเก็บ bytes ถ้าไม่มี schema',
-      'เข้ารหัสข้อมูลให้อัตโนมัติ',
+      '200 OK -- การเพิ่มอะไรก็ได้รับอนุญาตเสมอ',
+      '409, error_code 40901, พร้อม READER_FIELD_MISSING_DEFAULT_VALUE สำหรับ field ที่มีปัญหา',
+      '500 Internal Server Error',
+      '404 Not Found',
     ],
     answer: 1,
+    explain: 'response body จริงของ registry ระบุ field ที่แน่นอนและเหตุผลที่แน่นอน: field ที่ไม่มี default ที่ schema ใหม่ต้องการแต่ข้อมูลเก่าให้ไม่ได้',
   },
   {
-    q: 'ภายใต้ compatibility แบบ BACKWARD คุณควรอัปเกรดฝั่งไหนก่อน',
+    q: 'HTTP status จริงที่เกิดจากการลบ field (ไม่มี default) ภายใต้ BACKWARD compatibility คืออะไร และเพราะอะไร?',
     options: [
-      'producer ก่อน',
-      'consumer ก่อน — schema ใหม่อ่านข้อมูลที่เขียนด้วย schema เก่าได้',
-      'ลำดับไม่สำคัญ',
-      'ต้องอัปเกรดทั้งสองฝั่งพร้อมกันเป๊ะ ๆ',
+      '409 -- การลบอะไรก็ตามถูก reject เสมอ',
+      '200 -- BACKWARD ต้องการเพียงให้ schema ใหม่อ่านข้อมูลเก่าได้; schema ที่ไม่ขอ field นั้นแล้วไม่มีปัญหาในการอ่าน record ที่บังเอิญยังมี field นั้นอยู่',
+      'ไม่ได้รับอนุญาตให้ส่ง schema ที่มี field น้อยกว่า',
+      '403 Forbidden',
     ],
     answer: 1,
+    explain: 'พิสูจน์สด: การ register เวอร์ชันที่ลบ orderId สำเร็จด้วย 200 จริง -- BACKWARD compatibility เกี่ยวกับ reader ไม่ใช่การห้ามย่อ schema',
   },
   {
-    q: 'ข้อใด NOT ใช่ format การ serialize ที่ Schema Registry จัดการโดยทั่วไป',
+    q: 'TopicRecordNameStrategy ต่างจาก TopicNameStrategy ค่าเริ่มต้นอย่างไร?',
     options: [
-      'Avro',
-      'Protobuf',
-      'JSON Schema',
-      'แถว CSV ดิบที่ไม่มีการประกาศ type ใด ๆ',
+      'ไม่ต่างกันเลย เหมือนกันทุกอย่าง',
+      'derive subject จากทั้ง topic และชื่อ record แบบ fully-qualified (<topic>-<record name>) ทำให้ event หลายรูปร่างใช้ topic เดียวกันได้โดยมีประวัติ schema แยกกัน',
+      'ไม่สนใจ topic เลย',
+      'ปิดการตรวจ compatibility',
     ],
-    answer: 3,
+    answer: 1,
+    explain: 'ตามเอกสาร serdes ของ Confluent: TopicRecordNameStrategy รวม topic กับชื่อ record; TopicNameStrategy ค่าเริ่มต้นใช้แค่ topic (<topic>-value)',
+  },
+  {
+    q: 'ยืนยันผ่าน npm view สำหรับบทนี้: @kafkajs/confluent-schema-registry ยัง maintain อยู่ไหม ทั้งที่ KafkaJS core ไม่ maintain มาตั้งแต่ 2023?',
+    options: [
+      'ไม่ -- หยุดพร้อมกับ KafkaJS core ในปี 2023',
+      'ใช่ -- เวอร์ชันล่าสุด (4.1.0) publish วันที่ 2026-05-29 หลัง release ล่าสุดของ KafkaJS core ไปนาน โดย maintainer คนละกลุ่ม',
+      'ไม่เคยถูก publish บน npm เลย',
+      'ถูกรวมเข้ากับ @confluentinc/kafka-javascript แล้ว',
+    ],
+    answer: 1,
+    explain: 'npm view @kafkajs/confluent-schema-registry แสดง 4.1.0 publish 2026-05-29 -- maintain อยู่จริงในฐานะ package แยก ไม่ขึ้นกับสถานะการ maintain ของ KafkaJS core',
   },
 ];
 

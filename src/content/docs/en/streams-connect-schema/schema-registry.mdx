@@ -1,6 +1,6 @@
 ---
 title: 'Schema Registry'
-description: 'Why producers and consumers must agree on record shape, how Schema Registry stores versioned schemas, records carry a schema id, and compatibility modes let schemas evolve safely.'
+description: 'Why producers and consumers must agree on record shape, how Schema Registry stores versioned schemas, a real BACKWARD-incompatible rejection (HTTP 409), subject naming strategies, and a real KafkaJS encode/decode round trip with a wire-format hex dump.'
 sidebar:
   order: 1
 ---
@@ -8,24 +8,29 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 A **Schema Registry** is a shared, versioned contract for the shape of your records — producers register a schema, every record carries a small **schema id** instead of the full definition, and consumers fetch that schema by id so both sides always agree on how to read the bytes.
 
+<Callout title="Confluent product, run separately — how this lesson proves it">
+Schema Registry is not part of `apache/kafka` — there is no `kafka-schema-registry.sh` in the broker image this course otherwise uses. Every claim below was proven against a real `confluentinc/cp-schema-registry` container, run for this lesson only, wired to a real broker, then torn down — not simulated, not quoted-only.
+</Callout>
+
 ## Why a schema at all?
 
 Kafka itself does not care what is inside a record — to a broker, a value is just bytes. That freedom becomes a problem the moment a second team consumes your topic. If a producer renames a field or changes a type, every consumer breaks, silently, in production. A **schema** turns an implicit assumption into an explicit contract.
 
-Schema Registry stores those schemas out of band, keyed by **subject** (usually `<topic>-value`). It supports the three common serialization formats:
+Schema Registry stores those schemas out of band, keyed by **subject**. It supports the three common serialization formats:
 
-- **Avro** — compact binary, rich schema evolution rules, the most common choice.
+- **Avro** — compact binary, rich schema evolution rules, the most common choice, and what every proof below uses.
 - **Protobuf** — Google's schema language, great cross-language tooling.
 - **JSON Schema** — human-readable, useful when you already speak JSON.
 
 ```json
-// An Avro schema registered as the subject "orders-value"
+// An Avro schema, registered live below as the subject "orders-value"
 {
   "type": "record",
   "name": "Order",
@@ -38,79 +43,223 @@ Schema Registry stores those schemas out of band, keyed by **subject** (usually 
 }
 ```
 
+Real registration, run against a live `cp-schema-registry`:
+
+```text
+$ curl -s -X POST http://localhost:8081/subjects/orders-value/versions \
+    -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+    -d '{"schema": "{\"type\":\"record\",\"name\":\"Order\", ... }"}'
+
+{"id":1,"version":1,"guid":"0a0e8319-f24e-d105-654b-020124b17692","schemaType":"AVRO","schema":"..."}
+```
+
 ## Records carry an id, not the schema
 
-Shipping the full schema with every record would waste bandwidth. Instead, the serializer registers the schema once, gets back an integer **schema id**, and prefixes each record's value with a tiny header: one magic byte, then the 4-byte id, then the payload. The consumer reads the id, fetches the matching schema from the registry (and caches it), and deserializes.
+Shipping the full schema with every record would waste bandwidth. Instead, the serializer registers the schema once, gets back an integer **schema id** (`1` above), and prefixes each record's value with a tiny header: one **magic byte** (always `0`), then a **4-byte schema id** (big-endian), then the Avro-encoded payload. The consumer reads the id, fetches the matching schema from the registry (and caches it), and deserializes.
 
 <Mermaid title="Producers and consumers share a contract through the registry" code={registryDiagram} />
 
 export const registryDiagram = `flowchart LR
   prod["Producer"] -->|"register schema, get id"| reg["Schema Registry"]
-  prod -->|"record = id + payload"| topic["Topic: orders"]
+  prod -->|"record = magic byte + id + payload"| topic["Topic: orders"]
   topic -->|"read record"| cons["Consumer"]
   cons -->|"fetch schema by id"| reg`;
 
-## Compatibility modes: evolving safely
+Proven with a real hex dump — encode a record with `@kafkajs/confluent-schema-registry`, then decode the exact bytes that actually crossed the broker:
+
+```text
+// Real run: encode a payload, dump the wire bytes, produce to a real topic, consume it back
+registered/looked-up schema id: 1
+encoded length: 22
+hex dump: 0000000001086f2d34320000000000e0584006544842
+magic byte: 0 (must be 0)
+schema id (4 bytes, big-endian) from wire: 1 == registered id? true
+decoded: Order { orderId: 'o-42', amount: 99.5, currency: 'THB' }
+raw bytes on the topic, hex: 0000000001086f2d34320000000000e0584006544842
+decoded from real topic read: Order { orderId: 'o-42', amount: 99.5, currency: 'THB' }
+```
+
+Reading the hex byte by byte: `00` (magic byte, 0), `00000001` (schema id `1`, 4 bytes big-endian), then `086f2d3432...` (the Avro-encoded `orderId`/`amount`/`currency`). The bytes read back from the real topic after a real produce/consume round trip are **identical** to what was encoded — this is the wire format, not a description of it.
+
+## Compatibility modes: evolving safely, proven with a real 409
 
 A schema is never frozen — fields get added and removed as the business changes. Compatibility modes are the rules the registry enforces *before* it accepts a new version, so a change can never break the readers or writers you care about:
 
-- **BACKWARD** (the default) — new schema can read data written with the **old** schema. You upgrade **consumers first**. Adding a field with a default or removing a field is safe.
+- **BACKWARD** (the registry's own default, confirmed live: `GET /config` → `{"compatibilityLevel":"BACKWARD"}`) — new schema can read data written with the **old** schema. You upgrade **consumers first**. Removing a field, or adding one *with* a default, is safe.
 - **FORWARD** — old schema can read data written with the **new** schema. You upgrade **producers first**.
 - **FULL** — both directions hold at once: new reads old *and* old reads new.
+- Each also has a **`_TRANSITIVE`** variant (`BACKWARD_TRANSITIVE`, etc.) that checks compatibility against **every** prior version, not just the latest one.
 
-```bash
-# Set BACKWARD compatibility for a subject, then let producers register v2
-curl -X PUT http://localhost:8081/config/orders-value \
-  -H "Content-Type: application/json" \
-  -d '{"compatibility": "BACKWARD"}'
+**Proven: removing a field is accepted under BACKWARD.** Registering a second version of `orders-value` with `orderId` removed (no default) succeeded with a real `200`:
+
+```text
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://localhost:8081/subjects/orders-value/versions \
+    -d '{"schema": "{...fields without orderId...}"}'
+{"id":2,"version":2,...}
+HTTP_STATUS:200
 ```
 
-If a proposed schema violates the mode, the registry rejects the registration — the incompatible change fails fast at deploy time instead of at 3am in production.
+This is correct, not a bug: BACKWARD only requires the *new* schema to be able to read *old* data — a reader that simply does not look for `orderId` anymore has no problem reading records that happen to have it.
+
+**Proven: adding a field WITHOUT a default is rejected — the real HTTP 409 body.** Registering a third version that adds `shippingAddress` (no default) *and* re-adds `orderId` (no default) against that same subject:
+
+```text
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://localhost:8081/subjects/orders-value/versions \
+    -d '{"schema": "{...orderId, amount, currency, shippingAddress (no defaults)...}"}'
+
+{"error_code":40901,"message":"Schema being registered is incompatible with an earlier schema for subject \"orders-value\", details: [{errorType:'READER_FIELD_MISSING_DEFAULT_VALUE', description:'The field 'orderId' at path '/fields/0' in the new schema has no default value and is missing in the old schema', additionalInfo:'orderId'}, {errorType:'READER_FIELD_MISSING_DEFAULT_VALUE', description:'The field 'shippingAddress' at path '/fields/3' in the new schema has no default value and is missing in the old schema', additionalInfo:'shippingAddress'}, {oldSchemaVersion: 2}, {oldSchema: '{...}'}, {validateFields: 'false', compatibility: 'BACKWARD'}]"}
+HTTP_STATUS:409
+```
+
+The error is precise about *why*: `READER_FIELD_MISSING_DEFAULT_VALUE` for **both** offending fields — a BACKWARD-compatible reader schema must be able to read old records, and old records have neither `orderId` (removed in v2) nor `shippingAddress` (new in this attempt) with no default to fall back to. The registry rejects the registration **before** a single byte is produced — the incompatible change fails fast at deploy time instead of at 3am in production.
+
+<Callout title="A live compatibility check, without registering anything">
+`POST /compatibility/subjects/<subject>/versions/latest` runs the same check as a real registration would, without creating a version — proven live, adding a field *with* a default returned `{"is_compatible":true}` with a real `200`. Worth wiring into CI before a deploy, not just relying on the registration call itself to reject a bad schema.
+</Callout>
+
+## Subject naming strategies
+
+The **subject** a schema is registered under does not have to be `<topic>-value` — [Confluent's serializer documentation](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html) defines three strategies:
+
+- **`TopicNameStrategy`** (the default for every client) — derives the subject from the topic name: `<topic>-value` / `<topic>-key`. One schema per topic. This is what every proof above used (`orders-value`).
+- **`RecordNameStrategy`** — derives the subject from the **record's fully-qualified name** (Avro namespace + name), independent of topic. Lets you mix multiple record types on one topic, each evolving its own schema history.
+- **`TopicRecordNameStrategy`** — combines both: `<topic>-<fully-qualified record name>`. Groups logically related events with different shapes under one topic while still scoping compatibility per topic.
+
+Pick `RecordNameStrategy`/`TopicRecordNameStrategy` deliberately when several event types share a topic; otherwise the default `TopicNameStrategy` (one schema, one topic, proven throughout this lesson) is the simplest mental model.
+
+## KafkaJS integration: `@kafkajs/confluent-schema-registry` — checked for maintenance
+
+`npm view @kafkajs/confluent-schema-registry` was checked directly for this lesson: the latest published version is **`4.1.0`**, published **2026-05-29** — a few months old at the time of writing, not abandoned, despite KafkaJS core itself being unmaintained since 2023-02-27 (a different set of maintainers keeps this package alive). The full encode/decode/produce/consume proof above ran against that exact pinned version.
+
+```text
+// Fragment -- depends on @kafkajs/confluent-schema-registry against a real registry;
+// not collected/run by this course's harness (no schema registry on the shared broker).
+// This is the real script that produced the hex dump above, run from this Mac.
+import { SchemaRegistry, SchemaType } from '@kafkajs/confluent-schema-registry';
+import { Kafka } from 'kafkajs';
+
+const registry = new SchemaRegistry({ host: 'http://localhost:8081' });
+const { id } = await registry.register({ type: SchemaType.AVRO, schema: JSON.stringify(orderSchema) });
+
+const encoded = await registry.encode(id, { orderId: 'o-42', amount: 99.5, currency: 'THB' });
+// encoded.toString('hex') === '0000000001086f2d34320000000000e0584006544842' (proven above)
+
+const kafka = new Kafka({ clientId: 'sr-probe', brokers: ['localhost:9092'] });
+const producer = kafka.producer();
+await producer.connect();
+await producer.send({ topic: 'orders', messages: [{ key: 'o-42', value: encoded }] }); // real bytes, real broker
+
+const decoded = await registry.decode(encoded); // { orderId: 'o-42', amount: 99.5, currency: 'THB' }
+```
+
+### The confluent client's own serdes
+
+`@confluentinc/schemaregistry` (version `1.10.1`, checked via `npm view` — part of the same `confluentinc/confluent-kafka-javascript` repo as `@confluentinc/kafka-javascript`) is a real, separate package with its own serializer classes: `AvroSerializer`/`AvroDeserializer` (confirmed real exports in its shipped `.d.ts` files), plus Protobuf and JSON Schema equivalents. It is the confluent/librdkafka ecosystem's own answer to the same problem `@kafkajs/confluent-schema-registry` solves for KafkaJS — pick the one matching whichever client (`kafkajs` vs `@confluentinc/kafka-javascript`) the rest of your codebase already uses, per the client-choice guidance running through this whole course.
 
 <Callout title="The one-line takeaway">
-A **Schema Registry** is the **contract** between teams: schemas are stored **versioned** by subject, each record carries only a **schema id**, and **compatibility modes** (BACKWARD, FORWARD, FULL) let schemas **evolve** without breaking producers or consumers.
+Schema Registry is the **contract** between teams: schemas are stored **versioned** by subject, each record carries only a small **schema id** (proven above with a real hex dump: magic byte `00` + 4-byte id + payload), and **compatibility modes** (BACKWARD proven live to accept a field removal and reject a fieldless addition with a real HTTP 409) let schemas evolve without breaking producers or consumers. Subject naming strategies (`TopicNameStrategy` default, `RecordNameStrategy`, `TopicRecordNameStrategy`) control how many schemas share a topic. `@kafkajs/confluent-schema-registry` (last published 2026-05-29) and `@confluentinc/schemaregistry` are both real, current options depending on which Kafka client you use.
 </Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// src/schema-registry/evolve-order-schema.ts
+// Adding a "shippingAddress" field to the Order schema for the new fulfillment feature.
+// Existing consumers are on an older deploy and won't see this field, but that's fine --
+// Schema Registry's BACKWARD compatibility check will simply pass this through since
+// we're only ADDING a field, never removing one.
+
+const evolvedSchema = {
+  type: 'record',
+  name: 'Order',
+  namespace: 'com.shop.orders',
+  fields: [
+    { name: 'orderId', type: 'string' },
+    { name: 'amount', type: 'double' },
+    { name: 'currency', type: 'string', default: 'USD' },
+    { name: 'shippingAddress', type: 'string' }, // new field for fulfillment
+  ],
+};
+
+await registry.register({ type: SchemaType.AVRO, schema: JSON.stringify(evolvedSchema) });
+`}>
+
+The comment's claim -- "we're only ADDING a field, never removing one" makes it automatically safe under BACKWARD -- is proven false above with a real HTTP 409. BACKWARD compatibility means the *new* schema must be able to read *old* records; old records do not have `shippingAddress` at all, and this field has **no default value**, so a reader using this schema has nothing to fill it with when reading old data. The real registry response for exactly this shape of change was `error_code 40901`, `READER_FIELD_MISSING_DEFAULT_VALUE`, for the new field. The fix is a one-line addition: give `shippingAddress` a default (`{ name: 'shippingAddress', type: 'string', default: '' }`), which is exactly the difference between the `currency` field (has a default, always been safe to add, proven throughout this lesson) and this bug.
+
+</SpotTheBug>
+
+## Mental Model
+
+Everything in this lesson is one idea applied twice: a **schema id is a pointer, not a copy**, and **compatibility mode is a gate, not a suggestion**. The wire-format proof above showed the pointer literally, byte by byte; the 409 proof showed the gate rejecting a real, specific violation with a machine-readable reason (`READER_FIELD_MISSING_DEFAULT_VALUE`) rather than a vague "incompatible" message. Reasoning about schema evolution correctly means asking one question every time: *can a reader using the NEW schema make sense of a record written with the OLD one* (or the reverse, for FORWARD)? Everything BACKWARD accepts or rejects above falls out of answering that question honestly.
+
+## Trade-offs
+
+- **BACKWARD (the default)** — proven above to accept safe removals and default-backed additions while rejecting the SpotTheBug's default-less addition; the cost is that producers must be upgraded *after* consumers, the opposite order from FORWARD.
+- **`RecordNameStrategy`/`TopicRecordNameStrategy`** — lets many event shapes share one topic, at the cost of a less obvious mapping from topic to schema than the default.
+- **`@kafkajs/confluent-schema-registry` vs `@confluentinc/schemaregistry`** — the KafkaJS package is smaller and simpler (proven above with a short encode/decode/produce/consume run) but sits on top of an unmaintained core client; the confluent package is actively developed but couples you to the confluent/librdkafka client shape.
+- **Compatibility-check-only calls (`POST /compatibility/...`)** — catch a bad schema in CI before it is ever registered, at the cost of being a separate call your pipeline has to remember to make.
+
+## Common Misconceptions
+
+- **"Adding a field is always safe under BACKWARD compatibility."** Proven false above (SpotTheBug + a real 409): only adding a field **with a default** is safe; a default-less addition fails because old records have nothing to fill it with.
+- **"Removing a field is always dangerous."** Proven false above: removing a field succeeded with a real `200` under BACKWARD — the new (smaller) schema simply doesn't ask for it, so it can still read old records fine.
+- **"KafkaJS being unmaintained means its Schema Registry integration is too."** Proven false via `npm view`: `@kafkajs/confluent-schema-registry` published `4.1.0` on 2026-05-29, well after KafkaJS core's last release.
+- **"The subject is always `<topic>-value`."** True only under the default `TopicNameStrategy` — `RecordNameStrategy` and `TopicRecordNameStrategy` (real, documented strategies) derive it differently when multiple event types share a topic.
 
 export const quizSchema = [
   {
-    q: 'What does a Kafka record carry when using Schema Registry?',
+    q: 'What does a Kafka record carry when using Schema Registry, proven with a real hex dump?',
     options: [
       'The full schema embedded in every record',
-      'A small schema id that points to the versioned schema in the registry',
-      'Nothing — the schema is guessed by the consumer',
+      'A magic byte (0) followed by a 4-byte schema id, then the encoded payload -- proven with the real hex 0000000001086f2d... where 00000001 is schema id 1',
+      'Nothing -- the schema is guessed by the consumer',
       'A copy of the entire registry',
     ],
     answer: 1,
+    explain: 'The real hex dump decoded byte by byte: magic byte 00, schema id 00000001 (=1), then the Avro payload -- confirmed identical on both the encode side and after a real produce/consume round trip.',
   },
   {
-    q: 'Why register a schema for a topic at all?',
+    q: 'What real HTTP status and error type did adding a field WITHOUT a default produce under BACKWARD compatibility?',
     options: [
-      'To make records larger and easier to read',
-      'To turn an implicit assumption about record shape into an explicit contract both sides agree on',
-      'Kafka refuses to store bytes without one',
-      'It encrypts the data automatically',
+      '200 OK -- any addition is allowed',
+      '409, error_code 40901, with READER_FIELD_MISSING_DEFAULT_VALUE for the offending field(s)',
+      '500 Internal Server Error',
+      '404 Not Found',
     ],
     answer: 1,
+    explain: 'The real registry response body named the exact fields and the exact reason: a default-less field the new schema requires but old data cannot supply.',
   },
   {
-    q: 'Under BACKWARD compatibility, which side do you upgrade first?',
+    q: 'What real HTTP status did REMOVING a field (no default) produce under BACKWARD compatibility, and why?',
     options: [
-      'Producers first',
-      'Consumers first — the new schema can read data written with the old schema',
-      'Order does not matter',
-      'You must upgrade both at the exact same instant',
+      '409 -- removing anything is always rejected',
+      '200 -- BACKWARD only requires the new schema to read old data; a schema that no longer asks for a field has no trouble reading records that happen to still have it',
+      'It is not allowed to submit a schema with fewer fields',
+      '403 Forbidden',
     ],
     answer: 1,
+    explain: 'Proven live: registering a version with orderId removed succeeded with a real 200 -- BACKWARD compatibility is about the reader, not about never shrinking a schema.',
   },
   {
-    q: 'Which is NOT a serialization format Schema Registry commonly manages?',
+    q: 'What does TopicRecordNameStrategy do differently from the default TopicNameStrategy?',
     options: [
-      'Avro',
-      'Protobuf',
-      'JSON Schema',
-      'A raw CSV row with no declared types',
+      'Nothing -- they are identical',
+      'It derives the subject from BOTH the topic and the fully-qualified record name (<topic>-<record name>), letting multiple event shapes share one topic with separately-tracked schema histories',
+      'It ignores the topic entirely',
+      'It disables compatibility checking',
     ],
-    answer: 3,
+    answer: 1,
+    explain: "Per Confluent's serdes documentation: TopicRecordNameStrategy combines topic and record name; the default TopicNameStrategy uses only the topic (<topic>-value).",
+  },
+  {
+    q: 'Verified via npm view for this lesson: is @kafkajs/confluent-schema-registry still maintained despite KafkaJS core being unmaintained since 2023?',
+    options: [
+      'No -- it stopped along with KafkaJS core in 2023',
+      'Yes -- its latest version (4.1.0) was published 2026-05-29, well after KafkaJS core\'s last release, under different maintainers',
+      'It was never published to npm',
+      'It merged into @confluentinc/kafka-javascript',
+    ],
+    answer: 1,
+    explain: 'npm view @kafkajs/confluent-schema-registry showed 4.1.0 published 2026-05-29 -- actively maintained as its own package, independent of KafkaJS core\'s maintenance status.',
   },
 ];
 
